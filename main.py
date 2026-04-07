@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 import asyncio
 from app.services.market_data import market_service
 from app.services.alert_engine import run_alert_engine
+from app.services.screener import screener_service
 from app.routers import quotes, alerts, screener
 
 alert_task = None
@@ -17,10 +18,22 @@ async def lifespan(app: FastAPI):
     global alert_task
     await market_service.start()
     alert_task = asyncio.create_task(run_alert_engine())
+    # Load VNINDEX khi khởi động (không block, chạy background)
+    asyncio.create_task(_warmup_vnindex())
     yield
     if alert_task:
         alert_task.cancel()
     await market_service.stop()
+
+async def _warmup_vnindex():
+    """Load VNINDEX data ngay khi server start, không block lifespan."""
+    await asyncio.sleep(5)   # chờ market_service start xong, rate limiter ổn định
+    try:
+        await screener_service._ensure_index_data()
+        rows = len(screener_service._index_data) if screener_service._index_data is not None else 0
+        print(f"🔥 Warmup VNINDEX: {rows} rows")
+    except Exception as e:
+        print(f"⚠️  Warmup VNINDEX failed: {e}")
 
 app = FastAPI(title="VN Stock API", version="0.3.0", lifespan=lifespan)
 app.add_middleware(
