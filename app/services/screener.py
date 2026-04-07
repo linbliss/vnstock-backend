@@ -170,7 +170,7 @@ class ScreenerService:
         self.INDEX_TTL = 3600       # 1 giờ cho VNINDEX
 
     async def _ensure_index_data(self):
-        """Load VNINDEX data, refresh mỗi 1 giờ"""
+        """Load VNINDEX data, refresh mỗi 1 giờ. Thử nhiều tên symbol."""
         now = datetime.now()
         if (
             self._index_data is not None
@@ -181,13 +181,17 @@ class ScreenerService:
         end   = now.strftime("%Y-%m-%d")
         start = (now - timedelta(days=730)).strftime("%Y-%m-%d")
         loop  = asyncio.get_event_loop()
-        df = await loop.run_in_executor(None, self._fetch_history, "VNINDEX", start, end)
-        if df is not None and len(df) >= 60:
-            self._index_data = df
-            self._index_fetched_at = now
-            print(f"✅ VNINDEX loaded: {len(df)} rows")
-        else:
-            print("⚠️  Không load được VNINDEX data")
+
+        # Thử nhiều tên symbol VNINDEX phổ biến trong vnstock
+        for symbol in ("VNINDEX", "VN-INDEX", "VNI", "^VNINDEX"):
+            df = await loop.run_in_executor(None, self._fetch_history, symbol, start, end)
+            if df is not None and len(df) >= 60:
+                self._index_data = df
+                self._index_fetched_at = now
+                print(f"✅ VNINDEX loaded as '{symbol}': {len(df)} rows")
+                return
+
+        print("⚠️  Không load được VNINDEX data với bất kỳ tên symbol nào")
 
     async def run_screener(
         self,
