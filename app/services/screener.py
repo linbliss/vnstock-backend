@@ -286,25 +286,47 @@ class ScreenerService:
     def _fetch_history(self, ticker: str, start: str, end: str) -> Optional[pd.DataFrame]:
         try:
             from vnstock import Quote
-            df = Quote(symbol=ticker, source='KBS').history(
-                start=start, end=end, interval='1D'
-            )
+            # VNINDEX và index khác dùng TCBS source (KBS không hỗ trợ)
+            is_index = ticker.upper() in ("VNINDEX", "VN-INDEX", "VNI", "^VNINDEX",
+                                          "HNXINDEX", "UPINDEX")
+            sources = ['TCBS', 'KBS'] if is_index else ['KBS', 'TCBS']
+
+            df = None
+            for source in sources:
+                sym = "VNINDEX" if is_index else ticker.upper()
+                try:
+                    raw = Quote(symbol=sym, source=source).history(
+                        start=start, end=end, interval='1D'
+                    )
+                    if raw is not None and not raw.empty:
+                        df = raw
+                        print(f"✅ {ticker} fetched via {source}: {len(raw)} rows")
+                        break
+                    print(f"⚠️  {ticker} empty from {source}, trying next...")
+                except Exception as e:
+                    print(f"⚠️  {ticker} error from {source}: {e}")
+
             if df is None or df.empty:
                 return None
+
             df = df.reset_index()
             # Chuẩn hoá tên cột
             col_map = {}
             for col in df.columns:
                 cl = str(col).lower()
-                if 'close' in cl: col_map[col] = 'close'
-                elif 'open'  in cl: col_map[col] = 'open'
-                elif 'high'  in cl: col_map[col] = 'high'
-                elif 'low'   in cl: col_map[col] = 'low'
+                if 'close'  in cl: col_map[col] = 'close'
+                elif 'open'   in cl: col_map[col] = 'open'
+                elif 'high'   in cl: col_map[col] = 'high'
+                elif 'low'    in cl: col_map[col] = 'low'
                 elif 'volume' in cl: col_map[col] = 'volume'
             df = df.rename(columns=col_map)
-            for c in ['close','open','high','low','volume']:
+
+            for c in ['close', 'open', 'high', 'low']:
                 if c not in df.columns:
                     return None
+            # volume có thể không có với index — điền 0
+            if 'volume' not in df.columns:
+                df['volume'] = 0
             return df
         except Exception as e:
             print(f"fetch_history error {ticker}: {e}")
