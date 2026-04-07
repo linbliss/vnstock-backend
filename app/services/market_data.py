@@ -50,14 +50,21 @@ class MarketDataService:
             self._task.cancel()
 
     def _set_api_key(self):
-        key = os.getenv("VNSTOCK_API_KEY", "")
+        # Đọc trực tiếp từ environment (Railway inject vào đây)
+        key = os.environ.get("VNSTOCK_API_KEY") or os.getenv("VNSTOCK_API_KEY", "")
+        debug_env = os.getenv("DEBUG_VNSTOCK", "").strip().lower() in {"1", "true", "yes", "y"}
+        if debug_env:
+            has_key = bool(key)
+            print(f"DEBUG: VNSTOCK_API_KEY present = {has_key}")
+            print(f"DEBUG: All env keys with VNSTOCK: {[k for k in os.environ if 'VNSTOCK' in k]}")
+
         if not key:
             print("⚠️  VNSTOCK_API_KEY chưa được cấu hình – dùng guest mode")
             return
         try:
             import vnstock
             vnstock.change_api_key(key)
-            print(f"✅ vnstock API key đã thiết lập: {key[:20]}...")
+            print("✅ vnstock API key đã thiết lập")
         except Exception as e:
             print(f"⚠️  Lỗi set API key: {e}")
 

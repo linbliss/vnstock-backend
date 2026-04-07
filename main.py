@@ -2,13 +2,13 @@ import os
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import asyncio
 from app.services.market_data import market_service
 from app.services.alert_engine import run_alert_engine
-from app.routers import quotes, alerts
+from app.routers import quotes, alerts, screener
 
 alert_task = None
 
@@ -22,7 +22,7 @@ async def lifespan(app: FastAPI):
         alert_task.cancel()
     await market_service.stop()
 
-app = FastAPI(title="VN Stock API", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="VN Stock API", version="0.3.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,17 +30,74 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.include_router(quotes.router, prefix="/api/quotes", tags=["quotes"])
-app.include_router(alerts.router, prefix="/api/alerts", tags=["alerts"])
+app.include_router(quotes.router,   prefix="/api/quotes",   tags=["quotes"])
+app.include_router(alerts.router,   prefix="/api/alerts",   tags=["alerts"])
+app.include_router(screener.router, prefix="/api/screener", tags=["screener"])
 
 @app.get("/")
 async def root():
-    return {
-        "status": "running",
-        "quotes_cached": len(market_service.quotes),
-        "active_alerts": len(__import__('app.services.alert_engine', fromlist=['active_alerts']).active_alerts)
-    }
+    return {"status": "running", "version": "0.3.0"}
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/tickers/{exchange}")
+async def get_tickers(exchange: str):
+    ex = (exchange or "").strip().upper()
+    if ex not in {"VN30", "HOSE", "HNX", "UPCOM"}:
+        raise HTTPException(status_code=400, detail="exchange must be one of: VN30, HOSE, HNX, UPCOM")
+
+    if ex == "VN30":
+        tickers = [
+            "VIC", "VHM", "HPG", "TCB", "VCB",
+            "ACB", "MWG", "VNM", "FPT", "SSI",
+            "MBB", "VPB", "HDB", "BCM", "MSN",
+            "STB", "CTG", "BID", "GAS", "SAB",
+            "VJC", "PLX", "POW", "VRE", "GVR",
+        ]
+        return {"exchange": ex, "tickers": tickers, "count": len(tickers)}
+
+    try:
+        def fetch():
+            from vnstock import Listing
+
+            df = Listing().symbols_by_exchange()
+            if df is None or df.empty:
+                return []
+
+            # Debug columns + head + unique exchange values (Railway logs)
+            try:
+                print("DEBUG symbols_by_exchange columns:", df.columns.tolist())
+                print("DEBUG symbols_by_exchange head:\n", df.head())
+                if "exchange" in df.columns:
+                    print("DEBUG symbols_by_exchange exchange unique:", df["exchange"].dropna().astype(str).str.upper().unique().tolist())
+            except Exception as _e:
+                print("DEBUG symbols_by_exchange logging failed:", _e)
+
+            if "exchange" not in df.columns or "type" not in df.columns or "symbol" not in df.columns:
+                missing = [c for c in ["exchange", "type", "symbol"] if c not in df.columns]
+                raise HTTPException(status_code=502, detail=f"symbols_by_exchange missing columns: {missing}")
+
+            filtered = df[
+                (df["exchange"].astype(str).str.upper() == ex.upper())
+                & (df["type"] == "stock")
+            ]
+            return filtered["symbol"].dropna().astype(str).str.upper().tolist()
+
+        tickers = fetch()
+
+        # unique + stable
+        seen = set()
+        tickers_unique = []
+        for t in tickers:
+            if t not in seen:
+                seen.add(t)
+                tickers_unique.append(t)
+
+        return {"exchange": ex, "tickers": tickers_unique, "count": len(tickers_unique)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"failed to fetch symbols for {ex}: {e}")
