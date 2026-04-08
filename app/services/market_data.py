@@ -158,6 +158,11 @@ class MarketDataService:
         BATCH_SIZE = 20
         while self._running:
             try:
+                if not self.is_trading_hours():
+                    # Ngoài giờ giao dịch — không query vnstock, sleep 60s
+                    await asyncio.sleep(60)
+                    continue
+
                 tickers = list(self.subscribed)
                 if tickers:
                     batches = [tickers[i:i+BATCH_SIZE]
@@ -189,11 +194,12 @@ class MarketDataService:
 
     @staticmethod
     def is_trading_hours() -> bool:
+        """Giờ giao dịch HOSE/HNX: 9:00-11:30 và 13:00-15:01, ngày làm việc"""
         now = datetime.now()
-        if now.weekday() >= 5:
+        if now.weekday() >= 5:  # Thứ 7, Chủ nhật
             return False
         total = now.hour * 60 + now.minute
-        return (9*60 <= total <= 11*60+30) or (13*60 <= total <= 14*60+45)
+        return (9*60 <= total <= 11*60+30) or (13*60 <= total <= 15*60+1)
 
 
 market_service = MarketDataService()

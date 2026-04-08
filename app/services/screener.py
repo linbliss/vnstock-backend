@@ -179,7 +179,7 @@ class ScreenerService:
         ):
             return
         end   = now.strftime("%Y-%m-%d")
-        start = (now - timedelta(days=730)).strftime("%Y-%m-%d")
+        start = "2000-01-01"   # Lấy toàn bộ lịch sử có sẵn
         loop  = asyncio.get_event_loop()
 
         # Thử nhiều tên symbol VNINDEX phổ biến trong vnstock
@@ -223,9 +223,9 @@ class ScreenerService:
             if cached_time and (now - cached_time).seconds < self.CACHE_TTL:
                 return self._cache[ticker]
 
-        # Lấy dữ liệu lịch sử – cần 2 năm để đủ MA200 (~280 ngày lịch)
+        # Lấy toàn bộ lịch sử có sẵn – càng nhiều càng tin cậy cho MA200, RS
         end   = now.strftime("%Y-%m-%d")
-        start = (now - timedelta(days=730)).strftime("%Y-%m-%d")
+        start = "2000-01-01"
 
         await self._ensure_index_data()
         loop = asyncio.get_event_loop()
