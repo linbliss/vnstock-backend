@@ -7,50 +7,85 @@ from app.services.screener import screener_service
 _fundamental_cache: Dict[str, Any] = {}
 
 def _fetch_fundamental_sync(ticker: str) -> Dict[str, Any]:
-    """Lấy EPS & ROE theo quý từ vnstocks (chạy trong executor)."""
-    empty = {'ticker': ticker, 'eps': [], 'roe': [], 'eps_growth': False,
-             'roe_latest': 0.0, 'roe_growth': False}
+    """Lấy EPS & ROE theo quý từ vnstocks (chạy trong executor).
+
+    vnstocks trả về DataFrame GIẢM DẦN (mới nhất ở đầu).
+    Cần lấy head() rồi đảo ngược để có thứ tự tăng dần (cũ→mới).
+    """
+    import math
+    empty = {'ticker': ticker, 'eps': [], 'roe': [], 'quarters': [],
+             'eps_growth': False, 'roe_latest': 0.0, 'roe_growth': False}
     try:
         from vnstock import Vnstock
+        import pandas as pd
         stock = Vnstock().stock(symbol=ticker, source='VCI')
         df = stock.finance.ratio(period='quarterly', lang='en', dropna=False)
         if df is None or df.empty:
             return empty
 
         # Flatten multi-level columns
-        df.columns = ['_'.join(str(c) for c in col).strip() if isinstance(col, tuple) else str(col)
-                      for col in df.columns]
+        flat_cols = ['_'.join(str(c) for c in col).strip() if isinstance(col, tuple) else str(col)
+                     for col in df.columns]
+        df.columns = flat_cols
 
-        # Tìm cột EPS và ROE
-        eps_col = next((c for c in df.columns if 'eps' in c.lower() and 'vnd' in c.lower()), None) or \
-                  next((c for c in df.columns if 'eps' in c.lower()), None)
-        roe_col = next((c for c in df.columns if 'roe' in c.lower()), None)
+        # Tìm các cột cần thiết
+        eps_col  = next((c for c in flat_cols if 'eps' in c.lower() and 'vnd' in c.lower()), None) or \
+                   next((c for c in flat_cols if 'eps' in c.lower()), None)
+        roe_col  = next((c for c in flat_cols if 'roe' in c.lower()), None)
+        year_col = next((c for c in flat_cols if 'yearreport' in c.lower() or 'year' in c.lower()), None)
+        len_col  = next((c for c in flat_cols if 'lengthreport' in c.lower() or 'length' in c.lower()), None)
 
-        eps_vals, roe_vals = [], []
+        # DataFrame là GIẢM DẦN (mới nhất ở hàng đầu)
+        # Lấy 16 hàng đầu (mới nhất) rồi ĐẢO NGƯỢC → thứ tự tăng dần (cũ→mới)
+        recent = df.head(16).iloc[::-1].reset_index(drop=True)
 
-        if eps_col:
-            raw = df[eps_col].dropna()
-            raw = raw[raw != 0]
-            eps_vals = [round(float(v), 0) for v in raw.tail(8).tolist()]
+        eps_vals, roe_vals, quarters = [], [], []
 
-        if roe_col:
-            raw = df[roe_col].dropna()
-            raw = raw[raw != 0]
-            # ROE từ vnstocks là decimal (0.246 = 24.6%) → nhân 100
-            vals = raw.tail(8).tolist()
-            roe_vals = [round(float(v) * 100 if abs(float(v)) < 5 else float(v), 2) for v in vals]
+        for _, row in recent.iterrows():
+            eps_raw = row.get(eps_col) if eps_col else None
+            roe_raw = row.get(roe_col) if roe_col else None
+            year    = int(row.get(year_col, 0)) if year_col else 0
+            quarter = int(row.get(len_col,  0)) if len_col  else 0
 
-        # EPS tăng trưởng: ít nhất 2 quý gần nhất đều tăng
-        eps_growth = (len(eps_vals) >= 2 and all(
-            eps_vals[i] > eps_vals[i-1] for i in range(max(1, len(eps_vals)-2), len(eps_vals))
-        ))
-        roe_growth = (len(roe_vals) >= 2 and roe_vals[-1] > roe_vals[-2])
+            # Bỏ qua hàng không có EPS
+            if eps_raw is None or (isinstance(eps_raw, float) and math.isnan(eps_raw)):
+                continue
+
+            eps_f = float(eps_raw)
+            if eps_f == 0:
+                continue
+
+            roe_f = 0.0
+            if roe_raw is not None and not (isinstance(roe_raw, float) and math.isnan(roe_raw)):
+                roe_f = float(roe_raw)
+                # vnstocks trả ROE dạng decimal (0.246 = 24.6%) → nhân 100
+                if abs(roe_f) < 5:
+                    roe_f = round(roe_f * 100, 2)
+
+            eps_vals.append(round(eps_f, 0))
+            roe_vals.append(round(roe_f, 2))
+            quarters.append({'year': year, 'quarter': quarter})
+
+        # Giữ 8 quý gần nhất (cuối mảng = mới nhất)
+        eps_vals = eps_vals[-8:]
+        roe_vals = roe_vals[-8:]
+        quarters = quarters[-8:]
+
+        # Tính tăng trưởng: kiểm tra N quý cuối liên tiếp tăng
+        def check_growth(vals: list, n: int) -> bool:
+            if len(vals) < n + 1:
+                return False
+            return all(vals[i] > vals[i - 1] for i in range(len(vals) - n, len(vals)))
+
+        eps_growth = check_growth(eps_vals, 2)
+        roe_growth = check_growth(roe_vals, 1)
         roe_latest = roe_vals[-1] if roe_vals else 0.0
 
         return {
             'ticker':     ticker,
             'eps':        eps_vals,
             'roe':        roe_vals,
+            'quarters':   quarters,   # [{"year":2025,"quarter":4}, ...]  cũ→mới
             'eps_growth': eps_growth,
             'roe_latest': roe_latest,
             'roe_growth': roe_growth,
