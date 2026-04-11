@@ -1,6 +1,63 @@
 from fastapi import APIRouter, Query
-from typing import List
+from typing import List, Dict, Any
+import asyncio
 from app.services.screener import screener_service
+
+# Cache fundamental data theo session để tránh gọi vnstocks nhiều lần
+_fundamental_cache: Dict[str, Any] = {}
+
+def _fetch_fundamental_sync(ticker: str) -> Dict[str, Any]:
+    """Lấy EPS & ROE theo quý từ vnstocks (chạy trong executor)."""
+    empty = {'ticker': ticker, 'eps': [], 'roe': [], 'eps_growth': False,
+             'roe_latest': 0.0, 'roe_growth': False}
+    try:
+        from vnstock import Vnstock
+        stock = Vnstock().stock(symbol=ticker, source='VCI')
+        df = stock.finance.ratio(period='quarterly', lang='en', dropna=False)
+        if df is None or df.empty:
+            return empty
+
+        # Flatten multi-level columns
+        df.columns = ['_'.join(str(c) for c in col).strip() if isinstance(col, tuple) else str(col)
+                      for col in df.columns]
+
+        # Tìm cột EPS và ROE
+        eps_col = next((c for c in df.columns if 'eps' in c.lower() and 'vnd' in c.lower()), None) or \
+                  next((c for c in df.columns if 'eps' in c.lower()), None)
+        roe_col = next((c for c in df.columns if 'roe' in c.lower()), None)
+
+        eps_vals, roe_vals = [], []
+
+        if eps_col:
+            raw = df[eps_col].dropna()
+            raw = raw[raw != 0]
+            eps_vals = [round(float(v), 0) for v in raw.tail(8).tolist()]
+
+        if roe_col:
+            raw = df[roe_col].dropna()
+            raw = raw[raw != 0]
+            # ROE từ vnstocks là decimal (0.246 = 24.6%) → nhân 100
+            vals = raw.tail(8).tolist()
+            roe_vals = [round(float(v) * 100 if abs(float(v)) < 5 else float(v), 2) for v in vals]
+
+        # EPS tăng trưởng: ít nhất 2 quý gần nhất đều tăng
+        eps_growth = (len(eps_vals) >= 2 and all(
+            eps_vals[i] > eps_vals[i-1] for i in range(max(1, len(eps_vals)-2), len(eps_vals))
+        ))
+        roe_growth = (len(roe_vals) >= 2 and roe_vals[-1] > roe_vals[-2])
+        roe_latest = roe_vals[-1] if roe_vals else 0.0
+
+        return {
+            'ticker':     ticker,
+            'eps':        eps_vals,
+            'roe':        roe_vals,
+            'eps_growth': eps_growth,
+            'roe_latest': roe_latest,
+            'roe_growth': roe_growth,
+        }
+    except Exception as e:
+        print(f"Fundamental error {ticker}: {e}")
+        return empty
 
 router = APIRouter()
 
@@ -60,6 +117,38 @@ async def analyze_ticker(ticker: str):
     if not result:
         return {"error": f"Không đủ dữ liệu cho {ticker}"}
     return result
+
+@router.get("/fundamental/{ticker}")
+async def get_fundamental(ticker: str):
+    """Lấy EPS & ROE theo quý cho 1 mã (cache session)."""
+    sym = ticker.upper()
+    if sym not in _fundamental_cache:
+        loop = asyncio.get_event_loop()
+        _fundamental_cache[sym] = await loop.run_in_executor(None, _fetch_fundamental_sync, sym)
+    return _fundamental_cache[sym]
+
+@router.post("/fundamental/batch")
+async def get_fundamental_batch(tickers: List[str]):
+    """Lấy EPS & ROE cho nhiều mã, chạy song song (max 5 concurrent)."""
+    loop = asyncio.get_event_loop()
+    sem  = asyncio.Semaphore(5)
+
+    async def fetch_one(sym: str):
+        if sym in _fundamental_cache:
+            return _fundamental_cache[sym]
+        async with sem:
+            result = await loop.run_in_executor(None, _fetch_fundamental_sync, sym)
+            _fundamental_cache[sym] = result
+            return result
+
+    results = await asyncio.gather(*[fetch_one(t.upper()) for t in tickers])
+    return {'results': list(results)}
+
+@router.delete("/fundamental/cache")
+async def clear_fundamental_cache():
+    """Xoá cache fundamental (dùng khi muốn refresh dữ liệu)."""
+    _fundamental_cache.clear()
+    return {'cleared': True}
 
 @router.get("/debug/vnindex")
 async def debug_vnindex():
