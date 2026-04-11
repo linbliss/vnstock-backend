@@ -36,10 +36,11 @@ def _fetch_fundamental_sync(ticker: str) -> Dict[str, Any]:
         len_col  = next((c for c in flat_cols if 'lengthreport' in c.lower() or 'length' in c.lower()), None)
 
         # DataFrame là GIẢM DẦN (mới nhất ở hàng đầu)
-        # Lấy 16 hàng đầu (mới nhất) rồi ĐẢO NGƯỢC → thứ tự tăng dần (cũ→mới)
-        recent = df.head(16).iloc[::-1].reset_index(drop=True)
+        # Lấy 20 hàng (cần thêm để tính TTM: 8 TTM points cần 11 standalone quarters)
+        recent = df.head(20).iloc[::-1].reset_index(drop=True)
 
-        eps_vals, roe_vals, quarters = [], [], []
+        # ── Bước 1: Thu thập EPS/ROE standalone từng quý (cũ→mới) ──
+        raw_eps, raw_roe, raw_quarters = [], [], []
 
         for _, row in recent.iterrows():
             eps_raw = row.get(eps_col) if eps_col else None
@@ -47,13 +48,10 @@ def _fetch_fundamental_sync(ticker: str) -> Dict[str, Any]:
             year    = int(row.get(year_col, 0)) if year_col else 0
             quarter = int(row.get(len_col,  0)) if len_col  else 0
 
-            # Bỏ qua hàng không có EPS
             if eps_raw is None or (isinstance(eps_raw, float) and math.isnan(eps_raw)):
                 continue
 
             eps_f = float(eps_raw)
-            if eps_f == 0:
-                continue
 
             roe_f = 0.0
             if roe_raw is not None and not (isinstance(roe_raw, float) and math.isnan(roe_raw)):
@@ -62,30 +60,42 @@ def _fetch_fundamental_sync(ticker: str) -> Dict[str, Any]:
                 if abs(roe_f) < 5:
                     roe_f = round(roe_f * 100, 2)
 
-            eps_vals.append(round(eps_f, 0))
-            roe_vals.append(round(roe_f, 2))
-            quarters.append({'year': year, 'quarter': quarter})
+            raw_eps.append(eps_f)
+            raw_roe.append(round(roe_f, 2))
+            raw_quarters.append({'year': year, 'quarter': quarter})
 
-        # Giữ 8 quý gần nhất (cuối mảng = mới nhất)
-        eps_vals = eps_vals[-8:]
+        # ── Bước 2: Tính TTM EPS (Trailing Twelve Months = tổng 4 quý liên tiếp) ──
+        # FireAnt / Vietstock hiển thị TTM EPS chứ không phải EPS quý đơn lẻ.
+        # TTM tại quý i = raw_eps[i-3] + raw_eps[i-2] + raw_eps[i-1] + raw_eps[i]
+        eps_ttm, roe_vals, quarters = [], [], []
+        for i in range(len(raw_eps)):
+            if i < 3:
+                continue   # cần ít nhất 4 quý để tính TTM
+            ttm = round(sum(raw_eps[i - 3: i + 1]), 0)
+            eps_ttm.append(ttm)
+            roe_vals.append(raw_roe[i])
+            quarters.append(raw_quarters[i])
+
+        # Giữ 8 quý TTM gần nhất
+        eps_ttm  = eps_ttm[-8:]
         roe_vals = roe_vals[-8:]
         quarters = quarters[-8:]
 
-        # Tính tăng trưởng: kiểm tra N quý cuối liên tiếp tăng
+        # ── Bước 3: Kiểm tra tăng trưởng theo TTM EPS ──
         def check_growth(vals: list, n: int) -> bool:
             if len(vals) < n + 1:
                 return False
             return all(vals[i] > vals[i - 1] for i in range(len(vals) - n, len(vals)))
 
-        eps_growth = check_growth(eps_vals, 2)
+        eps_growth = check_growth(eps_ttm, 2)
         roe_growth = check_growth(roe_vals, 1)
         roe_latest = roe_vals[-1] if roe_vals else 0.0
 
         return {
             'ticker':     ticker,
-            'eps':        eps_vals,
+            'eps':        eps_ttm,      # TTM EPS — khớp với FireAnt / Vietstock
             'roe':        roe_vals,
-            'quarters':   quarters,   # [{"year":2025,"quarter":4}, ...]  cũ→mới
+            'quarters':   quarters,     # [{"year":2025,"quarter":4}, ...]  cũ→mới
             'eps_growth': eps_growth,
             'roe_latest': roe_latest,
             'roe_growth': roe_growth,
