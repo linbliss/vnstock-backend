@@ -1,0 +1,102 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches:
+      - main          # Tự động deploy khi push lên main
+  workflow_dispatch:  # Cho phép chạy thủ công từ GitHub UI
+
+# Chỉ 1 deploy chạy cùng lúc — tránh conflict
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+jobs:
+  # ────────────────────────────────────────────────────────────
+  # Job 1: Kiểm tra code trước khi deploy
+  # ────────────────────────────────────────────────────────────
+  lint:
+    name: Lint & Validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Kiểm tra syntax Python
+        run: python -m py_compile main.py && echo "✅ Syntax OK"
+
+      - name: Validate .env.example có đầy đủ keys
+        run: |
+          echo "✅ Kiểm tra .env.example..."
+          required_keys="FIREANT_TOKEN SUPABASE_URL SUPABASE_SERVICE_KEY TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID"
+          for key in $required_keys; do
+            if ! grep -q "^${key}=" .env.example; then
+              echo "❌ Thiếu key: $key trong .env.example"
+              exit 1
+            fi
+          done
+          echo "✅ Tất cả required keys có trong .env.example"
+
+  # ────────────────────────────────────────────────────────────
+  # Job 2: Deploy lên VPS (chỉ chạy sau khi lint pass)
+  # ────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy to VPS
+    runs-on: ubuntu-latest
+    needs: lint        # Chờ lint pass mới deploy
+    environment: production  # Dùng GitHub Environment secrets
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Lấy thông tin commit
+        id: commit_info
+        run: |
+          echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          echo "message=$(git log -1 --pretty=format:'%s')" >> $GITHUB_OUTPUT
+          echo "author=$(git log -1 --pretty=format:'%an')" >> $GITHUB_OUTPUT
+
+      - name: Deploy lên VPS qua SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || '22' }}
+          timeout: 120s
+          script_stop: true    # Dừng nếu có lỗi bất kỳ
+          script: |
+            set -e
+            echo "🚀 Deploy từ GitHub Actions bắt đầu..."
+            echo "   Commit: [${{ steps.commit_info.outputs.sha_short }}] ${{ steps.commit_info.outputs.message }}"
+            echo "   By: ${{ steps.commit_info.outputs.author }}"
+            echo ""
+
+            # Chạy deploy script
+            APP_DIR=/opt/vnstock-backend bash /opt/vnstock-backend/scripts/deploy.sh
+
+            echo ""
+            echo "✅ Deploy hoàn tất!"
+
+      - name: Thông báo deploy thành công
+        if: success()
+        run: |
+          echo "✅ Deploy thành công!"
+          echo "   Server: ${{ secrets.VPS_HOST }}"
+          echo "   Commit: [${{ steps.commit_info.outputs.sha_short }}] ${{ steps.commit_info.outputs.message }}"
+
+      - name: Thông báo deploy thất bại
+        if: failure()
+        run: |
+          echo "❌ Deploy THẤT BẠI!"
+          echo "   Kiểm tra logs tại: Actions → Deploy to VPS → Job details"
