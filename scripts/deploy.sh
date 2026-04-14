@@ -47,22 +47,22 @@ COMMIT_SHA=$(git rev-parse --short HEAD)
 COMMIT_MSG=$(git log -1 --pretty=format:"%s")
 info "Commit: [$COMMIT_SHA] $COMMIT_MSG"
 
-# ── Bước 2: Kiểm tra requirements có thay đổi không ────────────────────────
+# ── Bước 2: Kiểm tra requirements có thay đổi không (chỉ để log) ───────────
 info "Bước 2/5: Kiểm tra dependencies..."
 REQUIREMENTS_CHANGED=$(git diff HEAD@{1} HEAD -- requirements.txt 2>/dev/null | wc -l || echo "0")
 if [ "$REQUIREMENTS_CHANGED" -gt 0 ]; then
-    info "requirements.txt đã thay đổi — sẽ rebuild Docker image"
-    BUILD_FLAG="--build"
+    info "requirements.txt đã thay đổi — rebuild đầy đủ"
 else
-    BUILD_FLAG=""
-    info "requirements.txt không đổi — dùng cached image"
+    info "requirements.txt không đổi — Docker dùng layer cache (pip install bỏ qua)"
 fi
 
-# ── Bước 3: Build & restart container ──────────────────────────────────────
-info "Bước 3/5: Restart container..."
+# ── Bước 3: Luôn rebuild image với code mới ─────────────────────────────────
+# Phải có --build để copy source code mới vào image
+# Docker tự cache layer pip install nếu requirements.txt không đổi → vẫn nhanh
+info "Bước 3/5: Rebuild & restart container..."
 docker compose down --remove-orphans 2>/dev/null || true
-docker compose up -d $BUILD_FLAG
-success "Container đã khởi động"
+docker compose up -d --build
+success "Container đã khởi động với code mới"
 
 # ── Bước 4: Health check ────────────────────────────────────────────────────
 info "Bước 4/5: Kiểm tra health check..."
