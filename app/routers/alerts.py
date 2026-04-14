@@ -29,30 +29,12 @@ async def test_alert():
     )
     return {"sent": ok, "token_set": bool(BOT_TOKEN), "chat_set": bool(CHAT_ID)}
 
-class SetAlertRequest(BaseModel):
-    ticker: str
-    target_price: float
-    direction: str  # "above" | "below"
-
-@router.post("/set")
-async def set_alert(req: SetAlertRequest):
-    from app.services.alert_engine import set_price_alert
-    set_price_alert(req.ticker.upper(), req.target_price, req.direction)
-    direction_text = "tăng lên trên" if req.direction == "above" else "giảm xuống dưới"
-    await send_telegram(
-        f"🔔 <b>Đã đặt cảnh báo</b>\n"
-        f"Mã: <b>{req.ticker.upper()}</b>\n"
-        f"Khi giá {direction_text} <b>{req.target_price:,.0f}</b>"
-    )
-    return {"set": True, "ticker": req.ticker.upper(), "target": req.target_price}
-
-@router.delete("/remove/{ticker}")
-async def remove_alert(ticker: str):
-    from app.services.alert_engine import remove_alert
-    remove_alert(ticker.upper())
-    return {"removed": ticker.upper()}
-
-@router.get("/list")
-async def list_alerts():
-    from app.services.alert_engine import active_alerts
-    return list(active_alerts.values())
+@router.get("/status")
+async def alert_status():
+    """Trả về trạng thái alert engine — alerts được quản lý qua Supabase watchlist_items."""
+    from app.services.alert_engine import _states
+    return {
+        "engine": "running",
+        "users": len(_states),
+        "note": "Alerts được quản lý qua Watchlist (alert_price) và VCP engine trên backend."
+    }
