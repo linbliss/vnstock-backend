@@ -5,17 +5,26 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 from app.services.market_data import market_service
 
+# Dùng chung RateLimiter của market_service để tránh vượt quota vnai (60/phút).
+_limiter = market_service._limiter
+
 # ── Trend Template Minervini – 8 tiêu chí ──
-def check_trend_template(df: pd.DataFrame) -> Dict:
+# RS_MIN_VN: TTCK Việt Nam mẫu nhỏ (~1600 mã, thanh khoản mỏng) → dùng 55
+# thay vì chuẩn Minervini gốc 70. Giá trị có thể đổi trong alert settings.
+RS_MIN_VN = 55.0
+
+def check_trend_template(df: pd.DataFrame, rs_rating: float = 0.0) -> Dict:
     """
     df: OHLCV daily data, columns: open, high, low, close, volume
+    rs_rating: tính trước bằng compute_rs_rating(), truyền vào để tính c8
     Trả về dict điểm từng tiêu chí và tổng điểm
     """
     if df is None or len(df) < 200:
         return {"score": 0, "criteria": {}, "passed": False}
 
     close = df['close'].values
-    volume = df['volume'].values
+    high  = df['high'].values  if 'high' in df.columns else close
+    low   = df['low'].values   if 'low'  in df.columns else close
     current = close[-1]
 
     # Tính các MA
@@ -24,12 +33,9 @@ def check_trend_template(df: pd.DataFrame) -> Dict:
     ma200 = float(pd.Series(close).rolling(200).mean().iloc[-1])
     ma200_1m_ago = float(pd.Series(close).rolling(200).mean().iloc[-22])  # ~1 tháng
 
-    # 52 tuần
-    high_52w = float(np.max(close[-252:]))
-    low_52w  = float(np.min(close[-252:]))
-
-    # Volume MA30
-    vol_ma30 = float(pd.Series(volume).rolling(30).mean().iloc[-1])
+    # 52 tuần — dùng high/low thật (không phải close) để khớp Minervini gốc
+    high_52w = float(np.max(high[-252:]))
+    low_52w  = float(np.min(low[-252:]))
 
     criteria = {
         "c1_price_above_ma200":  bool(current > ma200),
@@ -39,7 +45,8 @@ def check_trend_template(df: pd.DataFrame) -> Dict:
         "c5_price_above_ma50":   bool(current > ma50),
         "c6_above_52w_low_30":   bool(current >= low_52w  * 1.30),
         "c7_near_52w_high_25":   bool(current >= high_52w * 0.75),
-        "c8_volume_sufficient":  bool(vol_ma30 > 100_000),
+        # c8: RS Rating ≥ 55 (TTCK VN mẫu nhỏ) — chuẩn Minervini là 70
+        "c8_rs_rating_strong":   bool(rs_rating >= RS_MIN_VN),
     }
 
     score = sum(criteria.values())
@@ -52,14 +59,16 @@ def check_trend_template(df: pd.DataFrame) -> Dict:
         "ma200":    round(ma200, 0),
         "high_52w": round(high_52w, 0),
         "low_52w":  round(low_52w, 0),
-        "vol_ma30": round(vol_ma30, 0),
+        "rs_rating": round(rs_rating, 1),
     }
 
 
 def compute_rs_rating(stock_returns: pd.Series, index_returns: pd.Series) -> float:
     """
     Tính RS Rating (0-100) so với VN-Index
-    Dựa trên hiệu suất tương đối 12 tháng (weighted: 25% Q4, 25% Q3, 25% Q2, 25% Q1)
+    Weighted 12 tháng: 40% quý gần nhất (63d) + 20% mỗi quý còn lại (126/189/252d)
+    Ưu tiên momentum gần để bắt đà mới sớm hơn. Đây là approximation;
+    RS percentile chuẩn IBD cần rank trên toàn universe (TODO Mức C).
     """
     try:
         # Lấy returns 63, 126, 189, 252 ngày
@@ -70,7 +79,7 @@ def compute_rs_rating(stock_returns: pd.Series, index_returns: pd.Series) -> flo
 
         stock_r  = [period_return(stock_returns,  p) for p in [63, 126, 189, 252]]
         index_r  = [period_return(index_returns,  p) for p in [63, 126, 189, 252]]
-        weights  = [0.4, 0.2, 0.2, 0.2]
+        weights  = [0.4, 0.2, 0.2, 0.2]   # 40/20/20/20 — khớp docstring
 
         stock_score = sum(r * w for r, w in zip(stock_r,  weights))
         index_score = sum(r * w for r, w in zip(index_r,  weights))
@@ -86,16 +95,23 @@ def compute_rs_rating(stock_returns: pd.Series, index_returns: pd.Series) -> flo
 
 def detect_vcp(df: pd.DataFrame) -> Dict:
     """
-    Nhận diện VCP (Volatility Contraction Pattern)
-    Trả về: is_vcp, contraction_count, tightness, pivot_buy_point
+    Nhận diện VCP (Volatility Contraction Pattern) — Mức A (vá nhanh).
+    Thuật toán slice cố định 10 ngày còn thô; Mức B sẽ viết lại bằng swing-point.
+    Trả về: is_vcp, contracting, vol_contracting, uptrend_ok, tightness, pivot_buy, ...
     """
-    if df is None or len(df) < 60:
+    if df is None or len(df) < 130:
+        # Cần ≥ 130 phiên để kiểm tra uptrend 6 tháng
         return {"is_vcp": False, "stage": "unknown"}
 
     close  = df['close'].values
     high   = df['high'].values
     low    = df['low'].values
     volume = df['volume'].values
+
+    # ── Uptrend check: phải +15% trong 6 tháng trước đó (Stage 2 filter thô) ──
+    price_6m_ago = float(close[-126]) if len(close) >= 126 else float(close[0])
+    current_close = float(close[-1])
+    uptrend_ok = current_close >= price_6m_ago * 1.15
 
     # Tìm pivot highs/lows trong 60 ngày gần nhất
     window = min(60, len(close))
@@ -143,19 +159,27 @@ def detect_vcp(df: pd.DataFrame) -> Dict:
     current_vol = float(v[-1])
     vol_ratio = current_vol / vol_ma30 if vol_ma30 > 0 else 0
 
-    is_vcp = contracting and tightness < 15  # biên hẹp < 15%
+    # Mức A: siết điều kiện VCP — cần hội đủ 3 yếu tố:
+    #   1) biên co dần (contracting)
+    #   2) volume cạn dần (vol_contracting)
+    #   3) biên cuối < 10% (tightness chặt, chuẩn Minervini 3-10%)
+    #   4) có uptrend 6 tháng trước đó (Stage 2)
+    is_vcp = contracting and vol_contracting and tightness < 10 and uptrend_ok
 
     return {
-        "is_vcp":        is_vcp,
-        "contracting":   contracting,
-        "tightness":     round(tightness, 2),
-        "pivot_buy":     pivot_buy,
-        "near_pivot":    near_pivot,
-        "vol_ratio":     round(vol_ratio, 2),
-        "vol_confirmed": vol_ratio >= 1.3,
-        "segments":      len(segments),
+        "is_vcp":          is_vcp,
+        "contracting":     contracting,
+        "vol_contracting": vol_contracting,
+        "uptrend_ok":      uptrend_ok,
+        "tightness":       round(tightness, 2),
+        "pivot_buy":       pivot_buy,
+        "near_pivot":      near_pivot,
+        "vol_ratio":       round(vol_ratio, 2),
+        "vol_confirmed":   vol_ratio >= 1.3,
+        "segments":        len(segments),
         "stage": "vcp" if is_vcp else (
-            "contracting" if contracting else "base_forming"
+            "contracting" if contracting else
+            "no_uptrend" if not uptrend_ok else "base_forming"
         ),
     }
 
@@ -184,6 +208,7 @@ class ScreenerService:
 
         # Thử nhiều tên symbol VNINDEX phổ biến trong vnstock
         for symbol in ("VNINDEX", "VN-INDEX", "VNI", "^VNINDEX"):
+            await _limiter.acquire()        # tôn trọng quota vnai 60/phút
             df = await loop.run_in_executor(None, self._fetch_history, symbol, start, end)
             if df is not None and len(df) >= 60:
                 self._index_data = df
@@ -229,6 +254,7 @@ class ScreenerService:
 
         await self._ensure_index_data()
         loop = asyncio.get_event_loop()
+        await _limiter.acquire()            # tôn trọng quota vnai 60/phút
         df = await loop.run_in_executor(
             None, self._fetch_history, ticker, start, end
         )
@@ -236,8 +262,15 @@ class ScreenerService:
         if df is None or len(df) < 60:
             return None
 
-        # Trend Template
-        trend = check_trend_template(df)
+        # RS Rating (so với VN-Index) — tính TRƯỚC để truyền vào trend template
+        rs_rating = 50.0
+        if self._index_data is not None and len(self._index_data) >= 60:
+            rs_rating = compute_rs_rating(
+                df['close'], self._index_data['close']
+            )
+
+        # Trend Template (c8 dùng rs_rating ≥ 55)
+        trend = check_trend_template(df, rs_rating=rs_rating)
 
         # VCP
         vcp = detect_vcp(df)
@@ -247,13 +280,6 @@ class ScreenerService:
         current_price = float(quote.get("price", df['close'].iloc[-1]))
         change_pct    = float(quote.get("change_pct", 0))
         volume        = int(quote.get("volume", 0))
-
-        # RS Rating (so với VN-Index)
-        rs_rating = 50.0
-        if self._index_data is not None and len(self._index_data) >= 60:
-            rs_rating = compute_rs_rating(
-                df['close'], self._index_data['close']
-            )
 
         # Tổng điểm (0-100)
         trend_pts = trend["score"] * 5          # max 40
@@ -286,10 +312,10 @@ class ScreenerService:
     def _fetch_history(self, ticker: str, start: str, end: str) -> Optional[pd.DataFrame]:
         try:
             from vnstock import Quote
-            # VNINDEX và index khác dùng TCBS source (KBS không hỗ trợ)
+            # VNINDEX dùng VCI/MSN (KBS không hỗ trợ; TCBS đã bị loại khỏi vnstock mới)
             is_index = ticker.upper() in ("VNINDEX", "VN-INDEX", "VNI", "^VNINDEX",
                                           "HNXINDEX", "UPINDEX")
-            sources = ['TCBS', 'KBS'] if is_index else ['KBS', 'TCBS']
+            sources = ['vci', 'msn'] if is_index else ['kbs', 'vci']
 
             df = None
             for source in sources:
@@ -303,8 +329,10 @@ class ScreenerService:
                         print(f"✅ {ticker} fetched via {source}: {len(raw)} rows")
                         break
                     print(f"⚠️  {ticker} empty from {source}, trying next...")
-                except Exception as e:
-                    print(f"⚠️  {ticker} error from {source}: {e}")
+                # Bắt BaseException để nuốt SystemExit từ vnai.beam.quota
+                # (vnai gọi sys.exit() khi rate limit, bypass except Exception)
+                except BaseException as e:
+                    print(f"⚠️  {ticker} error from {source}: {type(e).__name__}: {e}")
 
             if df is None or df.empty:
                 return None

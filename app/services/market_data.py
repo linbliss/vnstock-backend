@@ -6,7 +6,7 @@ from datetime import datetime
 from collections import deque
 
 class RateLimiter:
-    def __init__(self, max_calls: int = 55, period: float = 60.0):
+    def __init__(self, max_calls: int = 50, period: float = 60.0):
         self.max_calls = max_calls
         self.period    = period
         self._calls: deque = deque()
@@ -35,7 +35,7 @@ class MarketDataService:
         self.listeners: List[Callable] = []
         self._task    = None
         self._running = False
-        self._limiter = RateLimiter(max_calls=55, period=60.0)
+        self._limiter = RateLimiter(max_calls=50, period=60.0)
 
     async def start(self):
         self._running = True
@@ -128,8 +128,9 @@ class MarketDataService:
                     continue
             print(f"✅ Fetched {len(quotes)} quotes")
             return quotes
-        except Exception as e:
-            print(f"_fetch_sync error: {e}")
+        # BaseException để nuốt SystemExit từ vnai.beam.quota (rate limit)
+        except BaseException as e:
+            print(f"_fetch_sync error: {type(e).__name__}: {e}")
             return []
 
     async def fetch_historical(self, ticker: str, from_date: str, to_date: str) -> List[dict]:
@@ -150,8 +151,9 @@ class MarketDataService:
             if df is None or df.empty:
                 return []
             return df.reset_index().to_dict('records')
-        except Exception as e:
-            print(f"_hist_sync error: {e}")
+        # BaseException để nuốt SystemExit từ vnai.beam.quota (rate limit)
+        except BaseException as e:
+            print(f"_hist_sync error: {type(e).__name__}: {e}")
             return []
 
     async def _polling_loop(self):

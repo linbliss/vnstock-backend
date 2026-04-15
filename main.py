@@ -112,5 +112,6 @@ async def get_tickers(exchange: str):
         return {"exchange": ex, "tickers": tickers_unique, "count": len(tickers_unique)}
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"failed to fetch symbols for {ex}: {e}")
+    # BaseException để nuốt SystemExit từ vnai.beam.quota
+    except BaseException as e:
+        raise HTTPException(status_code=502, detail=f"failed to fetch symbols for {ex}: {type(e).__name__}: {e}")

@@ -146,7 +146,7 @@ def _fmt_criteria(criteria: dict) -> str:
         "c5_price_above_ma50":  "Giá > MA50",
         "c6_above_52w_low_30":  "+30% vs đáy 52w",
         "c7_near_52w_high_25":  "75% đỉnh 52w",
-        "c8_volume_sufficient": "Volume đủ lớn",
+        "c8_rs_rating_strong":  "RS Rating ≥ 55",
     }
     return "\n".join(
         f"  {'✅' if criteria.get(k) else '❌'} {v}"

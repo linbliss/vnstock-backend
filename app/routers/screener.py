@@ -15,6 +15,8 @@ def _fetch_fundamental_sync(ticker: str) -> Dict[str, Any]:
     import math
     empty = {'ticker': ticker, 'eps': [], 'roe': [], 'quarters': [],
              'eps_growth': False, 'roe_latest': 0.0, 'roe_growth': False}
+    # Rate-limit qua limiter chung (sync wrapper): dùng acquire_blocking nếu có,
+    # nếu không chỉ catch BaseException để nuốt SystemExit từ vnai
     try:
         from vnstock import Vnstock
         import pandas as pd
@@ -100,8 +102,9 @@ def _fetch_fundamental_sync(ticker: str) -> Dict[str, Any]:
             'roe_latest': roe_latest,
             'roe_growth': roe_growth,
         }
-    except Exception as e:
-        print(f"Fundamental error {ticker}: {e}")
+    # BaseException để nuốt SystemExit từ vnai.beam.quota (rate limit exceeded)
+    except BaseException as e:
+        print(f"Fundamental error {ticker}: {type(e).__name__}: {e}")
         return empty
 
 router = APIRouter()
@@ -115,20 +118,27 @@ async def get_tickers_by_exchange(exchange: str) -> List[str]:
         import asyncio
         loop = asyncio.get_event_loop()
         def fetch():
-            from vnstock import Listing
-            df = Listing().symbols_by_exchange()
-            if df is None or df.empty:
+            try:
+                from vnstock import Listing
+                df = Listing().symbols_by_exchange()
+                if df is None or df.empty:
+                    return []
+                filtered = df[
+                    (df['exchange'].str.upper() == exchange.upper()) &
+                    (df['type'] == 'stock')
+                ]
+                tickers = filtered['symbol'].str.upper().tolist()
+                print(f"✅ {exchange}: {len(tickers)} mã")
+                return tickers
+            # Nuốt SystemExit từ vnai để không giết worker
+            except BaseException as e:
+                print(f"Listing error: {type(e).__name__}: {e}")
                 return []
-            filtered = df[
-                (df['exchange'].str.upper() == exchange.upper()) &
-                (df['type'] == 'stock')
-            ]
-            tickers = filtered['symbol'].str.upper().tolist()
-            print(f"✅ {exchange}: {len(tickers)} mã")
-            return tickers
+        from app.services.market_data import market_service
+        await market_service._limiter.acquire()
         return await loop.run_in_executor(None, fetch)
-    except Exception as e:
-        print(f"get_tickers error {exchange}: {e}")
+    except BaseException as e:
+        print(f"get_tickers error {exchange}: {type(e).__name__}: {e}")
         return []
 
 @router.get("/tickers/{exchange}")
@@ -166,28 +176,33 @@ async def analyze_ticker(ticker: str):
 @router.get("/fundamental/{ticker}")
 async def get_fundamental(ticker: str):
     """Lấy EPS & ROE theo quý cho 1 mã (cache session)."""
+    from app.services.market_data import market_service
     sym = ticker.upper()
     if sym not in _fundamental_cache:
+        await market_service._limiter.acquire()
         loop = asyncio.get_event_loop()
         _fundamental_cache[sym] = await loop.run_in_executor(None, _fetch_fundamental_sync, sym)
     return _fundamental_cache[sym]
 
 @router.post("/fundamental/batch")
 async def get_fundamental_batch(tickers: List[str]):
-    """Lấy EPS & ROE cho nhiều mã, chạy song song (max 5 concurrent)."""
+    """Lấy EPS & ROE cho nhiều mã, chạy tuần tự qua limiter (tránh vượt quota vnai)."""
+    from app.services.market_data import market_service
     loop = asyncio.get_event_loop()
-    sem  = asyncio.Semaphore(5)
 
     async def fetch_one(sym: str):
         if sym in _fundamental_cache:
             return _fundamental_cache[sym]
-        async with sem:
-            result = await loop.run_in_executor(None, _fetch_fundamental_sync, sym)
-            _fundamental_cache[sym] = result
-            return result
+        # Serial qua limiter — không song song nữa vì vnai quota tính toàn process
+        await market_service._limiter.acquire()
+        result = await loop.run_in_executor(None, _fetch_fundamental_sync, sym)
+        _fundamental_cache[sym] = result
+        return result
 
-    results = await asyncio.gather(*[fetch_one(t.upper()) for t in tickers])
-    return {'results': list(results)}
+    results = []
+    for t in tickers:
+        results.append(await fetch_one(t.upper()))
+    return {'results': results}
 
 @router.delete("/fundamental/cache")
 async def clear_fundamental_cache():
