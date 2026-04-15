@@ -9,8 +9,11 @@ services:
       - "127.0.0.1:8000:8000"   # Chỉ bind localhost — Nginx sẽ reverse proxy
     env_file:
       - .env
+    environment:
+      - TZ=Asia/Ho_Chi_Minh       # Cho daily_update 16:00 chạy đúng giờ VN
     volumes:
-      - app_logs:/app/logs      # Persistent logs nếu cần
+      - app_logs:/app/logs        # Persistent logs nếu cần
+      - ohlcv_data:/app/data      # SQLite OHLCV DB (persistent across rebuilds)
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s
@@ -25,3 +28,4 @@ services:
 
 volumes:
   app_logs:
+  ohlcv_data:

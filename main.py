@@ -9,20 +9,27 @@ import asyncio
 from app.services.market_data import market_service
 from app.services.alert_engine import run_alert_engine
 from app.services.screener import screener_service
-from app.routers import quotes, alerts, screener
+from app.services import ohlcv_store
+from app.services.backfill import daily_update_scheduler
+from app.routers import quotes, alerts, screener, admin
 
 alert_task = None
+daily_task = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global alert_task
+    global alert_task, daily_task
+    ohlcv_store.init_db()
     await market_service.start()
     alert_task = asyncio.create_task(run_alert_engine())
+    daily_task = asyncio.create_task(daily_update_scheduler())
     # Load VNINDEX khi khởi động (không block, chạy background)
     asyncio.create_task(_warmup_vnindex())
     yield
     if alert_task:
         alert_task.cancel()
+    if daily_task:
+        daily_task.cancel()
     await market_service.stop()
 
 async def _warmup_vnindex():
@@ -46,6 +53,7 @@ app.add_middleware(
 app.include_router(quotes.router,   prefix="/api/quotes",   tags=["quotes"])
 app.include_router(alerts.router,   prefix="/api/alerts",   tags=["alerts"])
 app.include_router(screener.router, prefix="/api/screener", tags=["screener"])
+app.include_router(admin.router,    prefix="/api/admin",    tags=["admin"])
 
 @app.get("/")
 async def root():

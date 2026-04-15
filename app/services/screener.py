@@ -4,6 +4,7 @@ import numpy as np
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 from app.services.market_data import market_service
+from app.services import ohlcv_store
 
 # Dùng chung RateLimiter của market_service để tránh vượt quota vnai (60/phút).
 _limiter = market_service._limiter
@@ -303,11 +304,15 @@ class ScreenerService:
     async def _fetch_history_async(
         self, ticker: str, start: str, end: str, is_index: bool = False
     ) -> Optional[pd.DataFrame]:
-        """Async wrapper — acquire limiter TRƯỚC MỖI source attempt để
-        mỗi acquire = đúng 1 API call vnstock (tránh vượt quota vnai 60/min).
-        Chỉ thử source kế tiếp nếu kết quả RỖNG. Nếu raise (rate limit / invalid
-        source) → dừng luôn, không tốn thêm quota.
+        """Đọc lịch sử OHLCV. Ưu tiên OHLCV store (SQLite) để tránh gọi vnstock.
+        Chỉ fallback vnstock cho: indices (VNINDEX) hoặc ticker CHƯA có trong store.
         """
+        # ── Store first (stocks) ──
+        if not is_index:
+            df_store = ohlcv_store.get_ohlcv(ticker, start, end)
+            if df_store is not None and len(df_store) >= 60:
+                return df_store
+
         loop = asyncio.get_event_loop()
         sources = ['kbs', 'vci', 'msn'] if is_index else ['kbs', 'vci']
         for source in sources:
