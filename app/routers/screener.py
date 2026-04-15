@@ -21,12 +21,16 @@ def _fetch_fundamental_sync(ticker: str) -> Dict[str, Any]:
     empty = {'ticker': ticker, 'eps': [], 'roe': [], 'quarters': [],
              'eps_growth': False, 'roe_latest': 0.0, 'roe_growth': False}
 
-    for source in ('VCI', 'MSN', 'KBS'):
+    for source in ('VCI', 'KBS', 'FMP'):
         try:
             from vnstock import Vnstock
             import pandas as pd
             stock = Vnstock().stock(symbol=ticker, source=source)
-            df = stock.finance.ratio(period='quarterly', lang='en', dropna=False)
+            # KBS / FMP không hỗ trợ lang param
+            if source == 'VCI':
+                df = stock.finance.ratio(period='quarterly', lang='en', dropna=False)
+            else:
+                df = stock.finance.ratio(period='quarterly', dropna=False)
             if df is None or df.empty:
                 print(f"⚠️  Fundamental {ticker} via {source}: df empty", flush=True)
                 continue
@@ -221,11 +225,14 @@ async def debug_fundamental(ticker: str):
     sym = ticker.upper()
     errors = []
 
-    for source in ('VCI', 'MSN', 'KBS'):
+    for source in ('VCI', 'KBS', 'FMP'):
         try:
             from vnstock import Vnstock
             stock = Vnstock().stock(symbol=sym, source=source)
-            df = stock.finance.ratio(period='quarterly', lang='en', dropna=False)
+            if source == 'VCI':
+                df = stock.finance.ratio(period='quarterly', lang='en', dropna=False)
+            else:
+                df = stock.finance.ratio(period='quarterly', dropna=False)
             if df is None:
                 errors.append({"source": source, "error": "df is None"})
                 continue
