@@ -1,109 +1,124 @@
 from fastapi import APIRouter, Query
 from typing import List, Dict, Any
 import asyncio
+import time
 from app.services.screener import screener_service
 from app.services import ohlcv_store
+
+# ── In-memory cache cho exchange ticker lists (TTL 24h) ──
+_ticker_list_cache: Dict[str, Dict[str, Any]] = {}
+_TICKER_CACHE_TTL = 86400  # 24 giờ
+
 
 def _fetch_fundamental_sync(ticker: str) -> Dict[str, Any]:
     """Lấy EPS & ROE theo quý từ vnstocks (chạy trong executor).
 
     vnstocks trả về DataFrame GIẢM DẦN (mới nhất ở đầu).
     Cần lấy head() rồi đảo ngược để có thứ tự tăng dần (cũ→mới).
+    Thử VCI trước, fallback TCBS nếu thất bại.
     """
     import math
     empty = {'ticker': ticker, 'eps': [], 'roe': [], 'quarters': [],
              'eps_growth': False, 'roe_latest': 0.0, 'roe_growth': False}
-    # Rate-limit qua limiter chung (sync wrapper): dùng acquire_blocking nếu có,
-    # nếu không chỉ catch BaseException để nuốt SystemExit từ vnai
-    try:
-        from vnstock import Vnstock
-        import pandas as pd
-        stock = Vnstock().stock(symbol=ticker, source='VCI')
-        df = stock.finance.ratio(period='quarterly', lang='en', dropna=False)
-        if df is None or df.empty:
-            return empty
 
-        # Flatten multi-level columns
-        flat_cols = ['_'.join(str(c) for c in col).strip() if isinstance(col, tuple) else str(col)
-                     for col in df.columns]
-        df.columns = flat_cols
-
-        # Tìm các cột cần thiết
-        eps_col  = next((c for c in flat_cols if 'eps' in c.lower() and 'vnd' in c.lower()), None) or \
-                   next((c for c in flat_cols if 'eps' in c.lower()), None)
-        roe_col  = next((c for c in flat_cols if 'roe' in c.lower()), None)
-        year_col = next((c for c in flat_cols if 'yearreport' in c.lower() or 'year' in c.lower()), None)
-        len_col  = next((c for c in flat_cols if 'lengthreport' in c.lower() or 'length' in c.lower()), None)
-
-        # DataFrame là GIẢM DẦN (mới nhất ở hàng đầu)
-        # Lấy 20 hàng (cần thêm để tính TTM: 8 TTM points cần 11 standalone quarters)
-        recent = df.head(20).iloc[::-1].reset_index(drop=True)
-
-        # ── Bước 1: Thu thập EPS/ROE standalone từng quý (cũ→mới) ──
-        raw_eps, raw_roe, raw_quarters = [], [], []
-
-        for _, row in recent.iterrows():
-            eps_raw = row.get(eps_col) if eps_col else None
-            roe_raw = row.get(roe_col) if roe_col else None
-            year    = int(row.get(year_col, 0)) if year_col else 0
-            quarter = int(row.get(len_col,  0)) if len_col  else 0
-
-            if eps_raw is None or (isinstance(eps_raw, float) and math.isnan(eps_raw)):
+    for source in ('VCI', 'TCBS'):
+        try:
+            from vnstock import Vnstock
+            import pandas as pd
+            stock = Vnstock().stock(symbol=ticker, source=source)
+            df = stock.finance.ratio(period='quarterly', lang='en', dropna=False)
+            if df is None or df.empty:
+                print(f"⚠️  Fundamental {ticker} via {source}: df empty", flush=True)
                 continue
 
-            eps_f = float(eps_raw)
+            # Flatten multi-level columns
+            flat_cols = ['_'.join(str(c) for c in col).strip() if isinstance(col, tuple) else str(col)
+                         for col in df.columns]
+            df.columns = flat_cols
 
-            roe_f = 0.0
-            if roe_raw is not None and not (isinstance(roe_raw, float) and math.isnan(roe_raw)):
-                roe_f = float(roe_raw)
-                # vnstocks trả ROE dạng decimal (0.246 = 24.6%) → nhân 100
-                if abs(roe_f) < 5:
-                    roe_f = round(roe_f * 100, 2)
+            # Tìm các cột cần thiết
+            eps_col  = next((c for c in flat_cols if 'eps' in c.lower() and 'vnd' in c.lower()), None) or \
+                       next((c for c in flat_cols if 'eps' in c.lower()), None)
+            roe_col  = next((c for c in flat_cols if 'roe' in c.lower()), None)
+            year_col = next((c for c in flat_cols if 'yearreport' in c.lower() or 'year' in c.lower()), None)
+            len_col  = next((c for c in flat_cols if 'lengthreport' in c.lower() or 'length' in c.lower()), None)
 
-            raw_eps.append(eps_f)
-            raw_roe.append(round(roe_f, 2))
-            raw_quarters.append({'year': year, 'quarter': quarter})
+            if not eps_col:
+                print(f"⚠️  Fundamental {ticker} via {source}: no EPS column in {flat_cols[:8]}", flush=True)
+                continue
 
-        # ── Bước 2: Tính TTM EPS (Trailing Twelve Months = tổng 4 quý liên tiếp) ──
-        # FireAnt / Vietstock hiển thị TTM EPS chứ không phải EPS quý đơn lẻ.
-        # TTM tại quý i = raw_eps[i-3] + raw_eps[i-2] + raw_eps[i-1] + raw_eps[i]
-        eps_ttm, roe_vals, quarters = [], [], []
-        for i in range(len(raw_eps)):
-            if i < 3:
-                continue   # cần ít nhất 4 quý để tính TTM
-            ttm = round(sum(raw_eps[i - 3: i + 1]), 0)
-            eps_ttm.append(ttm)
-            roe_vals.append(raw_roe[i])
-            quarters.append(raw_quarters[i])
+            # DataFrame là GIẢM DẦN (mới nhất ở hàng đầu)
+            recent = df.head(20).iloc[::-1].reset_index(drop=True)
 
-        # Giữ 8 quý TTM gần nhất
-        eps_ttm  = eps_ttm[-8:]
-        roe_vals = roe_vals[-8:]
-        quarters = quarters[-8:]
+            # ── Bước 1: Thu thập EPS/ROE standalone từng quý (cũ→mới) ──
+            raw_eps, raw_roe, raw_quarters = [], [], []
 
-        # ── Bước 3: Kiểm tra tăng trưởng theo TTM EPS ──
-        def check_growth(vals: list, n: int) -> bool:
-            if len(vals) < n + 1:
-                return False
-            return all(vals[i] > vals[i - 1] for i in range(len(vals) - n, len(vals)))
+            for _, row in recent.iterrows():
+                eps_raw = row.get(eps_col) if eps_col else None
+                roe_raw = row.get(roe_col) if roe_col else None
+                year    = int(row.get(year_col, 0)) if year_col else 0
+                quarter = int(row.get(len_col,  0)) if len_col  else 0
 
-        eps_growth = check_growth(eps_ttm, 2)
-        roe_growth = check_growth(roe_vals, 1)
-        roe_latest = roe_vals[-1] if roe_vals else 0.0
+                if eps_raw is None or (isinstance(eps_raw, float) and math.isnan(eps_raw)):
+                    continue
 
-        return {
-            'ticker':     ticker,
-            'eps':        eps_ttm,      # TTM EPS — khớp với FireAnt / Vietstock
-            'roe':        roe_vals,
-            'quarters':   quarters,     # [{"year":2025,"quarter":4}, ...]  cũ→mới
-            'eps_growth': eps_growth,
-            'roe_latest': roe_latest,
-            'roe_growth': roe_growth,
-        }
-    # BaseException để nuốt SystemExit từ vnai.beam.quota (rate limit exceeded)
-    except BaseException as e:
-        print(f"Fundamental error {ticker}: {type(e).__name__}: {e}")
-        return empty
+                eps_f = float(eps_raw)
+
+                roe_f = 0.0
+                if roe_raw is not None and not (isinstance(roe_raw, float) and math.isnan(roe_raw)):
+                    roe_f = float(roe_raw)
+                    # vnstocks trả ROE dạng decimal (0.246 = 24.6%) → nhân 100
+                    if abs(roe_f) < 5:
+                        roe_f = round(roe_f * 100, 2)
+
+                raw_eps.append(eps_f)
+                raw_roe.append(round(roe_f, 2))
+                raw_quarters.append({'year': year, 'quarter': quarter})
+
+            if not raw_eps:
+                print(f"⚠️  Fundamental {ticker} via {source}: no valid EPS rows", flush=True)
+                continue
+
+            # ── Bước 2: Tính TTM EPS ──
+            eps_ttm, roe_vals, quarters = [], [], []
+            for i in range(len(raw_eps)):
+                if i < 3:
+                    continue
+                ttm = round(sum(raw_eps[i - 3: i + 1]), 0)
+                eps_ttm.append(ttm)
+                roe_vals.append(raw_roe[i])
+                quarters.append(raw_quarters[i])
+
+            eps_ttm  = eps_ttm[-8:]
+            roe_vals = roe_vals[-8:]
+            quarters = quarters[-8:]
+
+            # ── Bước 3: Kiểm tra tăng trưởng ──
+            def check_growth(vals: list, n: int) -> bool:
+                if len(vals) < n + 1:
+                    return False
+                return all(vals[i] > vals[i - 1] for i in range(len(vals) - n, len(vals)))
+
+            eps_growth = check_growth(eps_ttm, 2)
+            roe_growth = check_growth(roe_vals, 1)
+            roe_latest = roe_vals[-1] if roe_vals else 0.0
+
+            return {
+                'ticker':     ticker,
+                'eps':        eps_ttm,
+                'roe':        roe_vals,
+                'quarters':   quarters,
+                'eps_growth': eps_growth,
+                'roe_latest': roe_latest,
+                'roe_growth': roe_growth,
+            }
+        except BaseException as e:
+            print(f"⚠️  Fundamental {ticker} via {source}: {type(e).__name__}: {e}", flush=True)
+            continue
+
+    print(f"❌ Fundamental {ticker}: all sources failed", flush=True)
+    return empty
+
 
 router = APIRouter()
 
@@ -111,9 +126,18 @@ VN30 = ["VIC","VHM","HPG","TCB","VCB","ACB","MWG","VNM","FPT","SSI",
         "MBB","VPB","HDB","BCM","MSN","STB","CTG","BID","GAS","SAB",
         "VJC","PLX","POW","VRE","GVR"]
 
+
 async def get_tickers_by_exchange(exchange: str) -> List[str]:
+    """Lấy danh sách mã theo sàn. Cache trong memory 24h."""
+    ex = exchange.upper()
+    now = time.time()
+
+    # Check in-memory cache
+    cached = _ticker_list_cache.get(ex)
+    if cached and (now - cached["ts"]) < _TICKER_CACHE_TTL:
+        return cached["tickers"]
+
     try:
-        import asyncio
         loop = asyncio.get_event_loop()
         def fetch():
             try:
@@ -122,22 +146,27 @@ async def get_tickers_by_exchange(exchange: str) -> List[str]:
                 if df is None or df.empty:
                     return []
                 filtered = df[
-                    (df['exchange'].str.upper() == exchange.upper()) &
+                    (df['exchange'].str.upper() == ex) &
                     (df['type'] == 'stock')
                 ]
                 tickers = filtered['symbol'].str.upper().tolist()
-                print(f"✅ {exchange}: {len(tickers)} mã")
+                print(f"✅ {ex}: {len(tickers)} mã (cached for 24h)")
                 return tickers
-            # Nuốt SystemExit từ vnai để không giết worker
             except BaseException as e:
                 print(f"Listing error: {type(e).__name__}: {e}")
                 return []
         from app.services.market_data import market_service
         await market_service._limiter.acquire()
-        return await loop.run_in_executor(None, fetch)
+        tickers = await loop.run_in_executor(None, fetch)
+
+        # Cache kết quả (kể cả rỗng, để tránh retry liên tục)
+        if tickers:
+            _ticker_list_cache[ex] = {"tickers": tickers, "ts": now}
+        return tickers
     except BaseException as e:
         print(f"get_tickers error {exchange}: {type(e).__name__}: {e}")
         return []
+
 
 @router.get("/tickers/{exchange}")
 async def get_exchange_tickers(exchange: str):
@@ -170,6 +199,63 @@ async def analyze_ticker(ticker: str):
     if not result:
         return {"error": f"Không đủ dữ liệu cho {ticker}"}
     return result
+
+# ── Fundamental: static routes TRƯỚC dynamic {ticker} route ──
+
+@router.get("/fundamental/stats")
+async def get_fundamental_stats():
+    """Thống kê fundamentals cache."""
+    return ohlcv_store.get_fundamental_stats()
+
+@router.delete("/fundamental/cache")
+async def clear_fundamental_cache():
+    """Xoá toàn bộ fundamental cache trong SQLite (force re-fetch lần sau)."""
+    with ohlcv_store._lock, ohlcv_store._connect() as conn:
+        conn.execute("DELETE FROM fundamentals")
+    return {'cleared': True}
+
+@router.get("/fundamental/debug/{ticker}")
+async def debug_fundamental(ticker: str):
+    """Debug: thử fetch fundamental và trả về chi tiết lỗi nếu có."""
+    from app.services.market_data import market_service
+    sym = ticker.upper()
+    errors = []
+
+    for source in ('VCI', 'TCBS'):
+        try:
+            from vnstock import Vnstock
+            stock = Vnstock().stock(symbol=sym, source=source)
+            df = stock.finance.ratio(period='quarterly', lang='en', dropna=False)
+            if df is None:
+                errors.append({"source": source, "error": "df is None"})
+                continue
+            if df.empty:
+                errors.append({"source": source, "error": "df is empty"})
+                continue
+            flat_cols = ['_'.join(str(c) for c in col).strip() if isinstance(col, tuple) else str(col)
+                         for col in df.columns]
+            return {
+                "ticker": sym,
+                "source": source,
+                "ok": True,
+                "shape": list(df.shape),
+                "columns": flat_cols[:15],
+                "sample": df.head(2).to_dict("records") if len(df) > 0 else [],
+            }
+        except BaseException as e:
+            errors.append({"source": source, "error": f"{type(e).__name__}: {e}"})
+
+    # Also check SQLite cache
+    cached = ohlcv_store.get_fundamental(sym)
+    return {
+        "ticker": sym,
+        "ok": False,
+        "errors": errors,
+        "sqlite_cached": cached is not None,
+        "sqlite_data": cached,
+    }
+
+# ── Dynamic {ticker} route CUỐI CÙNG ──
 
 @router.get("/fundamental/{ticker}")
 async def get_fundamental(ticker: str):
@@ -220,26 +306,13 @@ async def get_fundamental_batch(tickers: List[str]):
         results.append(await fetch_one(t.upper()))
     return {'results': results}
 
-@router.delete("/fundamental/cache")
-async def clear_fundamental_cache():
-    """Xoá toàn bộ fundamental cache trong SQLite (force re-fetch lần sau)."""
-    with ohlcv_store._lock, ohlcv_store._connect() as conn:
-        conn.execute("DELETE FROM fundamentals")
-    return {'cleared': True}
-
-@router.get("/fundamental/stats")
-async def get_fundamental_stats():
-    """Thống kê fundamentals cache."""
-    return ohlcv_store.get_fundamental_stats()
-
 @router.get("/debug/vnindex")
 async def debug_vnindex():
     """Debug endpoint: kiểm tra trạng thái VNINDEX data"""
     from datetime import datetime, timedelta
-    import asyncio
     now = datetime.now()
     end   = now.strftime("%Y-%m-%d")
-    start = (now - timedelta(days=30)).strftime("%Y-%m-%d")  # chỉ lấy 30 ngày để test nhanh
+    start = (now - timedelta(days=30)).strftime("%Y-%m-%d")
     results = {}
     for symbol in ("VNINDEX", "VN-INDEX", "VNI", "^VNINDEX"):
         try:
