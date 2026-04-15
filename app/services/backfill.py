@@ -273,7 +273,7 @@ async def refresh_fundamentals() -> Dict:
     print(f"📊 Fundamental refresh: {len(stale)} ticker cần cập nhật", flush=True)
 
     # Import fetch function từ screener router
-    from app.routers.screener import _fetch_fundamental_sync
+    from app.routers.screener import _fetch_fundamental_via_api
 
     refreshed, failed = 0, 0
     loop = asyncio.get_event_loop()
@@ -281,7 +281,7 @@ async def refresh_fundamentals() -> Dict:
         try:
             await market_service._limiter.acquire()
             result = await asyncio.wait_for(
-                loop.run_in_executor(None, _fetch_fundamental_sync, t),
+                loop.run_in_executor(None, _fetch_fundamental_via_api, t),
                 timeout=30.0,
             )
             if result.get("eps"):

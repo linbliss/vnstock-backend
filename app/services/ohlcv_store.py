@@ -251,7 +251,7 @@ FUND_EXPIRY_DAYS = 7  # Dữ liệu fundamental được coi là "stale" sau 7 n
 
 
 def upsert_fundamental(ticker: str, data: Dict[str, Any]) -> None:
-    """Lưu fundamental data (EPS/ROE) vào SQLite. data là dict trả về từ _fetch_fundamental_sync."""
+    """Lưu fundamental data (EPS/ROE) vào SQLite. data là dict trả về từ _fetch_fundamental_via_api."""
     t = ticker.upper()
     now = datetime.now().isoformat()
     with _lock, _connect() as conn:
