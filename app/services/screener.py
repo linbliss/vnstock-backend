@@ -194,7 +194,7 @@ class ScreenerService:
         self.INDEX_TTL = 3600       # 1 giờ cho VNINDEX
 
     async def _ensure_index_data(self):
-        """Load VNINDEX data, refresh mỗi 1 giờ. Thử nhiều tên symbol."""
+        """Load VNINDEX (refresh 1 giờ). Chỉ dùng symbol 'VNINDEX' — đã verify OK qua KBS."""
         now = datetime.now()
         if (
             self._index_data is not None
@@ -203,20 +203,15 @@ class ScreenerService:
         ):
             return
         end   = now.strftime("%Y-%m-%d")
-        start = "2000-01-01"   # Lấy toàn bộ lịch sử có sẵn
-        loop  = asyncio.get_event_loop()
+        start = "2000-01-01"
 
-        # Thử nhiều tên symbol VNINDEX phổ biến trong vnstock
-        for symbol in ("VNINDEX", "VN-INDEX", "VNI", "^VNINDEX"):
-            await _limiter.acquire()        # tôn trọng quota vnai 60/phút
-            df = await loop.run_in_executor(None, self._fetch_history, symbol, start, end)
-            if df is not None and len(df) >= 60:
-                self._index_data = df
-                self._index_fetched_at = now
-                print(f"✅ VNINDEX loaded as '{symbol}': {len(df)} rows")
-                return
-
-        print("⚠️  Không load được VNINDEX data với bất kỳ tên symbol nào")
+        df = await self._fetch_history_async("VNINDEX", start, end, is_index=True)
+        if df is not None and len(df) >= 60:
+            self._index_data = df
+            self._index_fetched_at = now
+            print(f"✅ VNINDEX loaded: {len(df)} rows")
+        else:
+            print("⚠️  Không load được VNINDEX data")
 
     async def run_screener(
         self,
@@ -253,11 +248,7 @@ class ScreenerService:
         start = "2000-01-01"
 
         await self._ensure_index_data()
-        loop = asyncio.get_event_loop()
-        await _limiter.acquire()            # tôn trọng quota vnai 60/phút
-        df = await loop.run_in_executor(
-            None, self._fetch_history, ticker, start, end
-        )
+        df = await self._fetch_history_async(ticker, start, end, is_index=False)
 
         if df is None or len(df) < 60:
             return None
@@ -309,55 +300,69 @@ class ScreenerService:
         self._cache_time[ticker] = now
         return result
 
-    def _fetch_history(self, ticker: str, start: str, end: str) -> Optional[pd.DataFrame]:
+    async def _fetch_history_async(
+        self, ticker: str, start: str, end: str, is_index: bool = False
+    ) -> Optional[pd.DataFrame]:
+        """Async wrapper — acquire limiter TRƯỚC MỖI source attempt để
+        mỗi acquire = đúng 1 API call vnstock (tránh vượt quota vnai 60/min).
+        Chỉ thử source kế tiếp nếu kết quả RỖNG. Nếu raise (rate limit / invalid
+        source) → dừng luôn, không tốn thêm quota.
+        """
+        loop = asyncio.get_event_loop()
+        sources = ['kbs', 'vci', 'msn'] if is_index else ['kbs', 'vci']
+        for source in sources:
+            await _limiter.acquire()   # 1 acquire = 1 API call
+            df, stopped = await loop.run_in_executor(
+                None, self._fetch_one_source, ticker, source, start, end, is_index
+            )
+            if df is not None and not df.empty:
+                print(f"✅ {ticker} fetched via {source}: {len(df)} rows")
+                return df
+            if stopped:
+                break   # raise → bỏ luôn
+        return None
+
+    def _fetch_one_source(
+        self, ticker: str, source: str, start: str, end: str, is_index: bool
+    ):
+        """Sync worker — gọi vnstock 1 lần. Trả (df, stopped).
+        stopped=True nếu có exception → caller bỏ source khác.
+        """
         try:
             from vnstock import Quote
-            # VNINDEX dùng VCI/MSN (KBS không hỗ trợ; TCBS đã bị loại khỏi vnstock mới)
-            is_index = ticker.upper() in ("VNINDEX", "VN-INDEX", "VNI", "^VNINDEX",
-                                          "HNXINDEX", "UPINDEX")
-            sources = ['vci', 'msn'] if is_index else ['kbs', 'vci']
+            sym = "VNINDEX" if is_index else ticker.upper()
+            raw = Quote(symbol=sym, source=source).history(
+                start=start, end=end, interval='1D'
+            )
+            if raw is None or raw.empty:
+                return (None, False)
+            return (self._normalize(raw), False)
+        # BaseException để nuốt SystemExit từ vnai.beam.quota
+        except BaseException as e:
+            print(f"⚠️  {ticker} error from {source}: {type(e).__name__}: {e}")
+            return (None, True)
 
-            df = None
-            for source in sources:
-                sym = "VNINDEX" if is_index else ticker.upper()
-                try:
-                    raw = Quote(symbol=sym, source=source).history(
-                        start=start, end=end, interval='1D'
-                    )
-                    if raw is not None and not raw.empty:
-                        df = raw
-                        print(f"✅ {ticker} fetched via {source}: {len(raw)} rows")
-                        break
-                    print(f"⚠️  {ticker} empty from {source}, trying next...")
-                # Bắt BaseException để nuốt SystemExit từ vnai.beam.quota
-                # (vnai gọi sys.exit() khi rate limit, bypass except Exception)
-                except BaseException as e:
-                    print(f"⚠️  {ticker} error from {source}: {type(e).__name__}: {e}")
-
-            if df is None or df.empty:
-                return None
-
+    def _normalize(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
+        """Chuẩn hoá OHLCV columns → close/open/high/low/volume."""
+        try:
             df = df.reset_index()
-            # Chuẩn hoá tên cột
             col_map = {}
             for col in df.columns:
                 cl = str(col).lower()
-                if 'close'  in cl: col_map[col] = 'close'
+                if   'close'  in cl: col_map[col] = 'close'
                 elif 'open'   in cl: col_map[col] = 'open'
                 elif 'high'   in cl: col_map[col] = 'high'
                 elif 'low'    in cl: col_map[col] = 'low'
                 elif 'volume' in cl: col_map[col] = 'volume'
             df = df.rename(columns=col_map)
-
             for c in ['close', 'open', 'high', 'low']:
                 if c not in df.columns:
                     return None
-            # volume có thể không có với index — điền 0
             if 'volume' not in df.columns:
                 df['volume'] = 0
             return df
-        except Exception as e:
-            print(f"fetch_history error {ticker}: {e}")
+        except BaseException as e:
+            print(f"normalize error: {type(e).__name__}: {e}")
             return None
 
 

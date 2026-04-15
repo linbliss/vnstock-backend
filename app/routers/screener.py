@@ -218,11 +218,10 @@ async def debug_vnindex():
     now = datetime.now()
     end   = now.strftime("%Y-%m-%d")
     start = (now - timedelta(days=30)).strftime("%Y-%m-%d")  # chỉ lấy 30 ngày để test nhanh
-    loop  = asyncio.get_event_loop()
     results = {}
     for symbol in ("VNINDEX", "VN-INDEX", "VNI", "^VNINDEX"):
         try:
-            df = await loop.run_in_executor(None, screener_service._fetch_history, symbol, start, end)
+            df = await screener_service._fetch_history_async(symbol, start, end, is_index=True)
             results[symbol] = {
                 "rows": len(df) if df is not None else 0,
                 "ok": df is not None and len(df) > 0,
