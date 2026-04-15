@@ -299,26 +299,58 @@ async def debug_fundamental(ticker: str):
     sym = ticker.upper()
     sources = []
 
-    # 1. Test FireAnt API
+    # 1. Test FireAnt API — multiple endpoints
     fireant_token = os.environ.get("FIREANT_TOKEN", "").strip()
     if fireant_token:
-        try:
-            url = f"https://restv2.fireant.vn/symbols/{sym}/fundamental"
-            resp = req_lib.get(url, timeout=15, headers={"Authorization": f"Bearer {fireant_token}"})
-            body = resp.json() if resp.status_code == 200 else resp.text[:200]
-            sources.append({
-                "source": "FireAnt",
-                "status": resp.status_code,
-                "ok": resp.status_code == 200,
-                "type": type(body).__name__,
-                "keys": list(body.keys())[:20] if isinstance(body, dict) else (
-                    f"list[{len(body)}] keys={list(body[0].keys())[:15]}" if isinstance(body, list) and body else str(body)[:200]
-                ),
-            })
-        except Exception as e:
-            sources.append({"source": "FireAnt", "ok": False, "error": f"{type(e).__name__}: {e}"})
+        headers = {"Authorization": f"Bearer {fireant_token}"}
+        for ep_name, ep_url in [
+            ("fundamental", f"https://restv2.fireant.vn/symbols/{sym}/fundamental"),
+            ("financial-indicators", f"https://restv2.fireant.vn/symbols/{sym}/financial-indicators?type=quarterly&count=20"),
+            ("financial-reports", f"https://restv2.fireant.vn/symbols/{sym}/financial-reports?type=quarter&count=20"),
+        ]:
+            try:
+                resp = req_lib.get(ep_url, timeout=15, headers=headers)
+                body = resp.json() if resp.status_code == 200 else resp.text[:200]
+                info: Dict[str, Any] = {"source": f"FireAnt/{ep_name}", "status": resp.status_code, "ok": resp.status_code == 200}
+                if isinstance(body, dict):
+                    info["type"] = "dict"
+                    info["keys"] = list(body.keys())[:20]
+                    # Show EPS/ROE values if present
+                    for k in body:
+                        if 'eps' in k.lower() or 'roe' in k.lower():
+                            info[k] = body[k]
+                elif isinstance(body, list):
+                    info["type"] = f"list[{len(body)}]"
+                    if body and isinstance(body[0], dict):
+                        info["keys"] = list(body[0].keys())[:15]
+                        # Show EPS/ROE fields from first item
+                        for k in body[0]:
+                            if 'eps' in k.lower() or 'roe' in k.lower():
+                                info[f"sample_{k}"] = body[0][k]
+                else:
+                    info["body"] = str(body)[:200]
+                sources.append(info)
+            except Exception as e:
+                sources.append({"source": f"FireAnt/{ep_name}", "ok": False, "error": f"{type(e).__name__}: {e}"})
     else:
         sources.append({"source": "FireAnt", "ok": False, "error": "FIREANT_TOKEN not set"})
+
+    # 1b. Test VNDirect API raw
+    try:
+        vnd_url = f"https://finfo-api.vndirect.com.vn/v4/ratios?q=code:{sym}~reportType:quarterly&size=20&sort=yearReport:desc"
+        resp = req_lib.get(vnd_url, timeout=15)
+        if resp.status_code == 200:
+            body = resp.json()
+            sources.append({
+                "source": "VNDirect/raw",
+                "ok": True,
+                "type": type(body).__name__,
+                "keys": list(body.keys())[:10] if isinstance(body, dict) else f"list[{len(body)}]",
+            })
+        else:
+            sources.append({"source": "VNDirect/raw", "ok": False, "status": resp.status_code, "body": resp.text[:200]})
+    except Exception as e:
+        sources.append({"source": "VNDirect/raw", "ok": False, "error": f"{type(e).__name__}: {e}"})
 
     # 2. Test vnstock sources
     for vsrc in ('KBS', 'VCI'):
