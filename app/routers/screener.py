@@ -21,7 +21,7 @@ def _fetch_fundamental_sync(ticker: str) -> Dict[str, Any]:
     empty = {'ticker': ticker, 'eps': [], 'roe': [], 'quarters': [],
              'eps_growth': False, 'roe_latest': 0.0, 'roe_growth': False}
 
-    for source in ('VCI', 'TCBS'):
+    for source in ('VCI', 'MSN', 'KBS'):
         try:
             from vnstock import Vnstock
             import pandas as pd
@@ -221,7 +221,7 @@ async def debug_fundamental(ticker: str):
     sym = ticker.upper()
     errors = []
 
-    for source in ('VCI', 'TCBS'):
+    for source in ('VCI', 'MSN', 'KBS'):
         try:
             from vnstock import Vnstock
             stock = Vnstock().stock(symbol=sym, source=source)
