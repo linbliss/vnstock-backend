@@ -323,10 +323,15 @@ async def debug_fundamental(ticker: str):
                     info["type"] = f"list[{len(body)}]"
                     if body and isinstance(body[0], dict):
                         info["keys"] = list(body[0].keys())[:15]
-                        # Show EPS/ROE fields from first item
                         for k in body[0]:
                             if 'eps' in k.lower() or 'roe' in k.lower():
                                 info[f"sample_{k}"] = body[0][k]
+                # Show columns/rows structure for financial-reports
+                if isinstance(body, dict) and 'columns' in body and 'rows' in body:
+                    info["columns"] = body["columns"][:20] if isinstance(body["columns"], list) else body["columns"]
+                    info["rows_count"] = len(body["rows"]) if isinstance(body["rows"], list) else "?"
+                    if isinstance(body["rows"], list) and body["rows"]:
+                        info["sample_row"] = body["rows"][0]
                 else:
                     info["body"] = str(body)[:200]
                 sources.append(info)
