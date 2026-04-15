@@ -6,7 +6,7 @@ from datetime import datetime
 from collections import deque
 
 class RateLimiter:
-    def __init__(self, max_calls: int = 50, period: float = 60.0):
+    def __init__(self, max_calls: int = 35, period: float = 60.0):
         self.max_calls = max_calls
         self.period    = period
         self._calls: deque = deque()
@@ -35,7 +35,10 @@ class MarketDataService:
         self.listeners: List[Callable] = []
         self._task    = None
         self._running = False
-        self._limiter = RateLimiter(max_calls=50, period=60.0)
+        # 35/60 để có buffer rộng — vnai Community hard-limit là 60/min,
+        # nhiều entry point song song (polling, historical, screener) + sliding window
+        # có thể tràn qua vnai nếu sát ngưỡng. Nếu dùng gói Sponsor → có thể tăng.
+        self._limiter = RateLimiter(max_calls=35, period=60.0)
 
     async def start(self):
         self._running = True

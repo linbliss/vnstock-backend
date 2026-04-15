@@ -190,7 +190,7 @@ class ScreenerService:
         self._cache_time: Dict[str, datetime] = {}
         self._index_data: Optional[pd.DataFrame] = None
         self._index_fetched_at: Optional[datetime] = None
-        self.CACHE_TTL = 300        # 5 phút cho mã thường
+        self.CACHE_TTL = 900        # 15 phút cho mã thường (giảm churn gọi lại)
         self.INDEX_TTL = 3600       # 1 giờ cho VNINDEX
 
     async def _ensure_index_data(self):

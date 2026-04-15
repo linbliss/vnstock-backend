@@ -99,7 +99,9 @@ async def get_tickers(exchange: str):
             ]
             return filtered["symbol"].dropna().astype(str).str.upper().tolist()
 
-        tickers = fetch()
+        await market_service._limiter.acquire()   # bảo vệ quota vnai
+        import asyncio as _aio
+        tickers = await _aio.get_event_loop().run_in_executor(None, fetch)
 
         # unique + stable
         seen = set()
