@@ -117,26 +117,56 @@ def _fetch_history_sync(ticker: str, start: str, end: str) -> Optional[pd.DataFr
     return None
 
 
-async def _backfill_one(ticker: str, start: str, end: str) -> int:
-    """Fetch + upsert 1 ticker. Trả số rows."""
+async def _backfill_one(ticker: str, start: str, end: str, timeout: float = 45.0) -> int:
+    """Fetch + upsert 1 ticker. Trả số rows. Timeout để tránh vnstock hang vô hạn."""
     await market_service._limiter.acquire()
     loop = asyncio.get_event_loop()
-    df = await loop.run_in_executor(None, _fetch_history_sync, ticker, start, end)
-    if df is None or df.empty:
+    print(f"→ backfill {ticker} [{start}..{end}]", flush=True)
+    try:
+        df = await asyncio.wait_for(
+            loop.run_in_executor(None, _fetch_history_sync, ticker, start, end),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        print(f"⏱️  {ticker} TIMEOUT sau {timeout}s — skip", flush=True)
         return 0
-    return ohlcv_store.upsert_ohlcv(ticker, df)
+    if df is None or df.empty:
+        print(f"∅ {ticker}: no data", flush=True)
+        return 0
+    n = ohlcv_store.upsert_ohlcv(ticker, df)
+    print(f"✅ {ticker}: {n} rows saved", flush=True)
+    return n
 
 
 async def _run_job(job_id: str, tickers: List[str], start: str, end: str) -> None:
-    """Background task chạy backfill tuần tự. Mỗi ticker = 1 acquire."""
-    completed, failed = 0, 0
+    """Background task chạy backfill tuần tự. Mỗi ticker = 1 acquire.
+
+    Resume-friendly: nếu ticker đã có last_date >= end-3 ngày (lịch giao dịch) →
+    skip, không tốn API call. Để re-download đầy đủ, xoá row trong backfill_status
+    trước hoặc gọi force endpoint (chưa có).
+    """
+    completed, failed, skipped = 0, 0, 0
+    # Ticker được coi là "đủ" nếu last_date >= end - 3 ngày (bù cuối tuần/lễ)
+    from datetime import datetime, timedelta
+    try:
+        cutoff = (datetime.strptime(end, "%Y-%m-%d") - timedelta(days=3)).strftime("%Y-%m-%d")
+    except Exception:
+        cutoff = end
     try:
         for i, t in enumerate(tickers):
             if _cancel_flags.get(job_id):
                 ohlcv_store.update_job(job_id, completed=completed, failed=failed,
                                        status="cancelled",
-                                       message=f"cancelled at {i}/{len(tickers)}")
+                                       message=f"cancelled at {i}/{len(tickers)} (skipped={skipped})")
                 return
+            # Skip nếu đã có data tới end
+            last = ohlcv_store.get_last_date(t)
+            if last and last >= cutoff:
+                skipped += 1
+                completed += 1
+                if (i + 1) % 10 == 0:
+                    print(f"⏭  {t} đã có tới {last} — skip ({skipped} skipped)", flush=True)
+                continue
             try:
                 n = await _backfill_one(t, start, end)
                 if n > 0:
@@ -145,7 +175,7 @@ async def _run_job(job_id: str, tickers: List[str], start: str, end: str) -> Non
                     failed += 1
             except BaseException as e:
                 failed += 1
-                print(f"❌ backfill {t}: {type(e).__name__}: {e}")
+                print(f"❌ backfill {t}: {type(e).__name__}: {e}", flush=True)
             # Update progress mỗi 5 tickers
             if (i + 1) % 5 == 0 or i + 1 == len(tickers):
                 ohlcv_store.update_job(
@@ -154,9 +184,10 @@ async def _run_job(job_id: str, tickers: List[str], start: str, end: str) -> Non
                 )
         ohlcv_store.update_job(
             job_id, completed=completed, failed=failed,
-            status="done", message=f"done {completed}/{len(tickers)} ok, {failed} failed",
+            status="done",
+            message=f"done {completed}/{len(tickers)} ok ({skipped} skipped), {failed} failed",
         )
-        print(f"✅ Backfill job {job_id} done: {completed} ok, {failed} failed")
+        print(f"✅ Backfill job {job_id} done: {completed} ok ({skipped} skipped), {failed} failed", flush=True)
     except BaseException as e:
         ohlcv_store.update_job(
             job_id, completed=completed, failed=failed,

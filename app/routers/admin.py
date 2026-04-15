@@ -62,6 +62,23 @@ async def backfill_cancel(job_id: str):
     return {"ok": True, "job_id": job_id, "message": "cancel requested"}
 
 
+@router.post("/backfill/mark-stale")
+async def backfill_mark_stale():
+    """Đánh dấu mọi job đang 'running' thành 'cancelled'.
+    Dùng sau khi restart container — task in-memory đã mất, DB còn lưu status cũ."""
+    import sqlite3
+    from datetime import datetime
+    with sqlite3.connect(ohlcv_store.DB_PATH) as conn:
+        cur = conn.execute(
+            "UPDATE backfill_job SET status='cancelled', finished_at=?, "
+            "message=COALESCE(message,'')||' [auto-marked stale]' "
+            "WHERE status='running'",
+            (datetime.now().isoformat(),),
+        )
+        n = cur.rowcount
+    return {"ok": True, "marked": n}
+
+
 @router.post("/ohlcv/daily-update")
 async def trigger_daily_update():
     """Chạy ngay daily_update (không chờ 16:00)."""
