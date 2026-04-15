@@ -1,10 +1,27 @@
-"""Admin endpoints: backfill, daily update, OHLCV stats."""
+"""Admin endpoints: backfill, daily update, OHLCV stats.
+
+Auth: mỗi request phải có header `X-Admin-Token` khớp env `ADMIN_TOKEN`.
+Nếu `ADMIN_TOKEN` không set → endpoint trả 503 để tránh mở cửa toàn bộ ra public.
+"""
+import os
 from typing import Optional
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Header, Depends
 
 from app.services import ohlcv_store, backfill
 
-router = APIRouter()
+
+def _require_admin(x_admin_token: Optional[str] = Header(default=None)) -> None:
+    expected = os.environ.get("ADMIN_TOKEN", "").strip()
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="ADMIN_TOKEN chưa được cấu hình trên server",
+        )
+    if not x_admin_token or x_admin_token.strip() != expected:
+        raise HTTPException(status_code=401, detail="invalid admin token")
+
+
+router = APIRouter(dependencies=[Depends(_require_admin)])
 
 
 @router.post("/backfill")
