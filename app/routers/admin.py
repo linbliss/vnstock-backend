@@ -86,9 +86,24 @@ async def trigger_daily_update():
     return result
 
 
+@router.post("/fundamentals/refresh")
+async def trigger_fundamental_refresh():
+    """Chạy ngay fundamental refresh (không chờ thứ Hai)."""
+    result = await backfill.refresh_fundamentals()
+    return result
+
+
+@router.get("/fundamentals/stats")
+async def fundamental_stats():
+    """Thống kê fundamentals cache."""
+    return ohlcv_store.get_fundamental_stats()
+
+
 @router.get("/ohlcv/stats")
 async def ohlcv_stats():
-    return ohlcv_store.get_stats()
+    stats = ohlcv_store.get_stats()
+    stats["fundamentals"] = ohlcv_store.get_fundamental_stats()
+    return stats
 
 
 @router.get("/ohlcv/tickers")

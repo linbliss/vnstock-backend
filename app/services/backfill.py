@@ -261,8 +261,51 @@ async def daily_update() -> Dict:
     return {"updated": updated, "failed": failed, "total": len(tickers), "message": msg}
 
 
+async def refresh_fundamentals() -> Dict:
+    """Cập nhật EPS/ROE cho tất cả ticker có trong OHLCV store mà data đã quá 7 ngày.
+    Chạy tự động sau daily_update (mỗi ngày thứ Hai) hoặc gọi thủ công từ admin.
+    """
+    stale = ohlcv_store.list_stale_fundamentals()
+    if not stale:
+        print("✅ Fundamental: tất cả đã cập nhật, không cần refresh")
+        return {"refreshed": 0, "total": 0, "message": "all up to date"}
+
+    print(f"📊 Fundamental refresh: {len(stale)} ticker cần cập nhật", flush=True)
+
+    # Import fetch function từ screener router
+    from app.routers.screener import _fetch_fundamental_sync
+
+    refreshed, failed = 0, 0
+    loop = asyncio.get_event_loop()
+    for i, t in enumerate(stale):
+        try:
+            await market_service._limiter.acquire()
+            result = await asyncio.wait_for(
+                loop.run_in_executor(None, _fetch_fundamental_sync, t),
+                timeout=30.0,
+            )
+            if result.get("eps"):
+                ohlcv_store.upsert_fundamental(t, result)
+                refreshed += 1
+            else:
+                failed += 1
+        except asyncio.TimeoutError:
+            failed += 1
+            print(f"⏱️  fundamental {t} TIMEOUT", flush=True)
+        except BaseException as e:
+            failed += 1
+            print(f"❌ fundamental {t}: {type(e).__name__}: {e}", flush=True)
+        if (i + 1) % 20 == 0:
+            print(f"📊 Fundamental progress: {i+1}/{len(stale)} ({refreshed} ok, {failed} fail)", flush=True)
+
+    msg = f"fundamental refresh: {refreshed}/{len(stale)} ok, {failed} failed"
+    print(f"✅ {msg}", flush=True)
+    return {"refreshed": refreshed, "failed": failed, "total": len(stale), "message": msg}
+
+
 async def daily_update_scheduler():
     """Chạy daily_update mỗi ngày lúc 16:00 giờ Việt Nam.
+    Fundamental refresh chạy thêm vào thứ Hai (sau daily_update).
     Container không có TZ → dùng datetime.now() (VPS đã set TZ Asia/Ho_Chi_Minh
     hoặc lifespan sẽ log để user biết). Nếu TZ khác, đặt env TZ=Asia/Ho_Chi_Minh.
     """
@@ -275,9 +318,14 @@ async def daily_update_scheduler():
         print(f"⏰ Daily update scheduled at {target.isoformat()} (in {wait/3600:.1f}h)")
         try:
             await asyncio.sleep(wait)
+            weekday = datetime.now().weekday()
             # Chỉ chạy ngày làm việc
-            if datetime.now().weekday() < 5:
+            if weekday < 5:
                 await daily_update()
+                # Thứ Hai: refresh fundamental cho tất cả ticker stale
+                if weekday == 0:
+                    print("📊 Thứ Hai — chạy fundamental refresh", flush=True)
+                    await refresh_fundamentals()
             else:
                 print("⏭️  Weekend — skip daily_update")
         except asyncio.CancelledError:

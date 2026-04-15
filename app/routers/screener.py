@@ -2,9 +2,7 @@ from fastapi import APIRouter, Query
 from typing import List, Dict, Any
 import asyncio
 from app.services.screener import screener_service
-
-# Cache fundamental data theo session để tránh gọi vnstocks nhiều lần
-_fundamental_cache: Dict[str, Any] = {}
+from app.services import ohlcv_store
 
 def _fetch_fundamental_sync(ticker: str) -> Dict[str, Any]:
     """Lấy EPS & ROE theo quý từ vnstocks (chạy trong executor).
@@ -175,28 +173,46 @@ async def analyze_ticker(ticker: str):
 
 @router.get("/fundamental/{ticker}")
 async def get_fundamental(ticker: str):
-    """Lấy EPS & ROE theo quý cho 1 mã (cache session)."""
+    """Lấy EPS & ROE theo quý cho 1 mã.
+    Đọc từ SQLite trước — chỉ gọi vnstock nếu chưa có hoặc data quá cũ (>7 ngày).
+    """
     from app.services.market_data import market_service
     sym = ticker.upper()
-    if sym not in _fundamental_cache:
-        await market_service._limiter.acquire()
-        loop = asyncio.get_event_loop()
-        _fundamental_cache[sym] = await loop.run_in_executor(None, _fetch_fundamental_sync, sym)
-    return _fundamental_cache[sym]
+
+    # 1. Đọc từ SQLite cache
+    if not ohlcv_store.is_fundamental_stale(sym):
+        cached = ohlcv_store.get_fundamental(sym)
+        if cached:
+            cached.pop("_updated_at", None)
+            return cached
+
+    # 2. Fetch mới từ vnstock → lưu SQLite
+    await market_service._limiter.acquire()
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, _fetch_fundamental_sync, sym)
+    # Chỉ lưu nếu có dữ liệu thực (eps không rỗng)
+    if result.get("eps"):
+        ohlcv_store.upsert_fundamental(sym, result)
+    return result
 
 @router.post("/fundamental/batch")
 async def get_fundamental_batch(tickers: List[str]):
-    """Lấy EPS & ROE cho nhiều mã, chạy tuần tự qua limiter (tránh vượt quota vnai)."""
+    """Lấy EPS & ROE cho nhiều mã. Đọc SQLite trước, chỉ fetch vnstock khi stale."""
     from app.services.market_data import market_service
     loop = asyncio.get_event_loop()
 
-    async def fetch_one(sym: str):
-        if sym in _fundamental_cache:
-            return _fundamental_cache[sym]
-        # Serial qua limiter — không song song nữa vì vnai quota tính toàn process
+    async def fetch_one(sym: str) -> Dict[str, Any]:
+        # Đọc cache SQLite trước
+        if not ohlcv_store.is_fundamental_stale(sym):
+            cached = ohlcv_store.get_fundamental(sym)
+            if cached:
+                cached.pop("_updated_at", None)
+                return cached
+        # Fetch mới
         await market_service._limiter.acquire()
         result = await loop.run_in_executor(None, _fetch_fundamental_sync, sym)
-        _fundamental_cache[sym] = result
+        if result.get("eps"):
+            ohlcv_store.upsert_fundamental(sym, result)
         return result
 
     results = []
@@ -206,9 +222,15 @@ async def get_fundamental_batch(tickers: List[str]):
 
 @router.delete("/fundamental/cache")
 async def clear_fundamental_cache():
-    """Xoá cache fundamental (dùng khi muốn refresh dữ liệu)."""
-    _fundamental_cache.clear()
+    """Xoá toàn bộ fundamental cache trong SQLite (force re-fetch lần sau)."""
+    with ohlcv_store._lock, ohlcv_store._connect() as conn:
+        conn.execute("DELETE FROM fundamentals")
     return {'cleared': True}
+
+@router.get("/fundamental/stats")
+async def get_fundamental_stats():
+    """Thống kê fundamentals cache."""
+    return ohlcv_store.get_fundamental_stats()
 
 @router.get("/debug/vnindex")
 async def debug_vnindex():
