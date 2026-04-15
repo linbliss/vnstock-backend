@@ -273,6 +273,11 @@ class ScreenerService:
         change_pct    = float(quote.get("change_pct", 0))
         volume        = int(quote.get("volume", 0))
 
+        # Volume MA — frontend cần để hiển thị + filter theo Settings
+        vol = df['volume'].values
+        vol_ma20 = int(float(pd.Series(vol).rolling(20).mean().iloc[-1])) if len(vol) >= 20 else 0
+        vol_ma50 = int(float(pd.Series(vol).rolling(50).mean().iloc[-1])) if len(vol) >= 50 else 0
+
         # Tổng điểm (0-100)
         trend_pts = trend["score"] * 5          # max 40
         rs_pts    = min(rs_rating * 0.3, 30)    # max 30
@@ -294,6 +299,8 @@ class ScreenerService:
             "rs_rating":    rs_rating,
             "vcp":          vcp,
             "total_score":  total,
+            "vol_ma20":     vol_ma20,
+            "vol_ma50":     vol_ma50,
             "analysis_time": now.isoformat(),
         }
 
