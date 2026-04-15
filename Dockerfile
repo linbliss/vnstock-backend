@@ -25,7 +25,11 @@ COPY --from=builder /install /usr/local
 COPY . .
 
 # Tạo user non-root để chạy app (bảo mật)
-RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+# Tạo sẵn /app/data + /app/logs để named volume kế thừa ownership appuser
+# (nếu không, volume mount mặc định root-owned → sqlite không ghi được)
+RUN useradd -m -u 1000 appuser \
+    && mkdir -p /app/data /app/logs \
+    && chown -R appuser:appuser /app
 USER appuser
 
 # Port mà uvicorn lắng nghe
