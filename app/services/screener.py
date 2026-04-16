@@ -64,33 +64,51 @@ def check_trend_template(df: pd.DataFrame, rs_rating: float = 0.0) -> Dict:
     }
 
 
-def compute_rs_rating(stock_returns: pd.Series, index_returns: pd.Series) -> float:
+def compute_rs_rating(stock_close: pd.Series, index_close: pd.Series, length: int = 20) -> float:
     """
-    Tính RS Rating (0-100) so với VN-Index
-    Weighted 12 tháng: 40% quý gần nhất (63d) + 20% mỗi quý còn lại (126/189/252d)
-    Ưu tiên momentum gần để bắt đà mới sớm hơn. Đây là approximation;
-    RS percentile chuẩn IBD cần rank trên toàn universe (TODO Mức C).
+    Tính RS (Relative Strength) so với VN-Index — khớp FireAnt (length=20).
+
+    Công thức:
+      RS Line = Stock Close / Index Close  (tỷ lệ giá tương đối)
+      RS SMA  = SMA(RS Line, length)
+      RS Value = ((RS Line hiện tại / RS SMA) - 1) * 100
+
+    RS > 0: stock đang outperform index (trong ngắn hạn so với trung bình)
+    RS < 0: stock đang underperform
+
+    Chuyển sang thang 0-100 để dùng trong screener:
+      Clamp [-20, +20] → [0, 100]  (±20% là biên rộng cho TTCK VN)
     """
     try:
-        # Lấy returns 63, 126, 189, 252 ngày
-        def period_return(s: pd.Series, days: int) -> float:
-            if len(s) < days:
-                return 0.0
-            return float((s.iloc[-1] / s.iloc[-days] - 1) * 100)
+        if len(stock_close) < length + 5 or len(index_close) < length + 5:
+            return 50.0
 
-        stock_r  = [period_return(stock_returns,  p) for p in [63, 126, 189, 252]]
-        index_r  = [period_return(index_returns,  p) for p in [63, 126, 189, 252]]
-        weights  = [0.4, 0.2, 0.2, 0.2]   # 40/20/20/20 — khớp docstring
+        # Align length: lấy số phiên tối thiểu của cả hai
+        n = min(len(stock_close), len(index_close))
+        stock = stock_close.iloc[-n:].reset_index(drop=True)
+        index = index_close.iloc[-n:].reset_index(drop=True)
 
-        stock_score = sum(r * w for r, w in zip(stock_r,  weights))
-        index_score = sum(r * w for r, w in zip(index_r,  weights))
+        # RS Line = Stock / Index (normalize để tránh scale khác nhau)
+        # Normalize cả hai về base 100 từ điểm đầu
+        stock_norm = stock / stock.iloc[0] * 100
+        index_norm = index / index.iloc[0] * 100
+        rs_line = stock_norm / index_norm
 
-        # RS tương đối: > 0 là outperform
-        relative = stock_score - index_score
-        # Chuyển về thang 0-100 (clamp -50..+50 → 0..100)
-        rs = max(0, min(100, (relative + 50)))
-        return round(rs, 1)
-    except:
+        # SMA của RS Line
+        rs_sma = rs_line.rolling(window=length).mean()
+
+        # RS Value = % chênh lệch giữa RS Line hiện tại vs SMA
+        rs_current = float(rs_line.iloc[-1])
+        rs_sma_val = float(rs_sma.iloc[-1])
+        if rs_sma_val == 0:
+            return 50.0
+
+        rs_value = (rs_current / rs_sma_val - 1) * 100
+
+        # Chuyển về thang 0-100: clamp [-20, +20] → [0, 100]
+        rs_rating = max(0, min(100, (rs_value + 20) * 100 / 40))
+        return round(rs_rating, 1)
+    except Exception:
         return 50.0
 
 
