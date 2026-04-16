@@ -64,50 +64,65 @@ def check_trend_template(df: pd.DataFrame, rs_rating: float = 0.0) -> Dict:
     }
 
 
-def compute_rs_rating(stock_close: pd.Series, index_close: pd.Series, length: int = 20) -> float:
+def compute_rs_rating(stock_close: pd.Series, index_close: pd.Series) -> float:
     """
-    Tính RS (Relative Strength) so với VN-Index — khớp FireAnt (length=20).
+    RS Rating kiểu IBD (0-100) — Weighted 12 tháng so với VN-Index.
+    40% quý gần nhất (63d) + 20% mỗi quý còn lại (126/189/252d).
+    Ưu tiên momentum gần để bắt đà mới sớm hơn.
+    """
+    try:
+        def period_return(s: pd.Series, days: int) -> float:
+            if len(s) < days:
+                return 0.0
+            return float((s.iloc[-1] / s.iloc[-days] - 1) * 100)
+
+        stock_r = [period_return(stock_close, p) for p in [63, 126, 189, 252]]
+        index_r = [period_return(index_close, p) for p in [63, 126, 189, 252]]
+        weights = [0.4, 0.2, 0.2, 0.2]
+
+        stock_score = sum(r * w for r, w in zip(stock_r, weights))
+        index_score = sum(r * w for r, w in zip(index_r, weights))
+
+        relative = stock_score - index_score
+        rs = max(0, min(100, (relative + 50)))
+        return round(rs, 1)
+    except Exception:
+        return 50.0
+
+
+def compute_rs_line(stock_close: pd.Series, index_close: pd.Series, length: int = 20) -> float:
+    """
+    RS Line kiểu FireAnt (length=20) — đo sức mạnh tương đối ngắn hạn.
 
     Công thức:
-      RS Line = Stock Close / Index Close  (tỷ lệ giá tương đối)
+      RS Line = Stock Close / Index Close (normalized)
       RS SMA  = SMA(RS Line, length)
       RS Value = ((RS Line hiện tại / RS SMA) - 1) * 100
 
-    RS > 0: stock đang outperform index (trong ngắn hạn so với trung bình)
-    RS < 0: stock đang underperform
-
-    Chuyển sang thang 0-100 để dùng trong screener:
-      Clamp [-20, +20] → [0, 100]  (±20% là biên rộng cho TTCK VN)
+    Chuyển sang thang 0-100: Clamp [-20, +20] → [0, 100]
     """
     try:
         if len(stock_close) < length + 5 or len(index_close) < length + 5:
             return 50.0
 
-        # Align length: lấy số phiên tối thiểu của cả hai
         n = min(len(stock_close), len(index_close))
         stock = stock_close.iloc[-n:].reset_index(drop=True)
         index = index_close.iloc[-n:].reset_index(drop=True)
 
-        # RS Line = Stock / Index (normalize để tránh scale khác nhau)
-        # Normalize cả hai về base 100 từ điểm đầu
         stock_norm = stock / stock.iloc[0] * 100
         index_norm = index / index.iloc[0] * 100
         rs_line = stock_norm / index_norm
 
-        # SMA của RS Line
         rs_sma = rs_line.rolling(window=length).mean()
 
-        # RS Value = % chênh lệch giữa RS Line hiện tại vs SMA
         rs_current = float(rs_line.iloc[-1])
         rs_sma_val = float(rs_sma.iloc[-1])
         if rs_sma_val == 0:
             return 50.0
 
         rs_value = (rs_current / rs_sma_val - 1) * 100
-
-        # Chuyển về thang 0-100: clamp [-20, +20] → [0, 100]
-        rs_rating = max(0, min(100, (rs_value + 20) * 100 / 40))
-        return round(rs_rating, 1)
+        rs = max(0, min(100, (rs_value + 20) * 100 / 40))
+        return round(rs, 1)
     except Exception:
         return 50.0
 
@@ -272,14 +287,18 @@ class ScreenerService:
         if df is None or len(df) < 60:
             return None
 
-        # RS Rating (so với VN-Index) — tính TRƯỚC để truyền vào trend template
+        # RS Rating IBD (weighted 12 tháng) + RS Line FireAnt (length=20)
         rs_rating = 50.0
+        rs_line_val = 50.0
         if self._index_data is not None and len(self._index_data) >= 60:
             rs_rating = compute_rs_rating(
                 df['close'], self._index_data['close']
             )
+            rs_line_val = compute_rs_line(
+                df['close'], self._index_data['close']
+            )
 
-        # Trend Template (c8 dùng rs_rating ≥ 55)
+        # Trend Template (c8 dùng rs_rating IBD ≥ 55)
         trend = check_trend_template(df, rs_rating=rs_rating)
 
         # VCP
@@ -315,6 +334,7 @@ class ScreenerService:
             "ma150":        trend.get("ma150", 0),
             "ma200":        trend.get("ma200", 0),
             "rs_rating":    rs_rating,
+            "rs_line":      rs_line_val,
             "vcp":          vcp,
             "total_score":  total,
             "vol_ma20":     vol_ma20,
