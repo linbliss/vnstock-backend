@@ -25,20 +25,52 @@ def _fetch_fundamental_via_api(ticker: str) -> Dict[str, Any]:
     fireant_token = os.environ.get("FIREANT_TOKEN", "").strip()
     if fireant_token:
         try:
-            url = f"https://restv2.fireant.vn/symbols/{ticker}/fundamental"
-            resp = requests.get(url, timeout=15, headers={
-                "Authorization": f"Bearer {fireant_token}",
-            })
-            if resp.status_code == 200:
-                data = resp.json()
-                result = _parse_fireant_fundamental(ticker, data)
+            headers = {"Authorization": f"Bearer {fireant_token}"}
+
+            # 1a. Lấy sharesOutstanding + ROE từ fundamental
+            fund_resp = requests.get(
+                f"https://restv2.fireant.vn/symbols/{ticker}/fundamental",
+                timeout=15, headers=headers,
+            )
+            shares = 0
+            roe_latest = 0.0
+            if fund_resp.status_code == 200:
+                fund_data = fund_resp.json()
+                shares = fund_data.get("sharesOutstanding", 0) or 0
+                roe_latest = fund_data.get("roe", 0) or 0
+                # FireAnt trả ROE dạng % (vd: 7.43)
+                if isinstance(roe_latest, str):
+                    roe_latest = 0.0
+
+            # 1b. Lấy quarterly NetProfit từ financial-reports
+            report_resp = requests.get(
+                f"https://restv2.fireant.vn/symbols/{ticker}/financial-reports?type=quarter&count=20",
+                timeout=15, headers=headers,
+            )
+            if report_resp.status_code == 200:
+                report_data = report_resp.json()
+                result = _parse_fireant_reports(ticker, report_data, shares, roe_latest)
                 if result:
                     print(f"✅ Fundamental {ticker} via FireAnt: OK", flush=True)
                     return result
-                else:
-                    print(f"⚠️  Fundamental {ticker} via FireAnt: parse failed, keys={list(data.keys()) if isinstance(data, dict) else type(data)}", flush=True)
-            else:
-                print(f"⚠️  Fundamental {ticker} via FireAnt: HTTP {resp.status_code}", flush=True)
+
+            # 1c. Nếu financial-reports không có data, dùng snapshot
+            if fund_resp.status_code == 200 and fund_data.get("eps"):
+                eps_val = float(fund_data["eps"])
+                # Chỉ có giá trị mới nhất → tạo 1-point array
+                result = {
+                    'ticker': ticker,
+                    'eps': [round(eps_val, 0)],
+                    'roe': [round(roe_latest, 2)] if roe_latest else [0.0],
+                    'quarters': [{'year': 0, 'quarter': 0}],
+                    'eps_growth': False,
+                    'roe_latest': round(roe_latest, 2),
+                    'roe_growth': False,
+                }
+                print(f"✅ Fundamental {ticker} via FireAnt (snapshot): eps={eps_val:.0f}", flush=True)
+                return result
+
+            print(f"⚠️  Fundamental {ticker} via FireAnt: no usable data", flush=True)
         except Exception as e:
             print(f"⚠️  Fundamental {ticker} via FireAnt: {type(e).__name__}: {e}", flush=True)
 
@@ -65,6 +97,105 @@ def _fetch_fundamental_via_api(ticker: str) -> Dict[str, Any]:
 
     print(f"❌ Fundamental {ticker}: all sources failed", flush=True)
     return empty
+
+
+def _parse_fireant_reports(ticker: str, report_data: Any, shares: float, roe_latest: float) -> Dict[str, Any]:
+    """Parse FireAnt /financial-reports response → fundamental dict.
+
+    Format:
+      {
+        "symbol": "VIC",
+        "columns": ["Name", "Symbol", "Q4/2024", "Q1/2025", ...],
+        "rows": [
+          ["LNST", "NetProfit", 123456, 234567, ...],
+          ["LNST (CĐ cty mẹ)", "NetProfit_PCSH", 111111, 222222, ...],
+          ...
+        ]
+      }
+
+    Ưu tiên NetProfit_PCSH (lợi nhuận thuộc về cổ đông công ty mẹ).
+    EPS = NetProfit_PCSH / sharesOutstanding (đơn vị triệu → VND).
+    """
+    import math
+
+    if not isinstance(report_data, dict):
+        return None
+    columns = report_data.get("columns", [])
+    rows = report_data.get("rows", [])
+    if not columns or not rows or len(columns) < 3:
+        return None
+
+    # Tìm row NetProfit_PCSH (ưu tiên) hoặc NetProfit
+    net_profit_row = None
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or len(row) < 3:
+            continue
+        symbol_col = str(row[1]).strip() if len(row) > 1 else ""
+        if symbol_col == "NetProfit_PCSH":
+            net_profit_row = row
+            break
+    if net_profit_row is None:
+        for row in rows:
+            if not isinstance(row, (list, tuple)) or len(row) < 3:
+                continue
+            symbol_col = str(row[1]).strip() if len(row) > 1 else ""
+            if symbol_col == "NetProfit":
+                net_profit_row = row
+                break
+    if net_profit_row is None:
+        return None
+
+    # Parse quarter labels từ columns (skip "Name", "Symbol")
+    # Format: "Q4/2024", "Q1/2025", ...
+    raw_eps, raw_roe, raw_quarters = [], [], []
+    for i in range(2, min(len(columns), len(net_profit_row))):
+        col_label = str(columns[i])  # e.g. "Q4/2024"
+        val = net_profit_row[i]
+
+        # Parse quarter label
+        year, quarter = 0, 0
+        try:
+            parts = col_label.split("/")
+            if len(parts) == 2 and parts[0].startswith("Q"):
+                quarter = int(parts[0][1:])
+                year = int(parts[1])
+        except (ValueError, IndexError):
+            pass
+
+        # Parse net profit value (triệu VND)
+        try:
+            net_profit = float(val) if val is not None else 0.0
+            if math.isnan(net_profit):
+                net_profit = 0.0
+        except (ValueError, TypeError):
+            net_profit = 0.0
+
+        # EPS = NetProfit (triệu VND) * 1_000_000 / sharesOutstanding
+        if shares and shares > 0:
+            eps_q = round(net_profit * 1_000_000 / shares, 0)
+        else:
+            eps_q = 0.0
+
+        raw_eps.append(eps_q)
+        raw_roe.append(round(roe_latest, 2))  # ROE chỉ có giá trị snapshot mới nhất
+        raw_quarters.append({"year": year, "quarter": quarter})
+
+    if not raw_eps:
+        return None
+
+    # Nếu ít hơn 4 quý, trả về raw data (không tính TTM)
+    if len(raw_eps) < 4:
+        return {
+            "ticker": ticker,
+            "eps": raw_eps,
+            "roe": raw_roe,
+            "quarters": raw_quarters,
+            "eps_growth": False,
+            "roe_latest": round(roe_latest, 2),
+            "roe_growth": False,
+        }
+
+    return _compute_ttm(ticker, raw_eps, raw_roe, raw_quarters)
 
 
 def _parse_fireant_fundamental(ticker: str, data: Any) -> Dict[str, Any]:
