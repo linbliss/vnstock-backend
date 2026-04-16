@@ -57,7 +57,7 @@ def _fetch_fundamental_via_api(ticker: str) -> Dict[str, Any]:
 
             # 1b. Lấy quarterly NetProfit từ financial-reports
             report_resp = requests.get(
-                f"https://restv2.fireant.vn/symbols/{ticker}/financial-reports?type=quarter&count=40",
+                f"https://restv2.fireant.vn/symbols/{ticker}/financial-reports?type=quarter&limit=20",
                 timeout=15, headers=headers,
             )
             if report_resp.status_code == 200:
@@ -451,11 +451,7 @@ async def debug_fundamental(ticker: str):
         for ep_name, ep_url in [
             ("fundamental", f"https://restv2.fireant.vn/symbols/{sym}/fundamental"),
             ("financial-indicators", f"https://restv2.fireant.vn/symbols/{sym}/financial-indicators?type=quarterly&count=20"),
-            ("financial-reports", f"https://restv2.fireant.vn/symbols/{sym}/financial-reports?type=quarter&count=40"),
-            ("reports-year2024", f"https://restv2.fireant.vn/symbols/{sym}/financial-reports?type=quarter&year=2024"),
-            ("reports-year2023", f"https://restv2.fireant.vn/symbols/{sym}/financial-reports?type=quarter&year=2023"),
-            ("reports-limit20", f"https://restv2.fireant.vn/symbols/{sym}/financial-reports?type=quarter&limit=20"),
-            ("reports-period20", f"https://restv2.fireant.vn/symbols/{sym}/financial-reports?type=quarter&period=20"),
+            ("financial-reports", f"https://restv2.fireant.vn/symbols/{sym}/financial-reports?type=quarter&limit=20"),
         ]:
             try:
                 resp = req_lib.get(ep_url, timeout=15, headers=headers)
