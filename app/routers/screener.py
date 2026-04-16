@@ -27,20 +27,33 @@ def _fetch_fundamental_via_api(ticker: str) -> Dict[str, Any]:
         try:
             headers = {"Authorization": f"Bearer {fireant_token}"}
 
-            # 1a. Lấy sharesOutstanding + ROE từ fundamental
+            # 1a. Lấy sharesOutstanding từ fundamental
             fund_resp = requests.get(
                 f"https://restv2.fireant.vn/symbols/{ticker}/fundamental",
                 timeout=15, headers=headers,
             )
             shares = 0
             roe_latest = 0.0
+            fund_data = {}
             if fund_resp.status_code == 200:
                 fund_data = fund_resp.json()
                 shares = fund_data.get("sharesOutstanding", 0) or 0
-                roe_latest = fund_data.get("roe", 0) or 0
-                # FireAnt trả ROE dạng % (vd: 7.43)
-                if isinstance(roe_latest, str):
-                    roe_latest = 0.0
+
+            # 1a2. Lấy ROE từ financial-indicators (fundamental không có roe)
+            try:
+                ind_resp = requests.get(
+                    f"https://restv2.fireant.vn/symbols/{ticker}/financial-indicators?type=quarterly&count=20",
+                    timeout=15, headers=headers,
+                )
+                if ind_resp.status_code == 200:
+                    indicators = ind_resp.json()
+                    if isinstance(indicators, list):
+                        for item in indicators:
+                            if isinstance(item, dict) and item.get("shortName") == "ROE":
+                                roe_latest = float(item.get("value", 0) or 0)
+                                break
+            except Exception:
+                pass
 
             # 1b. Lấy quarterly NetProfit từ financial-reports
             report_resp = requests.get(
@@ -170,9 +183,10 @@ def _parse_fireant_reports(ticker: str, report_data: Any, shares: float, roe_lat
         except (ValueError, TypeError):
             net_profit = 0.0
 
-        # EPS = NetProfit (triệu VND) * 1_000_000 / sharesOutstanding
+        # EPS = NetProfit (VND) / sharesOutstanding
+        # FireAnt trả NetProfit đơn vị VND (không phải triệu)
         if shares and shares > 0:
-            eps_q = round(net_profit * 1_000_000 / shares, 0)
+            eps_q = round(net_profit / shares, 0)
         else:
             eps_q = 0.0
 
