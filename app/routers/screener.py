@@ -191,7 +191,6 @@ def _parse_fireant_reports(ticker: str, report_data: Any, shares: float, roe_lat
             eps_q = 0.0
 
         raw_eps.append(eps_q)
-        raw_roe.append(round(roe_latest, 2))  # ROE chỉ có giá trị snapshot mới nhất
         raw_quarters.append({"year": year, "quarter": quarter})
 
     if not raw_eps:
@@ -199,6 +198,7 @@ def _parse_fireant_reports(ticker: str, report_data: Any, shares: float, roe_lat
 
     # Nếu ít hơn 4 quý, trả về raw data (không tính TTM)
     if len(raw_eps) < 4:
+        raw_roe = [round(roe_latest, 2)] * len(raw_eps)
         return {
             "ticker": ticker,
             "eps": raw_eps,
@@ -209,7 +209,29 @@ def _parse_fireant_reports(ticker: str, report_data: Any, shares: float, roe_lat
             "roe_growth": False,
         }
 
-    return _compute_ttm(ticker, raw_eps, raw_roe, raw_quarters)
+    # Tính TTM EPS trước, rồi suy ra ROE ước lượng theo quý
+    # ROE = EPS_TTM / Equity_per_share * 100
+    # Equity_per_share = EPS_TTM_latest / (ROE_latest / 100)  (suy ngược từ snapshot)
+    result = _compute_ttm(ticker, raw_eps, [0.0] * len(raw_eps), raw_quarters)
+    if not result:
+        return None
+
+    # Tính ROE ước lượng cho từng quý TTM
+    eps_ttm_list = result["eps"]
+    if roe_latest and roe_latest > 0 and eps_ttm_list and eps_ttm_list[-1] != 0:
+        # Suy Equity per share từ snapshot: Equity = EPS_TTM_latest / (ROE% / 100)
+        equity_ps = abs(eps_ttm_list[-1]) / (roe_latest / 100.0)
+        roe_estimated = [round(e / equity_ps * 100, 2) if equity_ps > 0 else 0.0 for e in eps_ttm_list]
+        result["roe"] = roe_estimated
+        result["roe_latest"] = roe_estimated[-1] if roe_estimated else round(roe_latest, 2)
+        # ROE growth: kiểm tra 2 quý gần nhất tăng
+        if len(roe_estimated) >= 2:
+            result["roe_growth"] = roe_estimated[-1] > roe_estimated[-2]
+    else:
+        result["roe"] = [round(roe_latest, 2)] * len(eps_ttm_list)
+        result["roe_latest"] = round(roe_latest, 2)
+
+    return result
 
 
 def _parse_fireant_fundamental(ticker: str, data: Any) -> Dict[str, Any]:
@@ -452,9 +474,6 @@ async def debug_fundamental(ticker: str):
             ("fundamental", f"https://restv2.fireant.vn/symbols/{sym}/fundamental"),
             ("financial-indicators", f"https://restv2.fireant.vn/symbols/{sym}/financial-indicators?type=quarterly&count=20"),
             ("financial-reports", f"https://restv2.fireant.vn/symbols/{sym}/financial-reports?type=quarter&limit=20"),
-            ("type-2", f"https://restv2.fireant.vn/symbols/{sym}/financial-reports?type=2&limit=20"),
-            ("type-3", f"https://restv2.fireant.vn/symbols/{sym}/financial-reports?type=3&limit=20"),
-            ("type-4", f"https://restv2.fireant.vn/symbols/{sym}/financial-reports?type=4&limit=20"),
         ]:
             try:
                 resp = req_lib.get(ep_url, timeout=15, headers=headers)
