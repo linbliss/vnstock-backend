@@ -452,6 +452,10 @@ async def debug_fundamental(ticker: str):
             ("fundamental", f"https://restv2.fireant.vn/symbols/{sym}/fundamental"),
             ("financial-indicators", f"https://restv2.fireant.vn/symbols/{sym}/financial-indicators?type=quarterly&count=20"),
             ("financial-reports", f"https://restv2.fireant.vn/symbols/{sym}/financial-reports?type=quarter&count=40"),
+            ("reports-year2024", f"https://restv2.fireant.vn/symbols/{sym}/financial-reports?type=quarter&year=2024"),
+            ("reports-year2023", f"https://restv2.fireant.vn/symbols/{sym}/financial-reports?type=quarter&year=2023"),
+            ("reports-limit20", f"https://restv2.fireant.vn/symbols/{sym}/financial-reports?type=quarter&limit=20"),
+            ("reports-period20", f"https://restv2.fireant.vn/symbols/{sym}/financial-reports?type=quarter&period=20"),
         ]:
             try:
                 resp = req_lib.get(ep_url, timeout=15, headers=headers)
