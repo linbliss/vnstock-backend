@@ -326,12 +326,16 @@ async def debug_fundamental(ticker: str):
                         for k in body[0]:
                             if 'eps' in k.lower() or 'roe' in k.lower():
                                 info[f"sample_{k}"] = body[0][k]
-                # Show columns/rows structure for financial-reports
+                # Show full columns/rows for financial-reports
                 if isinstance(body, dict) and 'columns' in body and 'rows' in body:
-                    info["columns"] = body["columns"][:20] if isinstance(body["columns"], list) else body["columns"]
+                    info["columns"] = body["columns"]
                     info["rows_count"] = len(body["rows"]) if isinstance(body["rows"], list) else "?"
-                    if isinstance(body["rows"], list) and body["rows"]:
-                        info["sample_row"] = body["rows"][0]
+                    # Show all rows (name + symbol + values)
+                    if isinstance(body["rows"], list):
+                        info["all_rows"] = [[r[0], r[1]] + list(r[2:5]) for r in body["rows"]] if body["rows"] else []
+                # Show all items for financial-indicators
+                if isinstance(body, list):
+                    info["all_items"] = [{"name": item.get("name","?"), "shortName": item.get("shortName","?"), "value": item.get("value")} for item in body[:30] if isinstance(item, dict)]
                 else:
                     info["body"] = str(body)[:200]
                 sources.append(info)
