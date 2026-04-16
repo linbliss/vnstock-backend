@@ -349,14 +349,21 @@ class ScreenerService:
     async def _fetch_history_async(
         self, ticker: str, start: str, end: str, is_index: bool = False
     ) -> Optional[pd.DataFrame]:
-        """Đọc lịch sử OHLCV. Ưu tiên OHLCV store (SQLite) để tránh gọi vnstock.
-        Chỉ fallback vnstock cho: indices (VNINDEX) hoặc ticker CHƯA có trong store.
+        """Đọc lịch sử OHLCV. Ưu tiên OHLCV store (SQLite) → FireAnt → vnstock.
         """
-        # ── Store first (stocks) ──
-        if not is_index:
-            df_store = ohlcv_store.get_ohlcv(ticker, start, end)
-            if df_store is not None and len(df_store) >= 60:
-                return df_store
+        # ── Store first (tất cả, kể cả index) ──
+        df_store = ohlcv_store.get_ohlcv(ticker if not is_index else "VNINDEX", start, end)
+        if df_store is not None and len(df_store) >= 60:
+            return df_store
+
+        # ── FireAnt historical prices (index + stocks) ──
+        if is_index:
+            df_fa = await self._fetch_index_fireant(start, end)
+            if df_fa is not None and len(df_fa) >= 60:
+                # Lưu vào OHLCV store để lần sau không cần fetch lại
+                ohlcv_store.upsert_ohlcv("VNINDEX", df_fa)
+                print(f"✅ VNINDEX via FireAnt: {len(df_fa)} rows → saved to store")
+                return df_fa
 
         loop = asyncio.get_event_loop()
         sources = ['kbs', 'vci', 'msn'] if is_index else ['kbs', 'vci']
@@ -371,6 +378,53 @@ class ScreenerService:
             if stopped:
                 break   # raise → bỏ luôn
         return None
+
+    async def _fetch_index_fireant(self, start: str, end: str) -> Optional[pd.DataFrame]:
+        """Lấy VNINDEX historical prices từ FireAnt API."""
+        import os
+        import requests
+        token = os.environ.get("FIREANT_TOKEN", "").strip()
+        if not token:
+            return None
+        try:
+            # FireAnt historical endpoint
+            url = (
+                f"https://restv2.fireant.vn/symbols/VNINDEX/historical-quotes"
+                f"?startDate={start}&endDate={end}&offset=0&limit=5000"
+            )
+            resp = requests.get(url, timeout=30, headers={
+                "Authorization": f"Bearer {token}"
+            })
+            if resp.status_code != 200:
+                print(f"⚠️  FireAnt VNINDEX: HTTP {resp.status_code}")
+                return None
+            data = resp.json()
+            if not isinstance(data, list) or not data:
+                return None
+            # Parse: FireAnt trả list of {date, priceOpen, priceHigh, priceLow, priceClose, ...}
+            rows = []
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                d = item.get("date", "")
+                if isinstance(d, str) and len(d) >= 10:
+                    d = d[:10]  # "2024-01-15T00:00:00" → "2024-01-15"
+                rows.append({
+                    "date": d,
+                    "open":   item.get("priceOpen", 0) or 0,
+                    "high":   item.get("priceHigh", 0) or 0,
+                    "low":    item.get("priceLow", 0) or 0,
+                    "close":  item.get("priceClose", 0) or 0,
+                    "volume": item.get("totalVolume", 0) or item.get("dealVolume", 0) or 0,
+                })
+            if not rows:
+                return None
+            df = pd.DataFrame(rows)
+            df = df.sort_values("date").reset_index(drop=True)
+            return df
+        except Exception as e:
+            print(f"⚠️  FireAnt VNINDEX: {type(e).__name__}: {e}")
+            return None
 
     def _fetch_one_source(
         self, ticker: str, source: str, start: str, end: str, is_index: bool
