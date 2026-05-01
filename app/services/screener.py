@@ -233,6 +233,13 @@ class ScreenerService:
         self.CACHE_TTL = 900        # 15 phút cho mã thường (giảm churn gọi lại)
         self.INDEX_TTL = 3600       # 1 giờ cho VNINDEX
 
+    def clear_cache(self):
+        """Xóa toàn bộ screener cache (force re-analyze)."""
+        self._cache.clear()
+        self._cache_time.clear()
+        self._index_data = None
+        self._index_fetched_at = None
+
     async def _ensure_index_data(self):
         """Load VNINDEX (refresh 1 giờ). Chỉ dùng symbol 'VNINDEX' — đã verify OK qua KBS."""
         now = datetime.now()

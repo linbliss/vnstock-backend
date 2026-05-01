@@ -420,6 +420,12 @@ async def get_exchange_tickers(exchange: str):
     tickers = await get_tickers_by_exchange(ex)
     return {"exchange": ex, "tickers": tickers, "count": len(tickers)}
 
+@router.delete("/cache")
+async def clear_screener_cache():
+    """Xóa screener analysis cache (force re-calculate RS, trend, etc)."""
+    screener_service.clear_cache()
+    return {"cleared": True}
+
 @router.get("/scan")
 async def scan_market(
     tickers: str = Query(default=",".join(VN30)),
