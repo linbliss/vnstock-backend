@@ -426,6 +426,61 @@ async def clear_screener_cache():
     screener_service.clear_cache()
     return {"cleared": True}
 
+@router.get("/debug/rs/{ticker}")
+async def debug_rs(ticker: str):
+    """Debug RS calculation — xem dữ liệu đầu vào."""
+    from app.services.screener import compute_rs_rating, compute_rs_line
+    sym = ticker.upper()
+    await screener_service._ensure_index_data()
+
+    # Lấy stock data
+    from datetime import datetime
+    end = datetime.now().strftime("%Y-%m-%d")
+    df = await screener_service._fetch_history_async(sym, "2000-01-01", end, is_index=False)
+
+    idx = screener_service._index_data
+    result = {
+        "ticker": sym,
+        "index_loaded": idx is not None,
+        "index_len": len(idx) if idx is not None else 0,
+        "stock_len": len(df) if df is not None else 0,
+    }
+    if idx is not None and df is not None:
+        stock_close = df['close']
+        index_close = idx['close']
+        result["stock_close_first5"] = stock_close.head(3).tolist()
+        result["stock_close_last5"] = stock_close.tail(3).tolist()
+        result["index_close_first5"] = index_close.head(3).tolist()
+        result["index_close_last5"] = index_close.tail(3).tolist()
+        result["stock_dtype"] = str(stock_close.dtype)
+        result["index_dtype"] = str(index_close.dtype)
+
+        # Compute cả 2
+        result["rs_rating"] = compute_rs_rating(stock_close, index_close)
+        result["rs_line"] = compute_rs_line(stock_close, index_close)
+
+        # Manual debug RS line
+        import pandas as pd
+        n = min(len(stock_close), len(index_close))
+        s = stock_close.iloc[-n:].reset_index(drop=True)
+        i = index_close.iloc[-n:].reset_index(drop=True)
+        s0 = float(s.iloc[0])
+        i0 = float(i.iloc[0])
+        result["n"] = n
+        result["s0"] = s0
+        result["i0"] = i0
+        if s0 != 0 and i0 != 0:
+            sn = s / s0 * 100
+            iN = i / i0 * 100
+            rs_l = sn / iN
+            rs_sma = rs_l.rolling(20).mean()
+            result["rs_line_last"] = float(rs_l.iloc[-1])
+            result["rs_sma_last"] = float(rs_sma.iloc[-1])
+            rv = (float(rs_l.iloc[-1]) / float(rs_sma.iloc[-1]) - 1) * 100
+            result["rs_value"] = round(rv, 4)
+            result["rs_mapped"] = round(max(0, min(100, (rv + 20) * 100 / 40)), 1)
+    return result
+
 @router.get("/scan")
 async def scan_market(
     tickers: str = Query(default=",".join(VN30)),
