@@ -105,31 +105,29 @@ def compute_rs_line(stock_close: pd.Series, index_close: pd.Series, length: int 
         if len(stock_close) < length + 5 or len(index_close) < length + 5:
             return 50.0
 
-        n = min(len(stock_close), len(index_close))
-        stock = stock_close.iloc[-n:].reset_index(drop=True)
-        index = index_close.iloc[-n:].reset_index(drop=True)
+        # Chỉ dùng 60 phiên gần nhất (đủ cho SMA(20) + buffer)
+        # Dùng nhiều hơn gây lỗi khi normalize từ base cũ (stock/index scale khác xa)
+        lookback = length * 3  # 60 phiên cho length=20
+        stock = stock_close.iloc[-lookback:].reset_index(drop=True)
+        index = index_close.iloc[-lookback:].reset_index(drop=True)
 
-        stock_norm = stock / stock.iloc[0] * 100
-        index_norm = index / index.iloc[0] * 100
-        rs_line = stock_norm / index_norm
+        # RS Line = tỷ lệ % thay đổi tương đối (không normalize từ base)
+        # Cách tính: RS = (Stock / Index) rồi so với SMA
+        rs_ratio = stock / index
+        rs_sma = rs_ratio.rolling(window=length).mean()
 
-        rs_sma = rs_line.rolling(window=length).mean()
-
-        rs_current = float(rs_line.iloc[-1])
+        rs_current = float(rs_ratio.iloc[-1])
         rs_sma_val = float(rs_sma.iloc[-1])
         if rs_sma_val == 0:
             return 50.0
 
+        # RS value = % chênh lệch RS hiện tại vs SMA của nó
         rs_value = (rs_current / rs_sma_val - 1) * 100
-        rs = max(0, min(100, (rs_value + 20) * 100 / 40))
-        # DEBUG
-        print(f"  RS_LINE debug: n={n} stock[0]={float(stock.iloc[0]):.2f} idx[0]={float(index.iloc[0]):.2f} "
-              f"stock[-1]={float(stock.iloc[-1]):.2f} idx[-1]={float(index.iloc[-1]):.2f} "
-              f"rs_cur={rs_current:.4f} rs_sma={rs_sma_val:.4f} rs_value={rs_value:.2f} → rs={rs:.1f}",
-              flush=True)
+
+        # Map sang 0-100: [-10, +10] → [0, 100] (tighter range cho 60-day window)
+        rs = max(0, min(100, (rs_value + 10) * 100 / 20))
         return round(rs, 1)
-    except Exception as e:
-        print(f"  RS_LINE exception: {type(e).__name__}: {e}", flush=True)
+    except Exception:
         return 50.0
 
 
