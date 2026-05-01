@@ -61,7 +61,9 @@ fi
 # Docker tự cache layer pip install nếu requirements.txt không đổi → vẫn nhanh
 info "Bước 3/5: Rebuild & restart container..."
 docker compose down --remove-orphans 2>/dev/null || true
-docker compose up -d --build
+# --build-arg CACHEBUST đảm bảo COPY . . luôn chạy lại (không cache stale code)
+docker compose build --build-arg CACHEBUST="$(date +%s)" 2>/dev/null || docker compose build
+docker compose up -d
 success "Container đã khởi động với code mới"
 
 # ── Bước 4: Health check ────────────────────────────────────────────────────

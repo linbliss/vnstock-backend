@@ -21,6 +21,13 @@ WORKDIR /app
 # Copy installed packages từ builder
 COPY --from=builder /install /usr/local
 
+# Không tạo __pycache__ (tránh stale bytecode)
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# Bust Docker layer cache khi source code thay đổi
+ARG CACHEBUST=1
+
 # Copy source code
 COPY . .
 
