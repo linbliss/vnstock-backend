@@ -64,6 +64,18 @@ def check_trend_template(df: pd.DataFrame, rs_rating: float = 0.0) -> Dict:
     }
 
 
+def _filter_outliers(stock: pd.Series, index: pd.Series) -> tuple:
+    """Filter corrupt VNINDEX rows (FireAnt sometimes returns close/1000)."""
+    stock = stock.astype(float)
+    index = index.astype(float)
+    median_idx = float(index.median())
+    if median_idx > 0:
+        valid_mask = (index > median_idx * 0.3) & (index < median_idx * 3)
+        stock = stock[valid_mask].reset_index(drop=True)
+        index = index[valid_mask].reset_index(drop=True)
+    return stock, index
+
+
 def compute_rs_rating(stock_close: pd.Series, index_close: pd.Series) -> float:
     """
     RS Rating kiểu IBD (0-100) — Weighted 12 tháng so với VN-Index.
@@ -71,6 +83,12 @@ def compute_rs_rating(stock_close: pd.Series, index_close: pd.Series) -> float:
     Ưu tiên momentum gần để bắt đà mới sớm hơn.
     """
     try:
+        stock_close, index_close = _filter_outliers(stock_close, index_close)
+        if len(stock_close) < 252 or len(index_close) < 252:
+            # Fallback: cần ít nhất 63 phiên
+            if len(stock_close) < 63:
+                return 50.0
+
         def period_return(s: pd.Series, days: int) -> float:
             if len(s) < days:
                 return 0.0
@@ -105,26 +123,35 @@ def compute_rs_line(stock_close: pd.Series, index_close: pd.Series, length: int 
         if len(stock_close) < length + 5 or len(index_close) < length + 5:
             return 50.0
 
-        # Chỉ dùng 60 phiên gần nhất (đủ cho SMA(20) + buffer)
-        # Dùng nhiều hơn gây lỗi khi normalize từ base cũ (stock/index scale khác xa)
+        # Ch�� dùng 60 phiên gần nh���t (đủ cho SMA(20) + buffer)
         lookback = length * 3  # 60 phiên cho length=20
-        stock = stock_close.iloc[-lookback:].reset_index(drop=True)
-        index = index_close.iloc[-lookback:].reset_index(drop=True)
+        stock = stock_close.iloc[-lookback:].reset_index(drop=True).astype(float)
+        index = index_close.iloc[-lookback:].reset_index(drop=True).astype(float)
 
-        # RS Line = tỷ lệ % thay đổi tương đối (không normalize từ base)
-        # Cách tính: RS = (Stock / Index) rồi so với SMA
+        # Filter outliers: VNINDEX bình thường 100-5000 points
+        # FireAnt đôi khi trả giá trị lỗi (close bị chia 1000)
+        median_idx = float(index.median())
+        if median_idx > 0:
+            valid_mask = (index > median_idx * 0.3) & (index < median_idx * 3)
+            stock = stock[valid_mask].reset_index(drop=True)
+            index = index[valid_mask].reset_index(drop=True)
+
+        if len(stock) < length + 5:
+            return 50.0
+
+        # RS = Stock/Index ratio → so với SMA(20) của nó
         rs_ratio = stock / index
         rs_sma = rs_ratio.rolling(window=length).mean()
 
         rs_current = float(rs_ratio.iloc[-1])
         rs_sma_val = float(rs_sma.iloc[-1])
-        if rs_sma_val == 0:
+        if rs_sma_val == 0 or pd.isna(rs_sma_val):
             return 50.0
 
-        # RS value = % chênh lệch RS hiện tại vs SMA của nó
+        # RS value = % chênh lệch RS hiện tại vs SMA
         rs_value = (rs_current / rs_sma_val - 1) * 100
 
-        # Map sang 0-100: [-10, +10] → [0, 100] (tighter range cho 60-day window)
+        # Map sang 0-100: [-10, +10] → [0, 100]
         rs = max(0, min(100, (rs_value + 10) * 100 / 20))
         return round(rs, 1)
     except Exception:
