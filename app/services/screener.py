@@ -506,16 +506,23 @@ class ScreenerService:
         min_trend_score: int = 6,
         min_rs: float = 60.0,
     ) -> List[dict]:
-        """Chạy screener cho danh sách mã, trả về kết quả có điểm"""
+        """Chạy screener cho danh sách mã, trả về kết quả có điểm.
+        Dùng semaphore để xử lý concurrent (nhanh cho mã đã có data trong store).
+        """
         await self._ensure_index_data()
         results = []
-        for ticker in tickers:
-            try:
-                result = await self._analyze_ticker(ticker)
-                if result and result.get("trend_score", 0) >= min_trend_score:
-                    results.append(result)
-            except Exception as e:
-                print(f"Screener error {ticker}: {e}")
+        sem = asyncio.Semaphore(3)  # max 3 concurrent (rate limiter bảo vệ phía dưới)
+
+        async def analyze_one(ticker: str):
+            async with sem:
+                try:
+                    result = await self._analyze_ticker(ticker)
+                    if result and result.get("trend_score", 0) >= min_trend_score:
+                        results.append(result)
+                except Exception as e:
+                    print(f"Screener error {ticker}: {e}")
+
+        await asyncio.gather(*[analyze_one(t) for t in tickers])
 
         # Sắp xếp theo tổng điểm
         results.sort(key=lambda x: x.get("total_score", 0), reverse=True)
@@ -610,13 +617,12 @@ class ScreenerService:
             return df_store
 
         # ── FireAnt historical prices (index + stocks) ──
-        if is_index:
-            df_fa = await self._fetch_index_fireant(start, end)
-            if df_fa is not None and len(df_fa) >= 60:
-                # Lưu vào OHLCV store để lần sau không cần fetch lại
-                ohlcv_store.upsert_ohlcv("VNINDEX", df_fa)
-                print(f"✅ VNINDEX via FireAnt: {len(df_fa)} rows → saved to store")
-                return df_fa
+        sym_fa = "VNINDEX" if is_index else ticker.upper()
+        df_fa = await self._fetch_fireant_ohlcv(sym_fa, start, end)
+        if df_fa is not None and len(df_fa) >= 60:
+            ohlcv_store.upsert_ohlcv(sym_fa, df_fa)
+            print(f"✅ {sym_fa} via FireAnt: {len(df_fa)} rows → saved to store")
+            return df_fa
 
         loop = asyncio.get_event_loop()
         sources = ['kbs', 'vci', 'msn'] if is_index else ['kbs', 'vci']
@@ -626,30 +632,32 @@ class ScreenerService:
                 None, self._fetch_one_source, ticker, source, start, end, is_index
             )
             if df is not None and not df.empty:
-                print(f"✅ {ticker} fetched via {source}: {len(df)} rows")
+                # Lưu vào SQLite store để lần sau không cần fetch lại
+                sym = "VNINDEX" if is_index else ticker.upper()
+                ohlcv_store.upsert_ohlcv(sym, df)
+                print(f"✅ {ticker} fetched via {source}: {len(df)} rows → saved to store")
                 return df
             if stopped:
                 break   # raise → bỏ luôn
         return None
 
-    async def _fetch_index_fireant(self, start: str, end: str) -> Optional[pd.DataFrame]:
-        """Lấy VNINDEX historical prices từ FireAnt API."""
+    async def _fetch_fireant_ohlcv(self, symbol: str, start: str, end: str) -> Optional[pd.DataFrame]:
+        """Lấy historical prices từ FireAnt API (works for both stocks and index)."""
         import os
         import requests
         token = os.environ.get("FIREANT_TOKEN", "").strip()
         if not token:
             return None
         try:
-            # FireAnt historical endpoint
             url = (
-                f"https://restv2.fireant.vn/symbols/VNINDEX/historical-quotes"
+                f"https://restv2.fireant.vn/symbols/{symbol}/historical-quotes"
                 f"?startDate={start}&endDate={end}&offset=0&limit=5000"
             )
             resp = requests.get(url, timeout=30, headers={
                 "Authorization": f"Bearer {token}"
             })
             if resp.status_code != 200:
-                print(f"⚠️  FireAnt VNINDEX: HTTP {resp.status_code}")
+                print(f"⚠️  FireAnt {symbol}: HTTP {resp.status_code}")
                 return None
             data = resp.json()
             if not isinstance(data, list) or not data:
@@ -676,7 +684,7 @@ class ScreenerService:
             df = df.sort_values("date").reset_index(drop=True)
             return df
         except Exception as e:
-            print(f"⚠️  FireAnt VNINDEX: {type(e).__name__}: {e}")
+            print(f"⚠️  FireAnt {symbol}: {type(e).__name__}: {e}")
             return None
 
     def _fetch_one_source(
