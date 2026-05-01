@@ -122,8 +122,14 @@ def compute_rs_line(stock_close: pd.Series, index_close: pd.Series, length: int 
 
         rs_value = (rs_current / rs_sma_val - 1) * 100
         rs = max(0, min(100, (rs_value + 20) * 100 / 40))
+        # DEBUG
+        print(f"  RS_LINE debug: n={n} stock[0]={float(stock.iloc[0]):.2f} idx[0]={float(index.iloc[0]):.2f} "
+              f"stock[-1]={float(stock.iloc[-1]):.2f} idx[-1]={float(index.iloc[-1]):.2f} "
+              f"rs_cur={rs_current:.4f} rs_sma={rs_sma_val:.4f} rs_value={rs_value:.2f} → rs={rs:.1f}",
+              flush=True)
         return round(rs, 1)
-    except Exception:
+    except Exception as e:
+        print(f"  RS_LINE exception: {type(e).__name__}: {e}", flush=True)
         return 50.0
 
 
