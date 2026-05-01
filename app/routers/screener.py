@@ -476,6 +476,14 @@ async def debug_rs(ticker: str):
         rs_ratio = s / i
         result["ratio_first"] = float(rs_ratio.iloc[0])
         result["ratio_last"] = float(rs_ratio.iloc[-1])
+        result["ratio_min"] = float(rs_ratio.min())
+        result["ratio_max"] = float(rs_ratio.max())
+        result["ratio_has_inf"] = bool(rs_ratio.isin([float('inf'), float('-inf')]).any())
+        result["ratio_has_nan"] = bool(rs_ratio.isna().any())
+        result["i_min"] = float(i.min())
+        result["i_has_zero"] = bool((i == 0).any())
+        # Show all 60 ratio values to find spike
+        result["ratio_all"] = [round(float(v), 6) for v in rs_ratio.tolist()]
 
         rs_sma = rs_ratio.rolling(window=length).mean()
         result["sma_last"] = float(rs_sma.iloc[-1])
