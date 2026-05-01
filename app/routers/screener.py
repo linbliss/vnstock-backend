@@ -512,6 +512,24 @@ async def scan_market(
         "scanned_at": __import__('datetime').datetime.now().isoformat(),
     }
 
+@router.post("/scan")
+async def scan_market_post(body: dict):
+    """POST version — tránh URL length limit khi gửi nhiều mã."""
+    tickers_str = body.get("tickers", "")
+    min_score = int(body.get("min_score", 5))
+    min_rs = float(body.get("min_rs", 0.0))
+    ticker_list = [t.strip().upper() for t in tickers_str.split(",") if t.strip()]
+    results = await screener_service.run_screener(
+        ticker_list, min_trend_score=min_score, min_rs=min_rs
+    )
+    return {
+        "total":      len(ticker_list),
+        "passed":     len(results),
+        "results":    results,
+        "scanned_at": __import__('datetime').datetime.now().isoformat(),
+    }
+
+
 @router.get("/analyze/{ticker}")
 async def analyze_ticker(ticker: str):
     result = await screener_service._analyze_ticker(ticker.upper())
