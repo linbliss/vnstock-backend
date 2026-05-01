@@ -511,7 +511,7 @@ class ScreenerService:
         """
         await self._ensure_index_data()
         results = []
-        sem = asyncio.Semaphore(3)  # max 3 concurrent (rate limiter bảo vệ phía dưới)
+        sem = asyncio.Semaphore(10)  # max 10 concurrent — FireAnt nhanh, store read instant
 
         async def analyze_one(ticker: str):
             async with sem:
