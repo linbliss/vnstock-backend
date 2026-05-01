@@ -459,26 +459,32 @@ async def debug_rs(ticker: str):
         result["rs_rating"] = compute_rs_rating(stock_close, index_close)
         result["rs_line"] = compute_rs_line(stock_close, index_close)
 
-        # Manual debug RS line
+        # Manual debug RS line (v2 — same logic as compute_rs_line)
         import pandas as pd
-        n = min(len(stock_close), len(index_close))
-        s = stock_close.iloc[-n:].reset_index(drop=True)
-        i = index_close.iloc[-n:].reset_index(drop=True)
-        s0 = float(s.iloc[0])
-        i0 = float(i.iloc[0])
-        result["n"] = n
-        result["s0"] = s0
-        result["i0"] = i0
-        if s0 != 0 and i0 != 0:
-            sn = s / s0 * 100
-            iN = i / i0 * 100
-            rs_l = sn / iN
-            rs_sma = rs_l.rolling(20).mean()
-            result["rs_line_last"] = float(rs_l.iloc[-1])
-            result["rs_sma_last"] = float(rs_sma.iloc[-1])
-            rv = (float(rs_l.iloc[-1]) / float(rs_sma.iloc[-1]) - 1) * 100
-            result["rs_value"] = round(rv, 4)
-            result["rs_mapped"] = round(max(0, min(100, (rv + 20) * 100 / 40)), 1)
+        length = 20
+        lookback = length * 3  # 60
+        s = stock_close.iloc[-lookback:].reset_index(drop=True)
+        i = index_close.iloc[-lookback:].reset_index(drop=True)
+        result["lookback"] = lookback
+        result["s_len"] = len(s)
+        result["i_len"] = len(i)
+        result["s_first"] = float(s.iloc[0])
+        result["s_last"] = float(s.iloc[-1])
+        result["i_first"] = float(i.iloc[0])
+        result["i_last"] = float(i.iloc[-1])
+
+        rs_ratio = s / i
+        result["ratio_first"] = float(rs_ratio.iloc[0])
+        result["ratio_last"] = float(rs_ratio.iloc[-1])
+
+        rs_sma = rs_ratio.rolling(window=length).mean()
+        result["sma_last"] = float(rs_sma.iloc[-1])
+        result["sma_isnan"] = bool(pd.isna(rs_sma.iloc[-1]))
+
+        if float(rs_sma.iloc[-1]) != 0 and not pd.isna(rs_sma.iloc[-1]):
+            rv = (float(rs_ratio.iloc[-1]) / float(rs_sma.iloc[-1]) - 1) * 100
+            result["rs_value_v2"] = round(rv, 4)
+            result["rs_mapped_v2"] = round(max(0, min(100, (rv + 10) * 100 / 20)), 1)
     return result
 
 @router.get("/scan")
