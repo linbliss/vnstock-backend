@@ -161,29 +161,51 @@ def compute_rs_line(stock_close: pd.Series, index_close: pd.Series, length: int 
 def _find_swing_points(high: np.ndarray, low: np.ndarray, order: int = 5) -> tuple:
     """
     Tìm swing highs và swing lows dùng phương pháp fractal (Minervini style).
-    order=5: một swing high cần cao hơn 5 bar trái + 5 bar phải.
+
+    Fix A: Dùng order ĐỘNG — order lớn (5) cho phần đầu base, order nhỏ (2-3)
+    cho phần cuối để bắt được "tay cầm" (handle) ngắn hạn.
+    Quy tắc: 30% cuối base dùng order=2, phần còn lại dùng order truyền vào.
+
     Trả về: (swing_highs, swing_lows) — mỗi cái là list of (index, price).
     """
     swing_highs = []
     swing_lows = []
     n = len(high)
 
+    # Ngưỡng chuyển đổi: 70% đầu dùng order gốc, 30% cuối dùng order nhỏ
+    handle_zone_start = int(n * 0.7)
+    handle_order = min(order, 2)  # order=2 cho vùng tay cầm
+
     for i in range(order, n - order):
-        # Swing high: bar cao nhất trong cửa sổ 2*order+1
-        if high[i] == np.max(high[i - order:i + order + 1]):
+        # Chọn order phù hợp với vị trí trong base
+        local_order = handle_order if i >= handle_zone_start else order
+
+        # Đảm bảo không vượt biên
+        left = max(0, i - local_order)
+        right = min(n, i + local_order + 1)
+
+        # Swing high: bar cao nhất trong cửa sổ
+        if high[i] == np.max(high[left:right]):
             swing_highs.append((i, float(high[i])))
-        # Swing low: bar thấp nhất trong cửa sổ 2*order+1
-        if low[i] == np.min(low[i - order:i + order + 1]):
+        # Swing low: bar thấp nhất trong cửa sổ
+        if low[i] == np.min(low[left:right]):
             swing_lows.append((i, float(low[i])))
 
     return swing_highs, swing_lows
 
 
-def _find_contractions(swing_highs: list, swing_lows: list, close: np.ndarray) -> list:
+def _find_contractions(
+    swing_highs: list, swing_lows: list,
+    vol: np.ndarray, vol_ma50: float
+) -> list:
     """
     Tìm các contraction (T) trong base pattern.
-    Mỗi contraction = khoảng từ một swing high đến swing low kế tiếp.
-    Depth = (swing_high - swing_low) / swing_high * 100.
+
+    Fix B: Không lọc bằng depth >= 3%. Chỉ loại nhiễu bằng duration >= 2 phiên.
+    (Tay cầm hoàn hảo có thể depth chỉ 1.5-2.5%).
+
+    Fix C: Volume dry-up đo tại vùng TROUGH (2-3 phiên quanh đáy),
+    so sánh với vol_ma50. Cạn cung = vol tại đáy < 60% vol_ma50.
 
     Minervini VCP: T1 > T2 > T3 (depth giảm dần = volatility contraction).
     """
@@ -194,33 +216,49 @@ def _find_contractions(swing_highs: list, swing_lows: list, close: np.ndarray) -
     used_lows = set()
 
     for sh_idx, sh_price in swing_highs:
-        # Tìm swing low SÂU swing high này và TRƯỚC swing high kế tiếp
+        # Tìm swing low SÂU swing high này
         best_low = None
         for sl_idx, sl_price in swing_lows:
             if sl_idx <= sh_idx:
                 continue
             if sl_idx in used_lows:
                 continue
-            # Swing low phải thấp hơn swing high (obvious)
             if sl_price >= sh_price:
                 continue
             if best_low is None or sl_price < best_low[1]:
                 best_low = (sl_idx, sl_price)
-            # Chỉ tìm trong phạm vi hợp lý (không quá xa)
             if sl_idx - sh_idx > 60:
                 break
 
         if best_low:
             depth = (sh_price - best_low[1]) / sh_price * 100
             duration = best_low[0] - sh_idx
+
+            # Fix B: Chỉ lọc nhiễu bằng duration, KHÔNG lọc depth
+            # Một contraction phải kéo dài ít nhất 2 phiên để có ý nghĩa
+            if duration < 2:
+                continue
+
+            # Fix C: Đo volume tại vùng TROUGH (3 phiên quanh đáy)
+            trough_idx = best_low[0]
+            trough_start = max(0, trough_idx - 1)
+            trough_end = min(len(vol), trough_idx + 2)
+            trough_vol_slice = vol[trough_start:trough_end]
+            trough_avg_vol = float(np.mean(trough_vol_slice)) if len(trough_vol_slice) > 0 else 0
+
+            # Cạn cung = Volume tại đáy < 60% MA50 Volume
+            is_volume_dry = trough_avg_vol < (vol_ma50 * 0.6) if vol_ma50 > 0 else False
+
             used_lows.add(best_low[0])
             contractions.append({
                 "high_idx": sh_idx,
                 "high_price": sh_price,
                 "low_idx": best_low[0],
                 "low_price": best_low[1],
-                "depth": depth,         # % correction
-                "duration": duration,   # bars
+                "depth": depth,             # % correction
+                "duration": duration,       # bars
+                "trough_avg_vol": trough_avg_vol,
+                "is_volume_dry": is_volume_dry,
             })
 
     return contractions
@@ -341,8 +379,8 @@ def detect_vcp(df: pd.DataFrame) -> Dict:
     # ══════════════════════════════════════════════════════════════════════
     # SWING POINT DETECTION — Tìm pivot highs/lows thực sự
     # ══════════════════════════════════════════════════════════════════════
-    # Dùng order=5 cho daily chart (cần 5 bar mỗi bên để xác nhận swing)
-    # Chỉ phân tích từ base_high_idx trở đi (phần base pattern)
+    # Fix A: order=5 cho phần đầu base, tự động giảm xuống order=2
+    # ở 30% cuối base để bắt được "tay cầm" (handle) ngắn hạn.
     analysis_high = b_high[base_high_idx:]
     analysis_low  = b_low[base_high_idx:]
     analysis_vol  = b_vol[base_high_idx:]
@@ -352,44 +390,51 @@ def detect_vcp(df: pd.DataFrame) -> Dict:
     # ══════════════════════════════════════════════════════════════════════
     # XÁC ĐỊNH CONTRACTIONS (T-count)
     # ══════════════════════════════════════════════════════════════════════
-    contractions = _find_contractions(swing_highs, swing_lows, analysis_high)
+    # Tính vol_ma50 cho toàn bộ analysis zone — dùng làm benchmark cạn cung
+    vol_ma50_val = float(np.mean(analysis_vol[-50:])) if len(analysis_vol) >= 50 else float(np.mean(analysis_vol))
 
-    # Filter: chỉ giữ contractions có depth >= 3% (loại noise)
-    contractions = [c for c in contractions if c["depth"] >= 3.0]
+    # Fix B+C: _find_contractions giờ lọc bằng duration (không depth),
+    # và đo volume tại trough thay vì trung bình toàn nhịp
+    contractions = _find_contractions(swing_highs, swing_lows, analysis_vol, vol_ma50_val)
 
     t_count = len(contractions)
 
     # ══════════════════════════════════════════════════════════════════════
     # KIỂM TRA VCP CONDITIONS
     # ══════════════════════════════════════════════════════════════════════
-    # 1) Contracting: depth giảm dần (cho phép 1 lần vi phạm nhẹ)
+    # 1) Contracting: biên độ thu hẹp tổng thể
+    # Minervini core: contraction ĐẦU phải sâu hơn contraction CUỐI đáng kể.
+    # Cho phép micro-swing cùng depth (handle zone) miễn xu hướng tổng thể giảm.
     contracting = False
     if t_count >= 2:
+        first_depth = contractions[0]["depth"]
+        last_depth = contractions[-1]["depth"]
+        # Điều kiện chính: depth giảm ít nhất 40% từ T1 đến T cuối
+        overall_contraction = last_depth < first_depth * 0.6
+        # Hoặc: pair-wise check truyền thống (cho phép violations)
         violations = 0
         for i in range(t_count - 1):
-            if contractions[i + 1]["depth"] >= contractions[i]["depth"]:
+            if contractions[i + 1]["depth"] >= contractions[i]["depth"] * 1.05:
                 violations += 1
-        # Cho phép 1 vi phạm nếu có >= 3 contractions
-        max_violations = 1 if t_count >= 3 else 0
-        contracting = violations <= max_violations
+        max_violations = t_count // 2  # cho phép ~50% violations (micro-swings)
+        pairwise_ok = violations <= max_violations
+        contracting = overall_contraction or pairwise_ok
 
-    # 2) Volume dry-up: volume trung bình giảm qua các contraction
+    # 2) Volume dry-up: kiểm tra volume tại trough giảm dần
+    # Fix C: Dùng is_volume_dry từ _find_contractions (đo tại đáy vs MA50)
     vol_contracting = False
     if t_count >= 2:
-        contraction_vols = []
-        for c in contractions:
-            seg_start = c["high_idx"]
-            seg_end = c["low_idx"] + 1
-            if seg_end <= len(analysis_vol):
-                avg_v = float(np.mean(analysis_vol[seg_start:seg_end]))
-                contraction_vols.append(avg_v)
-
-        if len(contraction_vols) >= 2:
+        # Cách 1: Ít nhất contraction cuối phải cạn cung
+        last_dry = contractions[-1].get("is_volume_dry", False)
+        # Cách 2: Trough volume giảm dần qua các contraction
+        trough_vols = [c.get("trough_avg_vol", 0) for c in contractions]
+        if trough_vols:
             vol_violations = 0
-            for i in range(len(contraction_vols) - 1):
-                if contraction_vols[i + 1] > contraction_vols[i] * 1.1:
+            for i in range(len(trough_vols) - 1):
+                if trough_vols[i + 1] > trough_vols[i] * 1.2:  # cho phép 20% tolerance
                     vol_violations += 1
-            vol_contracting = vol_violations == 0
+            # Cạn cung nếu: trough vol giảm dần HOẶC nhịp cuối cạn cung rõ ràng
+            vol_contracting = (vol_violations == 0) or last_dry
 
     # 3) Tightness: contraction cuối (hoặc khoảng 10 ngày gần nhất)
     if t_count >= 1:
