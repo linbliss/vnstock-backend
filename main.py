@@ -8,21 +8,23 @@ from contextlib import asynccontextmanager
 import asyncio
 from app.services.market_data import market_service
 from app.services.alert_engine import run_alert_engine
-from app.services.screener import screener_service
+from app.services.screener import screener_service, compute_market_rs_ratings
 from app.services import ohlcv_store
 from app.services.backfill import daily_update_scheduler
 from app.routers import quotes, alerts, screener, admin
 
 alert_task = None
 daily_task = None
+rs_task = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global alert_task, daily_task
+    global alert_task, daily_task, rs_task
     ohlcv_store.init_db()
     await market_service.start()
     alert_task = asyncio.create_task(run_alert_engine())
     daily_task = asyncio.create_task(daily_update_scheduler())
+    rs_task = asyncio.create_task(_rs_rating_scheduler())
     # Load VNINDEX khi khởi động (không block, chạy background)
     asyncio.create_task(_warmup_vnindex())
     yield
@@ -30,6 +32,8 @@ async def lifespan(app: FastAPI):
         alert_task.cancel()
     if daily_task:
         daily_task.cancel()
+    if rs_task:
+        rs_task.cancel()
     await market_service.stop()
 
 async def _warmup_vnindex():
@@ -41,6 +45,24 @@ async def _warmup_vnindex():
         print(f"🔥 Warmup VNINDEX: {rows} rows")
     except Exception as e:
         print(f"⚠️  Warmup VNINDEX failed: {e}")
+
+
+async def _rs_rating_scheduler():
+    """Nightly batch job: compute RS Ratings percentile cho toàn thị trường.
+    - Chạy ngay khi startup nếu data stale (>24h hoặc chưa có)
+    - Sau đó lặp lại mỗi 24h (chạy lúc ~18:00 sau khi thị trường đóng cửa)
+    """
+    await asyncio.sleep(30)  # chờ warmup VNINDEX xong
+    while True:
+        try:
+            if ohlcv_store.is_rs_ratings_stale():
+                print("📊 RS Rating batch job starting...")
+                count = await compute_market_rs_ratings()
+                print(f"📊 RS Rating batch job done: {count} stocks ranked")
+        except Exception as e:
+            print(f"⚠️  RS Rating batch job failed: {e}")
+        # Sleep 24h rồi chạy lại
+        await asyncio.sleep(24 * 3600)
 
 app = FastAPI(title="VN Stock API", version="0.3.0", lifespan=lifespan)
 app.add_middleware(

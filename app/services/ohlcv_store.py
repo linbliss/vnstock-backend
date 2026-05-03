@@ -76,6 +76,15 @@ def init_db() -> None:
                 data_json   TEXT NOT NULL,
                 updated_at  TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS rs_ratings (
+                ticker      TEXT PRIMARY KEY,
+                rs_score    REAL NOT NULL,   -- raw weighted return score
+                rs_rating   REAL NOT NULL,   -- percentile rank (1-99)
+                rank        INTEGER NOT NULL,
+                total       INTEGER NOT NULL,
+                updated_at  TEXT NOT NULL
+            );
             """
         )
     print(f"✅ OHLCV DB ready at {DB_PATH}")
@@ -307,3 +316,57 @@ def get_fundamental_stats() -> Dict[str, Any]:
         oldest = conn.execute("SELECT MIN(updated_at) m FROM fundamentals").fetchone()["m"]
         newest = conn.execute("SELECT MAX(updated_at) m FROM fundamentals").fetchone()["m"]
     return {"total": total, "oldest_update": oldest, "newest_update": newest}
+
+
+# ── RS RATINGS ────────────────────────────────────────────────────────────────
+
+def upsert_rs_ratings(ratings: List[Dict[str, Any]]) -> int:
+    """Bulk upsert RS ratings (toàn bộ thị trường, chạy mỗi đêm)."""
+    if not ratings:
+        return 0
+    now = datetime.now().isoformat()
+    rows = [(r["ticker"], r["rs_score"], r["rs_rating"], r["rank"], r["total"], now)
+            for r in ratings]
+    with _lock, _connect() as conn:
+        conn.executemany(
+            """INSERT OR REPLACE INTO rs_ratings (ticker, rs_score, rs_rating, rank, total, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            rows
+        )
+    return len(rows)
+
+
+def get_rs_rating(ticker: str) -> Optional[Dict[str, Any]]:
+    """Lấy RS Rating cho 1 mã."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT rs_score, rs_rating, rank, total, updated_at FROM rs_ratings WHERE ticker = ?",
+            (ticker.upper(),)
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "rs_score": row["rs_score"],
+        "rs_rating": row["rs_rating"],
+        "rank": row["rank"],
+        "total": row["total"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def get_all_rs_ratings() -> Dict[str, float]:
+    """Trả về dict {ticker: rs_rating} cho toàn bộ thị trường."""
+    with _connect() as conn:
+        rows = conn.execute("SELECT ticker, rs_rating FROM rs_ratings").fetchall()
+    return {row["ticker"]: row["rs_rating"] for row in rows}
+
+
+def is_rs_ratings_stale() -> bool:
+    """Kiểm tra xem RS Ratings đã cũ chưa (>24h hoặc chưa có)."""
+    with _connect() as conn:
+        row = conn.execute("SELECT MAX(updated_at) m FROM rs_ratings").fetchone()
+    if not row or not row["m"]:
+        return True
+    from datetime import datetime as dt
+    last_update = dt.fromisoformat(row["m"])
+    return (dt.now() - last_update).total_seconds() > 86400  # >24h

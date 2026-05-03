@@ -76,36 +76,133 @@ def _filter_outliers(stock: pd.Series, index: pd.Series) -> tuple:
     return stock, index
 
 
-def compute_rs_rating(stock_close: pd.Series, index_close: pd.Series) -> float:
+def compute_rs_score(stock_close: pd.Series) -> float:
     """
-    RS Rating kiểu IBD (0-100) — Weighted 12 tháng so với VN-Index.
-    40% quý gần nhất (63d) + 20% mỗi quý còn lại (126/189/252d).
-    Ưu tiên momentum gần để bắt đà mới sớm hơn.
+    Tính RS Score thô (weighted return) cho 1 mã.
+    Công thức IBD: 40% Q gần nhất + 20% mỗi Q còn lại.
+    Đây là điểm SỐ TUYỆT ĐỐI — chưa phải Rating (percentile).
     """
     try:
-        stock_close, index_close = _filter_outliers(stock_close, index_close)
-        if len(stock_close) < 252 or len(index_close) < 252:
-            # Fallback: cần ít nhất 63 phiên
-            if len(stock_close) < 63:
-                return 50.0
+        if len(stock_close) < 63:
+            return 0.0
 
         def period_return(s: pd.Series, days: int) -> float:
             if len(s) < days:
                 return 0.0
             return float((s.iloc[-1] / s.iloc[-days] - 1) * 100)
 
-        stock_r = [period_return(stock_close, p) for p in [63, 126, 189, 252]]
-        index_r = [period_return(index_close, p) for p in [63, 126, 189, 252]]
+        returns = [period_return(stock_close, p) for p in [63, 126, 189, 252]]
         weights = [0.4, 0.2, 0.2, 0.2]
+        return sum(r * w for r, w in zip(returns, weights))
+    except Exception:
+        return 0.0
 
-        stock_score = sum(r * w for r, w in zip(stock_r, weights))
-        index_score = sum(r * w for r, w in zip(index_r, weights))
 
-        relative = stock_score - index_score
-        rs = max(0, min(100, (relative + 50)))
+def compute_rs_rating(stock_close: pd.Series, index_close: pd.Series) -> float:
+    """
+    DEPRECATED fallback — Tính RS tuyệt đối khi chưa có batch rating.
+    Chỉ dùng khi rs_ratings table chưa được populate.
+    True RS Rating phải lấy từ ohlcv_store.get_rs_rating() (percentile).
+    """
+    try:
+        stock_close, index_close = _filter_outliers(stock_close, index_close)
+        if len(stock_close) < 63:
+            return 50.0
+
+        score = compute_rs_score(stock_close)
+        # Fallback mapping: ép vào 0-100 (KHÔNG phải percentile thật)
+        # Đây chỉ dùng tạm khi batch job chưa chạy
+        rs = max(1, min(99, (score + 50)))
         return round(rs, 1)
     except Exception:
         return 50.0
+
+
+async def compute_market_rs_ratings(min_vol_ma20: int = 100_000) -> int:
+    """
+    ═══════════════════════════════════════════════════════════════════════
+    TRUE RS RATING — Nightly Batch Job
+    ═══════════════════════════════════════════════════════════════════════
+
+    Tính RS Rating (percentile rank) cho TOÀN BỘ thị trường.
+    Chạy 1 lần/ngày (sau 16:00 hoặc khi startup nếu stale).
+
+    Thuật toán:
+    1. Lấy tất cả mã có OHLCV data trong SQLite store
+    2. Lọc mã có vol_ma20 >= min_vol_ma20 (loại mã thanh khoản kém)
+    3. Tính RS Score (weighted 40-20-20-20) cho MỖI mã
+    4. Sort toàn bộ theo score từ cao → thấp
+    5. Gán percentile: RS_Rating = (total - rank) / total * 100
+    6. Lưu vào rs_ratings table
+
+    Returns: Số mã đã tính rating
+    """
+    print("🔄 Computing market-wide RS Ratings (percentile)...")
+
+    # Bước 1: Lấy tất cả ticker có data trong store
+    all_tickers = ohlcv_store.list_tickers()
+    if not all_tickers:
+        print("⚠️  RS Ratings: No tickers in OHLCV store")
+        return 0
+
+    # Loại bỏ index
+    all_tickers = [t for t in all_tickers if t != "VNINDEX"]
+
+    # Bước 2+3: Tính RS Score cho mỗi mã
+    scores = []  # list of (ticker, rs_score)
+    end = datetime.now().strftime("%Y-%m-%d")
+    start = "2000-01-01"
+
+    for ticker in all_tickers:
+        try:
+            df = ohlcv_store.get_ohlcv(ticker, start, end)
+            if df is None or len(df) < 63:
+                continue
+
+            # Lọc thanh khoản: vol_ma20 >= threshold
+            vol = df['volume'].values
+            if len(vol) >= 20:
+                vol_ma20 = float(pd.Series(vol).rolling(20).mean().iloc[-1])
+                if vol_ma20 < min_vol_ma20:
+                    continue
+
+            # Tính RS Score (weighted return, không trừ index)
+            close = df['close'].astype(float)
+            score = compute_rs_score(close)
+            scores.append((ticker, score))
+        except Exception as e:
+            print(f"  RS Score error {ticker}: {e}")
+            continue
+
+    if not scores:
+        print("⚠️  RS Ratings: No valid scores computed")
+        return 0
+
+    # Bước 4: Sort từ cao xuống thấp
+    scores.sort(key=lambda x: x[1], reverse=True)
+    total = len(scores)
+
+    # Bước 5: Gán percentile rank
+    ratings = []
+    for rank_idx, (ticker, score) in enumerate(scores):
+        # rank_idx=0 → mã mạnh nhất → RS Rating cao nhất
+        # Percentile = (total - rank) / total * 100
+        # Clamp 1-99 (IBD standard)
+        percentile = (total - rank_idx) / total * 100
+        rs_rating = max(1, min(99, round(percentile, 1)))
+
+        ratings.append({
+            "ticker": ticker,
+            "rs_score": round(score, 2),
+            "rs_rating": rs_rating,
+            "rank": rank_idx + 1,
+            "total": total,
+        })
+
+    # Bước 6: Lưu vào database
+    count = ohlcv_store.upsert_rs_ratings(ratings)
+    print(f"✅ RS Ratings computed: {count} stocks ranked (top: {ratings[0]['ticker']}={ratings[0]['rs_rating']}, bottom: {ratings[-1]['ticker']}={ratings[-1]['rs_rating']})")
+    return count
 
 
 def compute_rs_line(stock_close: pd.Series, index_close: pd.Series, length: int = 20) -> float:
@@ -592,13 +689,18 @@ class ScreenerService:
         if df is None or len(df) < 60:
             return None
 
-        # RS Rating IBD (weighted 12 tháng) + RS Line FireAnt (length=20)
+        # RS Rating: đọc từ rs_ratings table (percentile rank, nightly batch)
+        # Fallback: compute_rs_rating() nếu chưa có dữ liệu batch
         rs_rating = 50.0
         rs_line_val = 50.0
-        if self._index_data is not None and len(self._index_data) >= 60:
+        stored_rs = ohlcv_store.get_rs_rating(ticker)
+        if stored_rs:
+            rs_rating = stored_rs["rs_rating"]
+        elif self._index_data is not None and len(self._index_data) >= 60:
             rs_rating = compute_rs_rating(
                 df['close'], self._index_data['close']
             )
+        if self._index_data is not None and len(self._index_data) >= 60:
             rs_line_val = compute_rs_line(
                 df['close'], self._index_data['close']
             )

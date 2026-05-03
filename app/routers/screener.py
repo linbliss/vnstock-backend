@@ -702,6 +702,39 @@ async def get_fundamental_batch(tickers: List[str]):
         results.append(await fetch_one(t.upper()))
     return {'results': results}
 
+@router.post("/rs-ratings/compute")
+async def trigger_rs_ratings():
+    """Manually trigger RS Rating batch computation (percentile rank toàn thị trường)."""
+    from app.services.screener import compute_market_rs_ratings
+    try:
+        count = await compute_market_rs_ratings()
+        return {"status": "done", "stocks_ranked": count}
+    except Exception as e:
+        return {"status": "error", "message": f"{type(e).__name__}: {e}"}
+
+
+@router.get("/rs-ratings/status")
+async def rs_ratings_status():
+    """Kiểm tra trạng thái RS Ratings (stale hay not, stats)."""
+    stale = ohlcv_store.is_rs_ratings_stale()
+    with ohlcv_store._connect() as conn:
+        row = conn.execute("SELECT COUNT(*) c, MAX(updated_at) m FROM rs_ratings").fetchone()
+    return {
+        "stale": stale,
+        "count": row["c"] if row else 0,
+        "last_updated": row["m"] if row else None,
+    }
+
+
+@router.get("/rs-ratings/{ticker}")
+async def get_rs_rating(ticker: str):
+    """Lấy RS Rating (percentile) cho 1 mã."""
+    result = ohlcv_store.get_rs_rating(ticker.upper())
+    if not result:
+        return {"ticker": ticker.upper(), "error": "No RS Rating data. Run /rs-ratings/compute first."}
+    return {"ticker": ticker.upper(), **result}
+
+
 @router.get("/debug/vnindex")
 async def debug_vnindex():
     """Debug endpoint: kiểm tra trạng thái VNINDEX data"""
