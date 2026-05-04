@@ -701,47 +701,26 @@ class ScreenerService:
 
         # ── Trộn VOLUME intraday vào row cuối ──
         # Store chỉ update sau 16:00; trong giờ giao dịch volume[-1] là T-1
-        # → vol_ratio sai. Cập nhật volume + close của row cuối, GIỮ NGUYÊN
-        # high/low (không có intraday high/low → không tự ép = close để khỏi
-        # phá swing-point detection trong VCP).
+        # → vol_ratio sai (luôn là tỉ lệ ngày hôm qua).
+        #
+        # CHIẾN LƯỢC ĐƠN GIẢN: chỉ overwrite VOLUME của row cuối với cumulative
+        # volume hôm nay từ market_service.quotes. KHÔNG append row mới và
+        # KHÔNG đè close — tránh thay đổi length df (lệch index gain_12m,
+        # gain_6m, MA50/150/200) và tránh phá swing-point detection.
+        #
+        # Hệ quả:
+        # ✅ vol_ratio = today's volume / vol_ma30 → đúng realtime
+        # ✅ uptrend, MA stack, gain_12m, swing points → ổn định như EOD
+        # ⚠️ close[-1] vẫn là T-1 close — nhưng alert/UI dùng quote.price
+        #    (đã realtime), nên không bị ảnh hưởng.
         try:
             q_intra = market_service.quotes.get(ticker, {})
-            intra_price = float(q_intra.get("price") or 0)
-            intra_vol   = int(q_intra.get("volume") or 0)
-            if is_trading_hour and intra_price > 0 and intra_vol > 0:
-                price_kvnd = intra_price / 1000.0 if intra_price > 1000 else intra_price
-                today_str  = now.strftime("%Y-%m-%d")
-                last_date  = str(df['date'].iloc[-1])[:10] if 'date' in df.columns else None
+            intra_vol = int(q_intra.get("volume") or 0)
+            if is_trading_hour and intra_vol > 0 and len(df) > 0:
                 df = df.copy()
-                if last_date == today_str:
-                    # Có row hôm nay → cập nhật volume + close, giữ nguyên high/low
-                    idx_last = df.index[-1]
-                    df.at[idx_last, 'close']  = price_kvnd
-                    df.at[idx_last, 'volume'] = intra_vol
-                    # Mở rộng high/low nếu giá hiện tại vượt biên đã ghi
-                    if 'high' in df.columns:
-                        cur_high = float(df.at[idx_last, 'high'])
-                        if price_kvnd > cur_high:
-                            df.at[idx_last, 'high'] = price_kvnd
-                    if 'low' in df.columns:
-                        cur_low = float(df.at[idx_last, 'low'])
-                        if cur_low > 0 and price_kvnd < cur_low:
-                            df.at[idx_last, 'low'] = price_kvnd
-                else:
-                    # Chưa có row hôm nay → append, COPY high/low từ row T-1
-                    # (tránh tạo high=low=close nhân tạo phá swing detection)
-                    last_row = df.iloc[-1]
-                    new_row = {
-                        'date':   today_str,
-                        'open':   price_kvnd,
-                        'high':   max(float(last_row.get('high', price_kvnd)), price_kvnd),
-                        'low':    min(float(last_row.get('low', price_kvnd)),  price_kvnd) if float(last_row.get('low', 0)) > 0 else price_kvnd,
-                        'close':  price_kvnd,
-                        'volume': intra_vol,
-                    }
-                    df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+                df.at[df.index[-1], 'volume'] = intra_vol
         except Exception as e:
-            print(f"⚠️  Intraday merge {ticker}: {type(e).__name__}: {e}")
+            print(f"⚠️  Intraday volume merge {ticker}: {type(e).__name__}: {e}")
 
         # RS Rating: đọc từ rs_ratings table (percentile rank, nightly batch)
         # Fallback: compute_rs_rating() nếu chưa có dữ liệu batch
