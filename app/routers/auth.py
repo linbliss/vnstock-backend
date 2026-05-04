@@ -8,10 +8,10 @@ import os
 from datetime import datetime, timedelta
 from typing import Optional
 
+import bcrypt
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
-from passlib.context import CryptContext
 from pydantic import BaseModel
 
 from app.services import user_store
@@ -22,18 +22,20 @@ SECRET_KEY  = os.environ.get("JWT_SECRET_KEY", "change-me-in-production-please")
 ALGORITHM   = "HS256"
 TOKEN_EXPIRE_DAYS = 30
 
-_pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _hash_password(plain: str) -> str:
-    return _pwd_ctx.hash(plain)
+    return bcrypt.hashpw(plain.encode(), bcrypt.gensalt()).decode()
 
 
 def _verify_password(plain: str, hashed: str) -> bool:
-    return _pwd_ctx.verify(plain, hashed)
+    try:
+        return bcrypt.checkpw(plain.encode(), hashed.encode())
+    except Exception:
+        return False
 
 
 def _create_token(user_id: str) -> str:
