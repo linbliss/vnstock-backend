@@ -12,8 +12,14 @@ import os
 import sqlite3
 import threading
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
+
+
+def _now() -> str:
+    """ISO-8601 với milliseconds + Z — JavaScript new Date() parse được."""
+    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.') \
+           + f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
 
 DB_DIR  = os.environ.get("USER_DB_DIR", "/app/data")
 DB_PATH = os.path.join(DB_DIR, "user_data.db")
@@ -124,7 +130,7 @@ def init_db() -> None:
 
 def create_user(email: str, password_hash: str) -> dict:
     uid = uuid.uuid4().hex
-    now = datetime.now().isoformat()
+    now = _now()
     with _lock, _connect() as conn:
         conn.execute(
             "INSERT INTO users(id, email, password_hash, created_at) VALUES (?,?,?,?)",
@@ -185,7 +191,7 @@ def get_trades(user_id: str) -> List[dict]:
 
 def add_trade(user_id: str, data: dict) -> dict:
     tid  = uuid.uuid4().hex
-    now  = datetime.now().isoformat()
+    now  = _now()
     row = (
         tid,
         user_id,
@@ -291,7 +297,7 @@ def get_accounts(user_id: str) -> List[dict]:
 
 def add_account(user_id: str, data: dict) -> dict:
     aid = uuid.uuid4().hex
-    now = datetime.now().isoformat()
+    now = _now()
     account_name = data.get("account_name") or data.get("name", "")
     account_number = data.get("account_number", "")
     with _lock, _connect() as conn:
@@ -377,7 +383,7 @@ def get_watchlists(user_id: str) -> List[dict]:
 
 def add_watchlist(user_id: str, name: str) -> dict:
     wid = uuid.uuid4().hex
-    now = datetime.now().isoformat()
+    now = _now()
     with _lock, _connect() as conn:
         conn.execute(
             "INSERT INTO watchlists(id, user_id, name, sort_order, created_at) VALUES (?,?,?,0,?)",
@@ -410,7 +416,7 @@ def rename_watchlist(wl_id: str, user_id: str, name: str) -> bool:
 
 def add_watchlist_item(wl_id: str, ticker: str, note: str = "", alert_price: Optional[float] = None) -> dict:
     iid = uuid.uuid4().hex
-    now = datetime.now().isoformat()
+    now = _now()
     with _lock, _connect() as conn:
         conn.execute(
             """INSERT INTO watchlist_items(id, watchlist_id, ticker, note, alert_price, created_at)
@@ -496,7 +502,7 @@ def save_user_settings(user_id: str, settings_dict: dict) -> None:
     """Upsert settings cho user.
     Dùng bởi alert_engine._save_settings().
     """
-    now = datetime.now().isoformat()
+    now = _now()
     with _lock, _connect() as conn:
         conn.execute(
             """INSERT INTO user_settings(user_id, settings, updated_at) VALUES (?,?,?)
