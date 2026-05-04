@@ -672,11 +672,21 @@ class ScreenerService:
 
     async def _analyze_ticker(self, ticker: str) -> Optional[dict]:
         """Phân tích một mã: Trend Template + VCP + RS"""
-        # Kiểm tra cache
+        # Kiểm tra cache — TTL ngắn trong giờ giao dịch để bám sát volume intraday
         now = datetime.now()
+        is_trading_hour = (
+            now.weekday() < 5 and (
+                (now.hour == 9  and now.minute >= 0) or
+                (10 <= now.hour <= 11) or
+                (now.hour == 11 and now.minute <= 30) or
+                (13 <= now.hour <= 14) or
+                (now.hour == 15 and now.minute <= 1)
+            )
+        )
+        cache_ttl = 60 if is_trading_hour else self.CACHE_TTL
         if ticker in self._cache:
             cached_time = self._cache_time.get(ticker)
-            if cached_time and (now - cached_time).seconds < self.CACHE_TTL:
+            if cached_time and (now - cached_time).seconds < cache_ttl:
                 return self._cache[ticker]
 
         # Lấy toàn bộ lịch sử có sẵn – càng nhiều càng tin cậy cho MA200, RS
@@ -688,6 +698,42 @@ class ScreenerService:
 
         if df is None or len(df) < 60:
             return None
+
+        # ── Trộn dữ liệu intraday vào row cuối ──
+        # Store chỉ update sau 16:00, trong giờ giao dịch row cuối là T-1.
+        # Lấy realtime từ market_service.quotes để VCP volume/price chính xác.
+        try:
+            q_intra = market_service.quotes.get(ticker, {})
+            intra_price = float(q_intra.get("price") or 0)
+            intra_vol   = int(q_intra.get("volume") or 0)
+            if is_trading_hour and intra_price > 0 and intra_vol > 0:
+                # df['close'] dùng đơn vị nghìn VND, quote price dùng VND
+                price_kvnd = intra_price / 1000.0 if intra_price > 1000 else intra_price
+                today_str  = now.strftime("%Y-%m-%d")
+                last_date  = str(df['date'].iloc[-1])[:10] if 'date' in df.columns else None
+                df = df.copy()
+                if last_date == today_str:
+                    # Đã có row hôm nay → đè close + volume + cập nhật high/low
+                    idx_last = df.index[-1]
+                    cur_high = float(df.at[idx_last, 'high']) if 'high' in df.columns else price_kvnd
+                    cur_low  = float(df.at[idx_last, 'low'])  if 'low'  in df.columns else price_kvnd
+                    df.at[idx_last, 'close']  = price_kvnd
+                    df.at[idx_last, 'high']   = max(cur_high, price_kvnd)
+                    df.at[idx_last, 'low']    = min(cur_low,  price_kvnd) if cur_low > 0 else price_kvnd
+                    df.at[idx_last, 'volume'] = intra_vol
+                else:
+                    # Chưa có row hôm nay → append
+                    new_row = {
+                        'date':   today_str,
+                        'open':   price_kvnd,
+                        'high':   price_kvnd,
+                        'low':    price_kvnd,
+                        'close':  price_kvnd,
+                        'volume': intra_vol,
+                    }
+                    df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+        except Exception as e:
+            print(f"⚠️  Intraday merge {ticker}: {type(e).__name__}: {e}")
 
         # RS Rating: đọc từ rs_ratings table (percentile rank, nightly batch)
         # Fallback: compute_rs_rating() nếu chưa có dữ liệu batch
