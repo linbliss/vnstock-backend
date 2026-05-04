@@ -72,7 +72,9 @@ async def debug_buy_alert(ticker: str):
     price = float(quote.get("price") or r.get("price") or 0)
     # Quy đổi sang nghìn VND cho đồng bộ với pivot_buy
     price_kvnd = price / 1000.0 if price > 1000 else price
-    price_pct = abs(price_kvnd - pivot_buy) / pivot_buy * 100 if pivot_buy else 999
+    diff_pct   = (price_kvnd - pivot_buy) / pivot_buy * 100 if pivot_buy else 999
+    price_pct  = abs(diff_pct)
+    BREAKOUT_MAX_PCT = 5.0
 
     # Per-user diagnostics
     per_user = []
@@ -92,13 +94,20 @@ async def debug_buy_alert(ticker: str):
             score, criteria = -1, {"error": str(e)}
 
         # Đánh giá từng điều kiện
+        # Biên 2 phía: dưới pivot ≤ pivot_pct, trên pivot ≤ 5% (breakout)
+        if diff_pct >= 0:
+            zone_pass = diff_pct <= BREAKOUT_MAX_PCT
+            zone_label = f"breakout_<= {BREAKOUT_MAX_PCT:.1f}%"
+        else:
+            zone_pass = abs(diff_pct) <= pivot_pct
+            zone_label = f"near_pivot_<= {pivot_pct:.1f}%"
         checks = {
             "user_buy_enabled":     state.buy_enabled(),
             "trading_hours":        _is_trading(),
             "in_watchlist":         in_wl,
             "is_vcp":               is_vcp,
             "has_pivot_buy":        pivot_buy > 0,
-            f"distance_<= {pivot_pct:.1f}%": price_pct <= pivot_pct,
+            zone_label:             zone_pass,
             f"vol_ratio_>= {vol_mult:.2f}x": vol_ratio >= vol_mult,
             f"sepa_>= {sepa_min}":  score >= sepa_min,
             f"count_< {vcp_max}":   vs["count"] < vcp_max,
@@ -134,7 +143,9 @@ async def debug_buy_alert(ticker: str):
         "price": price,
         "vcp": {
             "is_vcp": is_vcp,
-            "pivot_buy": pivot_buy,
+            "pivot_buy_kvnd": pivot_buy,
+            "pivot_buy_vnd": int(pivot_buy * 1000),
+            "diff_pct": round(diff_pct, 2),  # signed: âm=dưới pivot, dương=trên pivot
             "distance_pct": round(price_pct, 2),
             "vol_ratio": vol_ratio,
             "vol_confirmed": vcp.get("vol_confirmed"),

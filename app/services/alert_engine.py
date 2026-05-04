@@ -394,11 +394,18 @@ async def _check_3b(state: _UserState):
         # ⚠️ Đơn vị: market_service.quotes price = VND (61700)
         #            screener vcp.pivot_buy   = nghìn VND (62.21)
         # → Quy đổi cùng đơn vị (nghìn VND) trước khi so sánh
-        price       = q["price"]
-        price_kvnd  = price / 1000.0 if price > 1000 else price
-        price_pct   = abs(price_kvnd - pivot_buy) / pivot_buy * 100
-        if price_pct > pivot_pct:
+        price        = q["price"]
+        price_kvnd   = price / 1000.0 if price > 1000 else price
+        diff_pct     = (price_kvnd - pivot_buy) / pivot_buy * 100  # signed
+        # Logic biên 2 phía bất đối xứng:
+        #   - Dưới pivot: ≤ pivot_pct (mặc định 3%) — vùng "near pivot" gom hàng
+        #   - Trên pivot: ≤ 5% — vùng "breakout xác nhận" (cho phép vượt nhẹ)
+        BREAKOUT_MAX_PCT = 5.0
+        if diff_pct < 0 and abs(diff_pct) > pivot_pct:
             continue
+        if diff_pct > BREAKOUT_MAX_PCT:
+            continue
+        price_pct = abs(diff_pct)
         if vol_ratio < vol_mult:
             continue
 
@@ -410,10 +417,18 @@ async def _check_3b(state: _UserState):
 
         count = vs["count"] + 1
         crit_text = _fmt_criteria(criteria)
+        # Hiển thị Giá và Pivot buy đều theo đơn vị VND (cùng đơn vị)
+        pivot_vnd = pivot_buy * 1000
+        # Vị trí so với pivot
+        if diff_pct >= 0:
+            zone = f"⬆️ Vượt pivot {diff_pct:.2f}% (breakout)"
+        else:
+            zone = f"⬇️ Dưới pivot {abs(diff_pct):.2f}% (near pivot)"
         msg = (
             f"🟢 <b>Điểm mua VCP – {ticker}</b>\n"
             f"Giá: <b>{_fp(price)}</b> ({q.get('change_pct', 0):+.2f}%)\n"
-            f"Pivot buy: {_fp(pivot_buy)} | Cách: {price_pct:.1f}%\n"
+            f"Pivot buy: <b>{_fp(pivot_vnd)}</b>\n"
+            f"{zone}\n"
             f"Volume: <b>{vol_ratio:.1f}x</b> MA30\n"
             f"Lần cảnh báo: {count}/{vcp_max}\n"
             f"\n"
