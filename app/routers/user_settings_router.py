@@ -21,13 +21,28 @@ class SettingsBody(BaseModel):
         return self.model_dump()
 
 
-@router.get("/")
+@router.get("/settings")
 def get_settings(current_user: dict = Depends(get_current_user)):
     return user_store.get_user_settings(current_user["id"])
 
 
-@router.put("/")
+@router.put("/settings")
 def save_settings(
+    body: Dict[str, Any],
+    current_user: dict = Depends(get_current_user),
+):
+    user_store.save_user_settings(current_user["id"], body)
+    return {"ok": True}
+
+
+# Alias: /api/user/ → /api/user/settings (backward compat)
+@router.get("/")
+def get_settings_root(current_user: dict = Depends(get_current_user)):
+    return user_store.get_user_settings(current_user["id"])
+
+
+@router.put("/")
+def save_settings_root(
     body: Dict[str, Any],
     current_user: dict = Depends(get_current_user),
 ):
