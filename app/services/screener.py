@@ -14,10 +14,13 @@ _limiter = market_service._limiter
 # thay vì chuẩn Minervini gốc 70. Giá trị có thể đổi trong alert settings.
 RS_MIN_VN = 55.0
 
-def check_trend_template(df: pd.DataFrame, rs_rating: float = 0.0) -> Dict:
+def check_trend_template(df: pd.DataFrame, rs_rating: float = 0.0,
+                         current_price: float = None) -> Dict:
     """
     df: OHLCV daily data, columns: open, high, low, close, volume
     rs_rating: tính trước bằng compute_rs_rating(), truyền vào để tính c8
+    current_price: nếu truyền vào (đơn vị nghìn VND, giống df.close), dùng làm
+                   "giá hiện tại" thay vì close[-1] — cho phép realtime intraday.
     Trả về dict điểm từng tiêu chí và tổng điểm
     """
     if df is None or len(df) < 200:
@@ -26,7 +29,7 @@ def check_trend_template(df: pd.DataFrame, rs_rating: float = 0.0) -> Dict:
     close = df['close'].values
     high  = df['high'].values  if 'high' in df.columns else close
     low   = df['low'].values   if 'low'  in df.columns else close
-    current = close[-1]
+    current = float(current_price) if current_price and current_price > 0 else float(close[-1])
 
     # Tính các MA
     ma50  = float(pd.Series(close).rolling(50).mean().iloc[-1])
@@ -361,7 +364,7 @@ def _find_contractions(
     return contractions
 
 
-def detect_vcp(df: pd.DataFrame) -> Dict:
+def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
     """
     Nhận diện VCP (Volatility Contraction Pattern) — Chuẩn IBD/Minervini.
 
@@ -393,7 +396,8 @@ def detect_vcp(df: pd.DataFrame) -> Dict:
     # ══════════════════════════════════════════════════════════════════════
     # STAGE 2 FILTER — Cổ phiếu phải đang trong uptrend rõ ràng
     # ══════════════════════════════════════════════════════════════════════
-    current_close = float(close[-1])
+    # current_close: nếu có current_price (intraday) thì dùng, ngược lại close[-1]
+    current_close = float(current_price) if current_price and current_price > 0 else float(close[-1])
     ma50  = float(pd.Series(close).rolling(50).mean().iloc[-1])
     ma150 = float(pd.Series(close).rolling(150).mean().iloc[-1])
 
@@ -738,17 +742,21 @@ class ScreenerService:
                 df['close'], self._index_data['close']
             )
 
-        # Trend Template (c8 dùng rs_rating IBD ≥ 55)
-        trend = check_trend_template(df, rs_rating=rs_rating)
-
-        # VCP
-        vcp = detect_vcp(df)
-
-        # Giá hiện tại từ cache quotes
+        # Giá hiện tại từ cache quotes (REALTIME) — truyền vào VCP/Trend
+        # để mọi check (c1-c7, near_pivot, uptrend) phản ánh giá intraday.
         quote = market_service.quotes.get(ticker, {})
         current_price = float(quote.get("price", df['close'].iloc[-1]))
         change_pct    = float(quote.get("change_pct", 0))
         volume        = int(quote.get("volume", 0))
+
+        # Quy đổi sang nghìn VND để khớp đơn vị df.close
+        cur_kvnd = current_price / 1000.0 if current_price > 1000 else current_price
+
+        # Trend Template (c8 dùng rs_rating IBD ≥ 55), c1/c3/c5/c6/c7 dùng giá realtime
+        trend = check_trend_template(df, rs_rating=rs_rating, current_price=cur_kvnd)
+
+        # VCP — current_price cho near_pivot + uptrend check
+        vcp = detect_vcp(df, current_price=cur_kvnd)
 
         # Volume MA — frontend cần để hiển thị + filter theo Settings
         vol = df['volume'].values
