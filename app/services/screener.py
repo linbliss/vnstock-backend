@@ -554,8 +554,10 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
         # Fallback: đỉnh 20 ngày + 0.5%
         pivot_buy = round(float(np.max(b_high[-20:])) * 1.005, 2)
 
-    # Giá hiện tại so với pivot
-    near_pivot = abs(current_close - pivot_buy) / pivot_buy * 100 < 3 if pivot_buy > 0 else False
+    # Giá hiện tại so với pivot (signed: âm = dưới pivot, dương = trên pivot)
+    diff_pivot_pct = (current_close - pivot_buy) / pivot_buy * 100 if pivot_buy > 0 else 0
+    near_pivot = abs(diff_pivot_pct) < 3 if pivot_buy > 0 else False
+    above_pivot = diff_pivot_pct > 0 if pivot_buy > 0 else False
 
     # 5) Volume ratio hiện tại
     vol_ma30 = float(np.mean(b_vol[-30:])) if len(b_vol) >= 30 else 1.0
@@ -581,7 +583,9 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
     )
 
     # Stage classification chi tiết hơn
-    if is_vcp and near_pivot:
+    if is_vcp and above_pivot:
+        stage = "breakout"      # VCP đã vượt pivot → đang breakout (mua xác nhận)
+    elif is_vcp and near_pivot:
         stage = "vcp_pivot"     # VCP hoàn chỉnh + gần pivot → sẵn sàng breakout
     elif is_vcp:
         stage = "vcp"           # VCP hoàn chỉnh, chờ tiến vào pivot
