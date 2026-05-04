@@ -20,14 +20,12 @@ Backend ghi lại Supabase sau trailing:
 """
 
 import asyncio
-import os
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
-import httpx
-
 from app.services.market_data import market_service
 from app.routers.alerts import send_telegram
+from app.services import user_store
 
 # ── Config mặc định ──────────────────────────────────────────────────────────
 DEFAULT_SEPA_MIN        = 6
@@ -40,45 +38,6 @@ VCP_MAX_ALERTS          = 5      # tối đa lần cảnh báo VCP / phiên
 SEPA_CACHE_MIN          = 60     # phút cache SEPA score
 VCP_CACHE_MIN           = 5      # phút cache VCP result
 DATA_RELOAD_MIN         = 5      # phút tải lại watchlist/trades
-
-# ── Supabase client ───────────────────────────────────────────────────────────
-_SUPA_URL  = os.getenv("SUPABASE_URL", "").rstrip("/")
-_SUPA_KEY  = os.getenv("SUPABASE_SERVICE_KEY", "") or os.getenv("SUPABASE_ANON_KEY", "")
-_SUPA_HDR  = {
-    "apikey":        _SUPA_KEY,
-    "Authorization": f"Bearer {_SUPA_KEY}",
-    "Content-Type":  "application/json",
-}
-
-
-async def _supa_get(table: str, params: dict = None) -> list:
-    if not _SUPA_URL or not _SUPA_KEY:
-        return []
-    try:
-        async with httpx.AsyncClient(timeout=15) as c:
-            r = await c.get(f"{_SUPA_URL}/rest/v1/{table}",
-                            params=params or {}, headers=_SUPA_HDR)
-            if r.status_code != 200:
-                print(f"⚠️  Supabase GET {table} {r.status_code}: {r.text[:120]}")
-                return []
-            return r.json()
-    except Exception as e:
-        print(f"⚠️  Supabase GET error: {e}")
-        return []
-
-
-async def _supa_patch(table: str, data: dict, params: dict) -> bool:
-    if not _SUPA_URL or not _SUPA_KEY:
-        return False
-    try:
-        hdrs = {**_SUPA_HDR, "Prefer": "return=minimal"}
-        async with httpx.AsyncClient(timeout=15) as c:
-            r = await c.patch(f"{_SUPA_URL}/rest/v1/{table}",
-                              params=params, json=data, headers=hdrs)
-            return r.status_code in (200, 204)
-    except Exception as e:
-        print(f"⚠️  Supabase PATCH error: {e}")
-        return False
 
 # ── Giờ giao dịch ────────────────────────────────────────────────────────────
 
@@ -225,43 +184,42 @@ _states: Dict[str, _UserState] = {}
 # ── Data loading ──────────────────────────────────────────────────────────────
 
 async def _load_user_ids() -> List[str]:
-    rows = await _supa_get("user_settings", {"select": "user_id"})
-    return [r["user_id"] for r in rows if r.get("user_id")]
+    return user_store.get_all_user_ids()
 
 
 async def _load_settings(uid: str) -> dict:
-    rows = await _supa_get("user_settings",
-                           {"user_id": f"eq.{uid}", "select": "settings"})
-    return rows[0].get("settings", {}) if rows else {}
+    return user_store.get_user_settings(uid)
 
 
 async def _load_watchlist_items(uid: str) -> List[dict]:
     """Lấy tất cả watchlist items của user."""
-    rows = await _supa_get("watchlists", {
-        "user_id": f"eq.{uid}",
-        "select":  "id,watchlist_items(ticker,alert_price)",
-    })
-    items = []
-    for wl in rows:
-        for item in (wl.get("watchlist_items") or []):
-            if item.get("ticker"):
-                items.append(item)
-    return items
+    return user_store.get_all_watchlist_items(uid)
 
 
 async def _load_trades(uid: str) -> List[dict]:
-    return await _supa_get("trades", {
-        "user_id": f"eq.{uid}",
-        "select":  "ticker,side,quantity,price,fee,trade_date",
-    })
+    """Trả về list of dict với keys: ticker, side, quantity, price, trade_date (+ fee=0)."""
+    rows = user_store.get_trades(uid)
+    # Đảm bảo format tương thích với _fifo_holdings (cần key 'fee')
+    return [
+        {
+            "ticker":     r["ticker"],
+            "side":       r["side"],
+            "quantity":   r["quantity"],
+            "price":      r["price"],
+            "fee":        0,  # fee không lưu trong schema hiện tại
+            "trade_date": r["trade_date"],
+        }
+        for r in rows
+    ]
 
 
 async def _save_settings(uid: str, settings: dict) -> bool:
-    return await _supa_patch(
-        "user_settings",
-        {"settings": settings, "updated_at": datetime.now().isoformat()},
-        {"user_id": f"eq.{uid}"},
-    )
+    try:
+        user_store.save_user_settings(uid, settings)
+        return True
+    except Exception as e:
+        print(f"⚠️  save_settings error for {uid[:8]}: {e}")
+        return False
 
 
 async def _refresh(state: _UserState):

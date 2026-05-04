@@ -9,9 +9,10 @@ import asyncio
 from app.services.market_data import market_service
 from app.services.alert_engine import run_alert_engine
 from app.services.screener import screener_service, compute_market_rs_ratings
-from app.services import ohlcv_store
+from app.services import ohlcv_store, user_store
 from app.services.backfill import daily_update_scheduler
 from app.routers import quotes, alerts, screener, admin, chart
+from app.routers import auth, portfolio, watchlist_router, user_settings_router
 
 alert_task = None
 daily_task = None
@@ -21,6 +22,7 @@ rs_task = None
 async def lifespan(app: FastAPI):
     global alert_task, daily_task, rs_task
     ohlcv_store.init_db()
+    user_store.init_db()
     await market_service.start()
     alert_task = asyncio.create_task(run_alert_engine())
     daily_task = asyncio.create_task(daily_update_scheduler())
@@ -72,11 +74,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.include_router(quotes.router,   prefix="/api/quotes",   tags=["quotes"])
-app.include_router(alerts.router,   prefix="/api/alerts",   tags=["alerts"])
-app.include_router(screener.router, prefix="/api/screener", tags=["screener"])
-app.include_router(admin.router,    prefix="/api/admin",    tags=["admin"])
-app.include_router(chart.router,    prefix="/api/chart",    tags=["chart"])
+app.include_router(quotes.router,               prefix="/api/quotes",      tags=["quotes"])
+app.include_router(alerts.router,               prefix="/api/alerts",      tags=["alerts"])
+app.include_router(screener.router,             prefix="/api/screener",    tags=["screener"])
+app.include_router(admin.router,                prefix="/api/admin",       tags=["admin"])
+app.include_router(chart.router,                prefix="/api/chart",       tags=["chart"])
+app.include_router(auth.router,                 prefix="/api/auth",        tags=["auth"])
+app.include_router(portfolio.router,            prefix="/api/portfolio",   tags=["portfolio"])
+app.include_router(watchlist_router.router,     prefix="/api/watchlists",  tags=["watchlists"])
+app.include_router(user_settings_router.router, prefix="/api/user",        tags=["user"])
 
 @app.get("/")
 async def root():

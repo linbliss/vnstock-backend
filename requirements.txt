@@ -7,3 +7,5 @@ pandas
 numpy
 apscheduler==3.10.4
 requests
+PyJWT==2.8.0
+passlib[bcrypt]==1.7.4
