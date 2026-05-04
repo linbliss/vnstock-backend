@@ -11,7 +11,7 @@ from app.services.alert_engine import run_alert_engine
 from app.services.screener import screener_service, compute_market_rs_ratings
 from app.services import ohlcv_store
 from app.services.backfill import daily_update_scheduler
-from app.routers import quotes, alerts, screener, admin
+from app.routers import quotes, alerts, screener, admin, chart
 
 alert_task = None
 daily_task = None
@@ -76,6 +76,7 @@ app.include_router(quotes.router,   prefix="/api/quotes",   tags=["quotes"])
 app.include_router(alerts.router,   prefix="/api/alerts",   tags=["alerts"])
 app.include_router(screener.router, prefix="/api/screener", tags=["screener"])
 app.include_router(admin.router,    prefix="/api/admin",    tags=["admin"])
+app.include_router(chart.router,    prefix="/api/chart",    tags=["chart"])
 
 @app.get("/")
 async def root():
