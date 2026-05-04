@@ -18,8 +18,8 @@ from typing import Dict, List, Optional, Any
 
 def _now() -> str:
     """ISO-8601 với milliseconds + Z — JavaScript new Date() parse được."""
-    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.') \
-           + f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
+    t = datetime.now(timezone.utc)
+    return t.strftime('%Y-%m-%dT%H:%M:%S.') + f"{t.microsecond // 1000:03d}Z"
 
 DB_DIR  = os.environ.get("USER_DB_DIR", "/app/data")
 DB_PATH = os.path.join(DB_DIR, "user_data.db")
@@ -371,7 +371,8 @@ def get_watchlists(user_id: str) -> List[dict]:
         result = []
         for wl in wls:
             items = conn.execute(
-                """SELECT id, watchlist_id, ticker, note, alert_price, created_at
+                """SELECT id, watchlist_id, ticker, note, alert_price,
+                          created_at AS added_at
                    FROM watchlist_items WHERE watchlist_id=? ORDER BY created_at""",
                 (wl["id"],),
             ).fetchall()
@@ -425,7 +426,7 @@ def add_watchlist_item(wl_id: str, ticker: str, note: str = "", alert_price: Opt
         )
     return {
         "id": iid, "watchlist_id": wl_id, "ticker": ticker.upper(),
-        "note": note, "alert_price": alert_price, "created_at": now,
+        "note": note, "alert_price": alert_price, "added_at": now,
     }
 
 
