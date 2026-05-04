@@ -70,7 +70,9 @@ async def debug_buy_alert(ticker: str):
     vol_ratio = float(vcp.get("vol_ratio") or 0)
 
     price = float(quote.get("price") or r.get("price") or 0)
-    price_pct = abs(price - pivot_buy) / pivot_buy * 100 if pivot_buy else 999
+    # Quy đổi sang nghìn VND cho đồng bộ với pivot_buy
+    price_kvnd = price / 1000.0 if price > 1000 else price
+    price_pct = abs(price_kvnd - pivot_buy) / pivot_buy * 100 if pivot_buy else 999
 
     # Per-user diagnostics
     per_user = []

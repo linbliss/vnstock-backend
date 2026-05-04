@@ -391,8 +391,12 @@ async def _check_3b(state: _UserState):
         if not is_vcp or not pivot_buy:
             continue
 
-        price     = q["price"]
-        price_pct = abs(price - pivot_buy) / pivot_buy * 100
+        # ⚠️ Đơn vị: market_service.quotes price = VND (61700)
+        #            screener vcp.pivot_buy   = nghìn VND (62.21)
+        # → Quy đổi cùng đơn vị (nghìn VND) trước khi so sánh
+        price       = q["price"]
+        price_kvnd  = price / 1000.0 if price > 1000 else price
+        price_pct   = abs(price_kvnd - pivot_buy) / pivot_buy * 100
         if price_pct > pivot_pct:
             continue
         if vol_ratio < vol_mult:
