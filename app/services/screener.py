@@ -356,40 +356,97 @@ def compute_rs_line(stock_close: pd.Series, index_close: pd.Series, length: int 
         return 50.0
 
 
-def _find_swing_points(high: np.ndarray, low: np.ndarray, order: int = 5) -> tuple:
+def _zigzag_swings(
+    high: np.ndarray, low: np.ndarray, threshold_pct: float = 2.0,
+) -> tuple:
     """
-    Tìm swing highs và swing lows dùng phương pháp fractal (Minervini style).
+    ZigZag swing detection — chuẩn TradingView/professional VCP analysis.
 
-    Fix A: Dùng order ĐỘNG — order lớn (5) cho phần đầu base, order nhỏ (2-3)
-    cho phần cuối để bắt được "tay cầm" (handle) ngắn hạn.
-    Quy tắc: 30% cuối base dùng order=2, phần còn lại dùng order truyền vào.
+    Khác fractal (window-based):
+      - Fractal: high[i] == max(high[i-N:i+N+1]) → bỏ sót swings sát nhau
+      - ZigZag: confirm swing khi giá đảo chiều ≥ threshold_pct% từ pivot
+        → tự nhiên align với "contraction depth", bắt mọi swing có ý nghĩa
 
-    Trả về: (swing_highs, swing_lows) — mỗi cái là list of (index, price).
+    Algorithm:
+      1. Track running extreme (high tối đa hoặc low tối thiểu) tùy trend
+      2. Khi đảo chiều ≥ threshold:
+         - trend up + low giảm > threshold từ running high → confirm swing high
+         - trend down + high tăng > threshold từ running low → confirm swing low
+      3. Tail: append tentative pivot đang track (handle chưa hoàn chỉnh)
+
+    threshold_pct: % minimum reversal để confirm swing.
+      - 2.0 (default): bắt cả handle tight 2-3% — phù hợp VCP cuối cùng
+      - 3.0: chỉ bắt swings sâu hơn — strict mode
+
+    Returns: (swing_highs, swing_lows) — mỗi list of (idx, price), sort theo idx.
+    Guarantee: swings xen kẽ H-L-H-L (zigzag không vi phạm).
     """
-    swing_highs = []
-    swing_lows = []
     n = len(high)
+    if n < 3:
+        return [], []
 
-    # Ngưỡng chuyển đổi: 70% đầu dùng order gốc, 30% cuối dùng order nhỏ
-    handle_zone_start = int(n * 0.7)
-    handle_order = min(order, 2)  # order=2 cho vùng tay cầm
+    threshold = threshold_pct / 100.0
+    swing_highs: list = []
+    swing_lows:  list = []
 
-    for i in range(order, n - order):
-        # Chọn order phù hợp với vị trí trong base
-        local_order = handle_order if i >= handle_zone_start else order
+    # Running extremes
+    cur_high_idx,  cur_high_price = 0, float(high[0])
+    cur_low_idx,   cur_low_price  = 0, float(low[0])
+    trend: Optional[str] = None  # 'up' | 'down' | None
 
-        # Đảm bảo không vượt biên
-        left = max(0, i - local_order)
-        right = min(n, i + local_order + 1)
+    for i in range(1, n):
+        hi, lo = float(high[i]), float(low[i])
 
-        # Swing high: bar cao nhất trong cửa sổ
-        if high[i] == np.max(high[left:right]):
-            swing_highs.append((i, float(high[i])))
-        # Swing low: bar thấp nhất trong cửa sổ
-        if low[i] == np.min(low[left:right]):
-            swing_lows.append((i, float(low[i])))
+        if trend is None:
+            # Update both extremes
+            if hi > cur_high_price:
+                cur_high_idx, cur_high_price = i, hi
+            if lo < cur_low_price:
+                cur_low_idx,  cur_low_price  = i, lo
+            # First reversal triggers initial trend
+            if lo < cur_high_price * (1 - threshold):
+                swing_highs.append((cur_high_idx, cur_high_price))
+                cur_low_idx, cur_low_price = i, lo
+                trend = 'down'
+            elif hi > cur_low_price * (1 + threshold):
+                swing_lows.append((cur_low_idx, cur_low_price))
+                cur_high_idx, cur_high_price = i, hi
+                trend = 'up'
+
+        elif trend == 'up':
+            # Trong uptrend: track new high, đợi đảo chiều xuống ≥ threshold
+            if hi > cur_high_price:
+                cur_high_idx, cur_high_price = i, hi
+            if lo < cur_high_price * (1 - threshold):
+                swing_highs.append((cur_high_idx, cur_high_price))
+                cur_low_idx, cur_low_price = i, lo
+                trend = 'down'
+
+        else:   # trend == 'down'
+            if lo < cur_low_price:
+                cur_low_idx, cur_low_price = i, lo
+            if hi > cur_low_price * (1 + threshold):
+                swing_lows.append((cur_low_idx, cur_low_price))
+                cur_high_idx, cur_high_price = i, hi
+                trend = 'up'
+
+    # ── Tail: append tentative pivot (swing đang hình thành chưa confirmed) ──
+    # Cho phép walker tạo contraction cuối nếu đủ duration & higher-lows
+    if trend == 'up':
+        # Currently in uptrend, track running high — append as last swing high
+        if not swing_highs or swing_highs[-1][0] != cur_high_idx:
+            swing_highs.append((cur_high_idx, cur_high_price))
+    elif trend == 'down':
+        if not swing_lows or swing_lows[-1][0] != cur_low_idx:
+            swing_lows.append((cur_low_idx, cur_low_price))
 
     return swing_highs, swing_lows
+
+
+# Backward compat alias — nếu code khác còn dùng tên cũ
+def _find_swing_points(high: np.ndarray, low: np.ndarray, order: int = 5) -> tuple:
+    """DEPRECATED — gọi _zigzag_swings (threshold mặc định 2%)."""
+    return _zigzag_swings(high, low, threshold_pct=2.0)
 
 
 def _find_contractions(
@@ -683,7 +740,10 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
     analysis_close = b_close[base_high_idx_local:]
     analysis_offset_global = base_start_global  # = base_offset_global + base_high_idx_local
 
-    swing_highs, swing_lows = _find_swing_points(analysis_high, analysis_low, order=5)
+    # ZigZag swing detection — threshold 2% (bắt cả handle tight 2-3%)
+    # Khác fractal: confirm swing khi đảo chiều ≥ threshold% từ pivot,
+    # tự nhiên align với "contraction depth" → không bỏ sót swings sát nhau
+    swing_highs, swing_lows = _zigzag_swings(analysis_high, analysis_low, threshold_pct=2.0)
 
     # vol_ma50 phải tính trên TOÀN dataset, không phải chỉ analysis_vol
     vol_ma50_full = float(pd.Series(volume).rolling(50).mean().iloc[-1]) if n >= 50 else float(np.mean(volume))
