@@ -5,16 +5,20 @@ GET /api/chart/history?ticker=VCB&period=6m
   → { candles: [...], ma20: [...], ma50: [...], ma150: [...], ma200: [...], pivot: float|null }
 
 period: 1m | 3m | 6m | 1y | 2y | all  (default 6m)
+
+Realtime: nếu trong/sau giờ giao dịch và market_service.quotes có data của ticker,
+candle hôm nay được append/update trước khi tính MA → MA & chart luôn có ngày current.
 """
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Optional, List
 
 from fastapi import APIRouter, HTTPException, Query
 import pandas as pd
 
 from app.services import ohlcv_store
+from app.services.market_data import market_service
 
 router = APIRouter()
 
@@ -46,6 +50,63 @@ def _ema(series: pd.Series, n: int) -> List[Optional[float]]:
     return [None if pd.isna(v) else round(float(v), 2) for v in rolled]
 
 
+def _is_market_open_or_post() -> bool:
+    """Trading day, từ 9:00 đến 16:00 (bao gồm post-close 15:00-16:00 lúc ATO/data settle)."""
+    now = datetime.now()
+    if now.weekday() >= 5:
+        return False
+    t = now.hour * 60 + now.minute
+    return 9 * 60 <= t <= 16 * 60
+
+
+def _merge_intraday_candle(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """
+    Append/update candle hôm nay từ market_service.quotes nếu có data.
+    Đảm bảo MA tính trên data có ngày hiện tại → chart không bị thiếu cây nến hôm nay.
+    """
+    quote = market_service.quotes.get(ticker, {})
+    if not quote:
+        return df
+
+    price = float(quote.get('price', 0) or 0)
+    if price <= 0:
+        return df
+
+    today_str = date.today().isoformat()
+    last_date = str(df['date'].iloc[-1]) if len(df) > 0 else None
+
+    open_p   = float(quote.get('open',  price) or price)
+    high_p   = float(quote.get('high',  price) or price)
+    low_p    = float(quote.get('low',   price) or price)
+    volume   = int(quote.get('volume', 0)      or 0)
+
+    if last_date != today_str:
+        # Chưa có candle hôm nay trong store → append
+        if not _is_market_open_or_post():
+            # Ngoài giờ + chưa có T row → có thể đang sáng sớm, đừng append (data có thể stale)
+            # Trừ khi quote.timestamp gần đây
+            return df
+        new_row = pd.DataFrame([{
+            'date':   today_str,
+            'open':   open_p,
+            'high':   high_p,
+            'low':    low_p,
+            'close':  price,
+            'volume': volume,
+        }])
+        df = pd.concat([df, new_row], ignore_index=True)
+    else:
+        # Đã có candle hôm nay (có thể là EOD T-1 đã sync) → update với intraday
+        if _is_market_open_or_post():
+            idx = df.index[-1]
+            df.at[idx, 'high']   = max(float(df.at[idx, 'high']), high_p)
+            df.at[idx, 'low']    = min(float(df.at[idx, 'low']),  low_p)
+            df.at[idx, 'close']  = price
+            df.at[idx, 'volume'] = volume
+            # Open giữ nguyên — open của phiên là từ ATO đầu phiên
+    return df
+
+
 @router.get("/history")
 async def chart_history(
     ticker: str = Query(..., description="Mã CK, e.g. VCB"),
@@ -73,6 +134,10 @@ async def chart_history(
             detail=f"Không có dữ liệu OHLCV cho {ticker}. "
                    "Vui lòng chạy backfill trước.",
         )
+
+    # Merge realtime candle hôm nay từ market_service.quotes (nếu trong giờ GD)
+    # → MA & chart luôn có ngày current, không phải đợi EOD sync
+    df = _merge_intraday_candle(df, ticker)
 
     close = df["close"].astype(float)
 
