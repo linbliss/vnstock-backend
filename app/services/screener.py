@@ -2,7 +2,7 @@ import asyncio
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from app.services.market_data import market_service
 from app.services import ohlcv_store
 
@@ -68,54 +68,118 @@ def check_trend_template(df: pd.DataFrame, rs_rating: float = 0.0,
 
 
 def _filter_outliers(stock: pd.Series, index: pd.Series) -> tuple:
-    """Filter corrupt VNINDEX rows (FireAnt sometimes returns close/1000)."""
+    """Filter corrupt VNINDEX rows (FireAnt sometimes returns close/1000).
+    PRESERVE DatetimeIndex để có thể align sau."""
     stock = stock.astype(float)
     index = index.astype(float)
     median_idx = float(index.median())
     if median_idx > 0:
         valid_mask = (index > median_idx * 0.3) & (index < median_idx * 3)
-        stock = stock[valid_mask].reset_index(drop=True)
-        index = index[valid_mask].reset_index(drop=True)
+        # Lọc theo mask nhưng GIỮ index gốc (DatetimeIndex)
+        index = index[valid_mask]
+        stock = stock[stock.index.isin(index.index)] if hasattr(stock, 'index') else stock
     return stock, index
 
 
-def compute_rs_score(stock_close: pd.Series) -> float:
+def _align_by_date(stock_close: pd.Series, index_close: pd.Series) -> Tuple[pd.Series, pd.Series]:
     """
-    Tính RS Score thô (weighted return) cho 1 mã.
-    Công thức IBD: 40% Q gần nhất + 20% mỗi Q còn lại.
-    Đây là điểm SỐ TUYỆT ĐỐI — chưa phải Rating (percentile).
+    Align 2 series. Ưu tiên DatetimeIndex (chính xác), fallback tail-align (xấp xỉ).
+
+    - DatetimeIndex (cả 2): intersection theo ngày → đúng tuyệt đối
+    - RangeIndex / không có ngày: lấy tail của cả 2 với độ dài min
+      (giả định cùng frequency EOD, cùng ngày kết thúc — đúng với data từ ohlcv_store)
+    """
+    try:
+        # Case 1: cả 2 đều DatetimeIndex
+        if isinstance(stock_close.index, pd.DatetimeIndex) and isinstance(index_close.index, pd.DatetimeIndex):
+            common = stock_close.index.intersection(index_close.index)
+            if len(common) >= 63:
+                return stock_close.loc[common].sort_index(), index_close.loc[common].sort_index()
+
+        # Case 2: tail-align (default cho data từ get_ohlcv)
+        n = min(len(stock_close), len(index_close))
+        if n < 63:
+            return stock_close, pd.Series(dtype=float)
+        return (
+            stock_close.iloc[-n:].reset_index(drop=True),
+            index_close.iloc[-n:].reset_index(drop=True),
+        )
+    except Exception:
+        return stock_close, index_close
+
+
+def compute_rs_score(stock_close: pd.Series, index_close: Optional[pd.Series] = None) -> float:
+    """
+    IBD-style RS Score: weighted RELATIVE return vs benchmark (VNINDEX).
+
+    Công thức:
+      RS = 0.4×(R3m_stock − R3m_idx)
+         + 0.2×(R6m_stock − R6m_idx)
+         + 0.2×(R9m_stock − R9m_idx)
+         + 0.2×(R12m_stock − R12m_idx)
+
+    Lý do RELATIVE (không tuyệt đối):
+      - Khi index uptrend mạnh, mã yếu hơn index vẫn có return dương cao
+        → score cao "ảo" theo công thức tuyệt đối, không phản ánh leadership thực
+      - IBD/Minervini chuẩn = excess return vs benchmark cùng kỳ
+
+    Args:
+      stock_close:  pd.Series với DatetimeIndex (close giá cổ phiếu)
+      index_close:  pd.Series với DatetimeIndex (close VNINDEX). None → fallback tuyệt đối.
+
+    Returns:
+      RS Score thô (số có thể âm khi underperform). Cần percentile rank để thành Rating 1-99.
     """
     try:
         if len(stock_close) < 63:
             return 0.0
+
+        # Align dates với index nếu có (đảm bảo so sánh return cùng kỳ)
+        idx_close: Optional[pd.Series] = None
+        if index_close is not None and len(index_close) >= 63:
+            try:
+                stock_aligned, idx_aligned = _align_by_date(stock_close, index_close)
+                if len(stock_aligned) >= 63 and len(idx_aligned) >= 63:
+                    stock_close = stock_aligned
+                    idx_close = idx_aligned
+            except Exception:
+                pass   # rơi xuống fallback tuyệt đối
 
         def period_return(s: pd.Series, days: int) -> float:
             if len(s) < days:
                 return 0.0
             return float((s.iloc[-1] / s.iloc[-days] - 1) * 100)
 
-        returns = [period_return(stock_close, p) for p in [63, 126, 189, 252]]
+        stock_returns = [period_return(stock_close, p) for p in [63, 126, 189, 252]]
+
+        if idx_close is not None:
+            idx_returns = [period_return(idx_close, p) for p in [63, 126, 189, 252]]
+            relative = [s - i for s, i in zip(stock_returns, idx_returns)]
+        else:
+            # Fallback: dùng absolute return (chỉ khi không có index data — không khuyến nghị)
+            relative = stock_returns
+
         weights = [0.4, 0.2, 0.2, 0.2]
-        return sum(r * w for r, w in zip(returns, weights))
+        return sum(r * w for r, w in zip(relative, weights))
     except Exception:
         return 0.0
 
 
 def compute_rs_rating(stock_close: pd.Series, index_close: pd.Series) -> float:
     """
-    DEPRECATED fallback — Tính RS tuyệt đối khi chưa có batch rating.
-    Chỉ dùng khi rs_ratings table chưa được populate.
-    True RS Rating phải lấy từ ohlcv_store.get_rs_rating() (percentile).
+    Fallback RS Rating — chỉ dùng khi rs_ratings table chưa populate.
+    Truyền cả index_close để compute_rs_score tính RELATIVE return chuẩn IBD.
+    True RS Rating (percentile) phải lấy từ ohlcv_store.get_rs_rating().
     """
     try:
         stock_close, index_close = _filter_outliers(stock_close, index_close)
         if len(stock_close) < 63:
             return 50.0
 
-        score = compute_rs_score(stock_close)
-        # Fallback mapping: ép vào 0-100 (KHÔNG phải percentile thật)
-        # Đây chỉ dùng tạm khi batch job chưa chạy
-        rs = max(1, min(99, (score + 50)))
+        score = compute_rs_score(stock_close, index_close)
+        # Fallback mapping: ép RS Score (relative) về 0-100
+        # Khi outperform index nhiều → score cao → rating cao (và ngược lại)
+        rs = max(1, min(99, score + 50))
         return round(rs, 1)
     except Exception:
         return 50.0
@@ -124,25 +188,44 @@ def compute_rs_rating(stock_close: pd.Series, index_close: pd.Series) -> float:
 async def compute_market_rs_ratings(min_vol_ma20: int = 100_000) -> int:
     """
     ═══════════════════════════════════════════════════════════════════════
-    TRUE RS RATING — Nightly Batch Job
+    TRUE RS RATING — Nightly Batch Job (Relative vs VNINDEX)
     ═══════════════════════════════════════════════════════════════════════
 
     Tính RS Rating (percentile rank) cho TOÀN BỘ thị trường.
     Chạy 1 lần/ngày (sau 16:00 hoặc khi startup nếu stale).
 
-    Thuật toán:
-    1. Lấy tất cả mã có OHLCV data trong SQLite store
-    2. Lọc mã có vol_ma20 >= min_vol_ma20 (loại mã thanh khoản kém)
-    3. Tính RS Score (weighted 40-20-20-20) cho MỖI mã
-    4. Sort toàn bộ theo score từ cao → thấp
-    5. Gán percentile: RS_Rating = (total - rank) / total * 100
-    6. Lưu vào rs_ratings table
+    Thuật toán (chuẩn IBD):
+    1. Load VNINDEX 1 lần (benchmark cho relative return)
+    2. Lấy tất cả mã có OHLCV data trong SQLite store
+    3. Lọc mã có vol_ma20 >= min_vol_ma20 (loại mã thanh khoản kém)
+    4. Tính RS Score = weighted RELATIVE return vs VNINDEX (40-20-20-20)
+       → mã out-perform index → score dương cao
+       → mã under-perform → score âm
+    5. Sort toàn bộ theo score từ cao → thấp
+    6. Gán percentile: RS_Rating = (total - rank) / total * 100
+    7. Lưu vào rs_ratings table
 
     Returns: Số mã đã tính rating
     """
-    print("🔄 Computing market-wide RS Ratings (percentile)...")
+    print("🔄 Computing market-wide RS Ratings (RELATIVE vs VNINDEX, percentile)...")
 
-    # Bước 1: Lấy tất cả ticker có data trong store
+    # Bước 1: Load VNINDEX 1 lần — dùng làm benchmark cho mọi mã
+    # Set DatetimeIndex để align chính xác theo date (handle suspension gaps)
+    end   = datetime.now().strftime("%Y-%m-%d")
+    start = "2000-01-01"
+    index_close: Optional[pd.Series] = None
+    try:
+        index_df = ohlcv_store.get_ohlcv("VNINDEX", start, end)
+        if index_df is not None and len(index_df) >= 63:
+            index_df = index_df.set_index(pd.to_datetime(index_df['date']))
+            index_close = index_df['close'].astype(float)
+            print(f"   ✅ VNINDEX loaded: {len(index_close)} days, latest={index_close.iloc[-1]:.2f}")
+        else:
+            print("⚠️  VNINDEX data thiếu — RS Score sẽ dùng absolute (KHÔNG chuẩn IBD)")
+    except Exception as e:
+        print(f"⚠️  VNINDEX load error: {e} — fallback absolute")
+
+    # Bước 2: Lấy tất cả ticker có data trong store
     all_tickers = ohlcv_store.list_tickers()
     if not all_tickers:
         print("⚠️  RS Ratings: No tickers in OHLCV store")
@@ -151,10 +234,8 @@ async def compute_market_rs_ratings(min_vol_ma20: int = 100_000) -> int:
     # Loại bỏ index
     all_tickers = [t for t in all_tickers if t != "VNINDEX"]
 
-    # Bước 2+3: Tính RS Score cho mỗi mã
+    # Bước 3+4: Tính RS Score (RELATIVE) cho mỗi mã
     scores = []  # list of (ticker, rs_score)
-    end = datetime.now().strftime("%Y-%m-%d")
-    start = "2000-01-01"
 
     for ticker in all_tickers:
         try:
@@ -169,9 +250,12 @@ async def compute_market_rs_ratings(min_vol_ma20: int = 100_000) -> int:
                 if vol_ma20 < min_vol_ma20:
                     continue
 
-            # Tính RS Score (weighted return, không trừ index)
+            # Set DatetimeIndex để align chính xác với VNINDEX theo date
+            df = df.set_index(pd.to_datetime(df['date']))
             close = df['close'].astype(float)
-            score = compute_rs_score(close)
+
+            # Tính RS Score = weighted RELATIVE return vs VNINDEX
+            score = compute_rs_score(close, index_close)
             scores.append((ticker, score))
         except Exception as e:
             print(f"  RS Score error {ticker}: {e}")
@@ -886,9 +970,10 @@ class ScreenerService:
         if stored_rs:
             rs_rating = stored_rs["rs_rating"]
         elif self._index_data is not None and len(self._index_data) >= 60:
-            rs_rating = compute_rs_rating(
-                df['close'], self._index_data['close']
-            )
+            # Set DatetimeIndex để align chuẩn theo date (handle suspension gaps)
+            stk = df.set_index(pd.to_datetime(df['date']))['close']
+            idx = self._index_data.set_index(pd.to_datetime(self._index_data['date']))['close']
+            rs_rating = compute_rs_rating(stk, idx)
         if self._index_data is not None and len(self._index_data) >= 60:
             rs_line_val = compute_rs_line(
                 df['close'], self._index_data['close']
