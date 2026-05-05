@@ -454,21 +454,27 @@ def _find_contractions(
     vol: np.ndarray, close: np.ndarray, vol_ma50_full: float,
 ) -> list:
     """
-    Tìm contractions VCP — Sequential Walker với Higher Lows constraint.
+    Tìm contractions VCP — Sequential Walker.
 
     Thuật toán:
       1. Merge swing_highs + swing_lows, sort theo (idx, type) — H trước L cùng idx
-      2. Walk tuần tự:
-         - Gặp H: nhận làm `pending_high` (override nếu price cao hơn pending hiện tại,
-                  vì có nghĩa là pattern chưa hình thành đáy xong)
+      2. Walk tuần tự với state machine:
+         - Gặp H: nhận làm pending_high (override nếu price cao hơn pending,
+                  nghĩa là pattern chưa hình thành L)
          - Gặp L (sau pending_high):
-           * Nếu price >= pending_high.price → bỏ qua
-           * Nếu price <= last_low_price (vi phạm HIGHER LOWS) → reset pending, đợi H mới
-           * Nếu duration < 2 → bỏ qua (chưa reset pending — chờ L tiếp theo)
-           * Đáp ứng → tạo contraction, update last_low_price, reset pending_high
+           * price >= pending_high.price → bỏ qua
+           * duration < 2 → bỏ qua (chờ L tiếp theo, không reset pending)
+           * Đáp ứng → tạo contraction, reset pending
 
-    Higher Lows = đặc trưng cốt lõi VCP. Đáy sau phải CAO HƠN đáy trước
-    (= demand được tích lũy dần, supply cạn dần). Nếu vi phạm → không phải VCP.
+    Lưu ý — KHÔNG enforce Higher Lows ở mức swing:
+      VCP textbook nói "Higher Lows" là đặc trưng IDEAL nhưng dữ liệu thực
+      thường có shake-out (Minervini gọi "undercut & rally") — T₂ thủng nhẹ
+      L của T₁ để rũ weak hands. Strict HL → reject T₂ → chuỗi T₃,T₄ cũng
+      mắc kẹt vì last_low không update. Kết quả: chỉ thấy T1.
+
+    Higher Lows được track như METADATA (`higher_low_vs_prev`) để frontend
+    hiển thị quality, KHÔNG dùng làm gate. Gate chính là depth contraction
+    (xử lý ở pair_reductions trong detect_vcp).
 
     Args:
       swing_highs / swing_lows: [(idx_local_to_analysis, price)]
@@ -476,12 +482,13 @@ def _find_contractions(
       vol_ma50_full: MA50 volume trên TOÀN DATASET
 
     Returns:
-      list contractions xen kẽ tuần tự H₁→L₁→H₂→L₂→... với H_i ≤ H_{i-1}, L_i > L_{i-1}
+      list contractions tuần tự H₁→L₁→H₂→L₂→... với H_i ≤ H_{i-1}.
+      Mỗi item có `higher_low_vs_prev` (bool) cho post-hoc quality check.
     """
     if not swing_highs or not swing_lows:
         return []
 
-    # Merge events, sort theo idx (H trước L nếu cùng idx)
+    # Merge events, sort theo idx (H trước L nếu cùng idx để bắt cặp đúng)
     events = (
         [(i, p, 'H') for i, p in swing_highs] +
         [(i, p, 'L') for i, p in swing_lows]
@@ -489,12 +496,12 @@ def _find_contractions(
     events.sort(key=lambda x: (x[0], 0 if x[2] == 'H' else 1))
 
     contractions = []
-    pending_high   = None              # (idx, price) — đỉnh đang chờ ghép
-    last_low_price = -float('inf')     # ràng buộc Higher Lows
+    pending_high  = None     # (idx, price) — đỉnh đang chờ ghép
+    prev_low      = None     # tracking để metadata higher_low_vs_prev
 
     for idx, price, typ in events:
         if typ == 'H':
-            # Update pending_high: chưa có HOẶC đỉnh mới CAO HƠN (pattern reset, chưa có L)
+            # Update pending_high khi chưa có HOẶC đỉnh mới cao hơn
             if pending_high is None or price > pending_high[1]:
                 pending_high = (idx, price)
             continue
@@ -507,16 +514,9 @@ def _find_contractions(
         if price >= sh_price:
             continue
 
-        # Higher Lows constraint
-        if price <= last_low_price:
-            # Vi phạm → pattern bị break, đợi đỉnh mới
-            pending_high = None
-            continue
-
         duration = idx - sh_idx
         if duration < 2:
-            # Quá ngắn — bỏ qua, NHƯNG KHÔNG reset pending (chờ L tiếp theo)
-            continue
+            continue   # Quá ngắn — đợi L tiếp theo, không reset pending
 
         depth = (sh_price - price) / sh_price * 100
 
@@ -527,7 +527,7 @@ def _find_contractions(
         trough_avg_vol   = float(np.mean(trough_vol_slice)) if len(trough_vol_slice) > 0 else 0
         is_volume_dry    = trough_avg_vol < (vol_ma50_full * 0.6) if vol_ma50_full > 0 else False
 
-        # UP/DOWN volume trong segment [sh_idx, idx] (institutional accumulation check)
+        # UP/DOWN volume trong segment [sh_idx, idx] (institutional accumulation)
         seg_end = min(idx + 1, len(close))
         up_vol_sum, down_vol_sum = 0.0, 0.0
         for i in range(sh_idx + 1, seg_end):
@@ -540,21 +540,25 @@ def _find_contractions(
                 down_vol_sum += float(vol[i])
         down_up_ratio = down_vol_sum / up_vol_sum if up_vol_sum > 0 else 999.0
 
+        # Higher Lows metadata (quality indicator, not a gate)
+        higher_low = prev_low is None or price > prev_low
+
         contractions.append({
-            "high_idx":       sh_idx,
-            "high_price":     sh_price,
-            "low_idx":        idx,
-            "low_price":      price,
-            "depth":          depth,
-            "duration":       duration,
-            "trough_avg_vol": trough_avg_vol,
-            "is_volume_dry":  is_volume_dry,
-            "up_vol_sum":     up_vol_sum,
-            "down_vol_sum":   down_vol_sum,
-            "down_up_ratio":  down_up_ratio,
+            "high_idx":         sh_idx,
+            "high_price":       sh_price,
+            "low_idx":          idx,
+            "low_price":        price,
+            "depth":            depth,
+            "duration":         duration,
+            "trough_avg_vol":   trough_avg_vol,
+            "is_volume_dry":    is_volume_dry,
+            "up_vol_sum":       up_vol_sum,
+            "down_vol_sum":     down_vol_sum,
+            "down_up_ratio":    down_up_ratio,
+            "higher_low_vs_prev": higher_low,
         })
-        last_low_price = price
-        pending_high   = None        # Đợi đỉnh tiếp theo
+        prev_low     = price
+        pending_high = None        # Đợi đỉnh tiếp theo
 
     return contractions
 
@@ -947,6 +951,7 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
             "reduction_from_prev_pct": round(red_prev, 1) if red_prev is not None else None,
             "passes_strict_reduction": passes_strict,
             "passes_loose_reduction":  passes_loose,
+            "higher_low_vs_prev":      bool(c.get("higher_low_vs_prev", True)),
             "date_high":      _idx_to_date(gh_idx),
             "date_low":       _idx_to_date(gl_idx),
         })
