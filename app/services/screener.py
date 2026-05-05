@@ -296,18 +296,22 @@ def _find_swing_points(high: np.ndarray, low: np.ndarray, order: int = 5) -> tup
 
 def _find_contractions(
     swing_highs: list, swing_lows: list,
-    vol: np.ndarray, vol_ma50: float
+    vol: np.ndarray, close: np.ndarray, vol_ma50_full: float,
 ) -> list:
     """
-    Tìm các contraction (T) trong base pattern.
+    Tìm các contraction (T) trong base pattern + metadata đầy đủ cho Minervini.
 
-    Fix B: Không lọc bằng depth >= 3%. Chỉ loại nhiễu bằng duration >= 2 phiên.
-    (Tay cầm hoàn hảo có thể depth chỉ 1.5-2.5%).
+    Args:
+        swing_highs / swing_lows: [(idx_local_to_analysis, price)]
+        vol:    volume slice của analysis_zone (b_vol[base_high_idx:])
+        close:  close slice của analysis_zone (b_close[base_high_idx:])
+        vol_ma50_full: MA50 của volume tính trên TOÀN DATASET (không phải base)
 
-    Fix C: Volume dry-up đo tại vùng TROUGH (2-3 phiên quanh đáy),
-    so sánh với vol_ma50. Cạn cung = vol tại đáy < 60% vol_ma50.
-
-    Minervini VCP: T1 > T2 > T3 (depth giảm dần = volatility contraction).
+    Trả về list contractions, mỗi item:
+      high_idx, high_price, low_idx, low_price
+      depth_pct, duration_bars
+      trough_avg_vol, is_volume_dry
+      up_vol_sum, down_vol_sum, down_up_ratio  (UP/DOWN volume Minervini)
     """
     if not swing_highs or not swing_lows:
         return []
@@ -316,7 +320,6 @@ def _find_contractions(
     used_lows = set()
 
     for sh_idx, sh_price in swing_highs:
-        # Tìm swing low SÂU swing high này
         best_low = None
         for sl_idx, sl_price in swing_lows:
             if sl_idx <= sh_idx:
@@ -330,80 +333,156 @@ def _find_contractions(
             if sl_idx - sh_idx > 60:
                 break
 
-        if best_low:
-            depth = (sh_price - best_low[1]) / sh_price * 100
-            duration = best_low[0] - sh_idx
+        if not best_low:
+            continue
 
-            # Fix B: Chỉ lọc nhiễu bằng duration, KHÔNG lọc depth
-            # Một contraction phải kéo dài ít nhất 2 phiên để có ý nghĩa
-            if duration < 2:
-                continue
+        low_idx, low_price = best_low
+        depth = (sh_price - low_price) / sh_price * 100
+        duration = low_idx - sh_idx
 
-            # Fix C: Đo volume tại vùng TROUGH (3 phiên quanh đáy)
-            trough_idx = best_low[0]
-            trough_start = max(0, trough_idx - 1)
-            trough_end = min(len(vol), trough_idx + 2)
-            trough_vol_slice = vol[trough_start:trough_end]
-            trough_avg_vol = float(np.mean(trough_vol_slice)) if len(trough_vol_slice) > 0 else 0
+        # Lọc nhiễu: contraction phải kéo dài ≥ 2 phiên
+        if duration < 2:
+            continue
 
-            # Cạn cung = Volume tại đáy < 60% MA50 Volume
-            is_volume_dry = trough_avg_vol < (vol_ma50 * 0.6) if vol_ma50 > 0 else False
+        # Volume tại trough (3 phiên quanh đáy) so với MA50 toàn dataset
+        trough_start = max(0, low_idx - 1)
+        trough_end   = min(len(vol), low_idx + 2)
+        trough_vol_slice = vol[trough_start:trough_end]
+        trough_avg_vol   = float(np.mean(trough_vol_slice)) if len(trough_vol_slice) > 0 else 0
+        is_volume_dry    = trough_avg_vol < (vol_ma50_full * 0.6) if vol_ma50_full > 0 else False
 
-            used_lows.add(best_low[0])
-            contractions.append({
-                "high_idx": sh_idx,
-                "high_price": sh_price,
-                "low_idx": best_low[0],
-                "low_price": best_low[1],
-                "depth": depth,             # % correction
-                "duration": duration,       # bars
-                "trough_avg_vol": trough_avg_vol,
-                "is_volume_dry": is_volume_dry,
-            })
+        # UP vs DOWN volume trong khoảng [sh_idx, low_idx]
+        # Healthy base: tổng vol những ngày giảm < tổng vol những ngày tăng
+        # = institutional accumulation (Minervini "supply being absorbed")
+        seg_start = sh_idx
+        seg_end   = min(low_idx + 1, len(close))
+        up_vol_sum, down_vol_sum = 0.0, 0.0
+        for i in range(seg_start + 1, seg_end):
+            if i >= len(vol) or i >= len(close):
+                break
+            chg = close[i] - close[i - 1]
+            if chg > 0:
+                up_vol_sum += float(vol[i])
+            elif chg < 0:
+                down_vol_sum += float(vol[i])
+        down_up_ratio = down_vol_sum / up_vol_sum if up_vol_sum > 0 else 999.0
+
+        used_lows.add(low_idx)
+        contractions.append({
+            "high_idx":       sh_idx,
+            "high_price":     sh_price,
+            "low_idx":        low_idx,
+            "low_price":      low_price,
+            "depth":          depth,
+            "duration":       duration,
+            "trough_avg_vol": trough_avg_vol,
+            "is_volume_dry":  is_volume_dry,
+            "up_vol_sum":     up_vol_sum,
+            "down_vol_sum":   down_vol_sum,
+            "down_up_ratio":  down_up_ratio,
+        })
 
     return contractions
 
 
+def _empty_vcp_result(stage: str, **extra) -> Dict:
+    """Skeleton kết quả VCP rỗng (fail uptrend / base filter)."""
+    base = {
+        "is_vcp": False,
+        "is_vcp_strict": False,
+        "is_vcp_loose": False,
+        "contracting": False,
+        "vol_contracting": False,
+        "uptrend_ok": False,
+        "tightness": 0.0,
+        "pivot_buy": 0.0,
+        "near_pivot": False,
+        "above_pivot": False,
+        "vol_ratio": 0.0,
+        "vol_ratio_ma50": 0.0,
+        "vol_confirmed": False,
+        "vol_confirmed_strict": False,
+        "segments": 0,
+        "t_count": 0,
+        "base_depth": 0.0,
+        "base_length": 0,
+        "stop_loss": 0.0,
+        "handle_low": 0.0,
+        "hold_above_ma50": False,
+        "stage": stage,
+        "stage_strict": stage,
+        "stage_loose": stage,
+        "contractions": [],
+        "base_start_date": None,
+        "pivot_date": None,
+    }
+    base.update(extra)
+    return base
+
+
 def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
     """
-    Nhận diện VCP (Volatility Contraction Pattern) — Chuẩn IBD/Minervini.
+    Nhận diện VCP (Volatility Contraction Pattern) — chuẩn Minervini.
+    Tính cả 2 mode đồng thời: STRICT (textbook) và LOOSE (relaxed cho VN).
 
-    Thuật toán swing-point based:
-    1. Stage 2 filter: giá phải trong uptrend (trên MA150, +30% trong 12 tháng)
-    2. Tìm swing highs/lows thực sự (fractal method, order=5)
-    3. Xác định các contraction (T1, T2, T3...) từ swing points
-    4. Kiểm tra VCP: depth giảm dần (T1 > T2 > T3), ít nhất 2 contractions
-    5. Tightness: contraction cuối phải < 15% (lý tưởng 3-10%)
-    6. Volume dry-up: volume giảm dần qua các contraction
-    7. Pivot point: đỉnh contraction cuối + 0.5%
+    STRICT (Minervini textbook):
+      - T-count >= 3
+      - Mỗi cặp consecutive: depth phải giảm ≥ 50% (T2 ≤ 0.5×T1, T3 ≤ 0.5×T2 ...)
+      - Tightness (handle) < 8%
+      - Handle duration ≥ 5 phiên (1 tuần)
+      - Volume MUST: trough giảm dần qua các T VÀ handle khô (< 60% MA50 toàn dataset)
+      - DOWN volume < UP volume trong base (institutional accumulation)
+      - Hold above MA50 ≥ 70% bars trong nửa sau base
+      - Base length ≥ 35 ngày (5+ tuần)
+      - Breakout volume ≥ 1.5× MA50
 
-    Điều kiện Minervini gốc:
-    - First contraction (T1): 10-35% depth
-    - Subsequent: mỗi cái shallower hơn trước ít nhất 30%
-    - Final tightness: < 15% (tốt nhất < 10%)
-    - Duration tổng thể: 3-65 tuần (15-325 ngày)
-    - Ít nhất 2 contractions (T-count ≥ 2)
+    LOOSE (relaxed cho VN, vẫn chặt hơn bản cũ):
+      - T-count >= 2
+      - Pair-wise: tối đa 1 violation (depth sau >= depth trước * 1.0)
+        HOẶC overall T_cuối < 0.6 × T_đầu
+      - Tightness < 12%
+      - Handle duration ≥ 3 phiên
+      - Volume contracting OR handle khô
+      - Base length ≥ 25 ngày
+      - Breakout volume ≥ 1.3× MA50
+
+    Output thêm:
+      - contractions: list [{t_index, high_idx, high_price, low_idx, low_price,
+                             depth_pct, duration_bars, ..., date_high, date_low,
+                             passes_strict_reduction, passes_loose_reduction}]
+      - stop_loss = handle_low × 0.985
+      - base_start_date, pivot_date (ISO yyyy-mm-dd)
     """
     if df is None or len(df) < 130:
-        return {"is_vcp": False, "stage": "unknown"}
+        return _empty_vcp_result("unknown")
 
     close  = df['close'].astype(float).values
     high   = df['high'].astype(float).values
     low    = df['low'].astype(float).values
     volume = df['volume'].astype(float).values
+    dates  = df.index   # DatetimeIndex
     n = len(close)
 
-    # ══════════════════════════════════════════════════════════════════════
-    # STAGE 2 FILTER — Cổ phiếu phải đang trong uptrend rõ ràng
-    # ══════════════════════════════════════════════════════════════════════
-    # current_close: nếu có current_price (intraday) thì dùng, ngược lại close[-1]
-    current_close = float(current_price) if current_price and current_price > 0 else float(close[-1])
-    ma50  = float(pd.Series(close).rolling(50).mean().iloc[-1])
-    ma150 = float(pd.Series(close).rolling(150).mean().iloc[-1])
+    # ── Helper: index trong base/analysis → ISO date ──
+    def _idx_to_date(global_idx: int) -> Optional[str]:
+        try:
+            if 0 <= global_idx < len(dates):
+                return dates[global_idx].strftime("%Y-%m-%d")
+        except Exception:
+            pass
+        return None
 
-    # Điều kiện uptrend tối thiểu:
-    # - Giá trên MA150 (đang trong Stage 2)
-    # - Tăng ít nhất 30% trong 12 tháng (hoặc 20% trong 6 tháng)
+    # ══════════════════════════════════════════════════════════════════════
+    # STAGE 2 FILTER (8 tiêu chí Minervini Trend Template — phần MA stack)
+    # ══════════════════════════════════════════════════════════════════════
+    current_close = float(current_price) if current_price and current_price > 0 else float(close[-1])
+    ma50_arr  = pd.Series(close).rolling(50).mean().values
+    ma150_arr = pd.Series(close).rolling(150).mean().values
+    ma200_arr = pd.Series(close).rolling(200).mean().values
+    ma50  = float(ma50_arr[-1])  if not np.isnan(ma50_arr[-1])  else 0
+    ma150 = float(ma150_arr[-1]) if not np.isnan(ma150_arr[-1]) else 0
+    ma200 = float(ma200_arr[-1]) if not np.isnan(ma200_arr[-1]) else 0
+
     price_12m = float(close[-252]) if n >= 252 else float(close[0])
     price_6m  = float(close[-126]) if n >= 126 else float(close[0])
     gain_12m  = (current_close / price_12m - 1) * 100 if price_12m > 0 else 0
@@ -413,204 +492,273 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
         current_close > ma150 and
         (gain_12m >= 30 or gain_6m >= 20)
     )
+    # MA stack chặt hơn (cho strict): price > MA50 > MA150 > MA200
+    ma_stack_ok = (
+        current_close > ma50 > 0 and
+        ma50 > ma150 > 0 and
+        ma150 > ma200 > 0
+    )
 
     if not uptrend_ok:
-        # Vẫn trả kết quả đầy đủ để frontend render
-        vol_ma30 = float(np.mean(volume[-30:])) if len(volume) >= 30 else 1.0
-        vol_ratio = float(volume[-1]) / vol_ma30 if vol_ma30 > 0 else 0
-        return {
-            "is_vcp": False,
-            "contracting": False,
-            "vol_contracting": False,
-            "uptrend_ok": False,
-            "tightness": 0.0,
-            "pivot_buy": 0.0,
-            "near_pivot": False,
-            "vol_ratio": round(vol_ratio, 2),
-            "vol_confirmed": vol_ratio >= 1.3,
-            "segments": 0,
-            "t_count": 0,
-            "base_depth": 0.0,
-            "base_length": 0,
-            "stage": "no_uptrend",
-        }
+        return _empty_vcp_result("no_uptrend", uptrend_ok=False)
 
     # ══════════════════════════════════════════════════════════════════════
-    # TÌM BASE PATTERN — scan 200 ngày gần nhất (covers most VCP bases)
+    # BASE PATTERN — scan 200 ngày gần nhất
     # ══════════════════════════════════════════════════════════════════════
     base_window = min(200, n)
     b_close = close[-base_window:]
     b_high  = high[-base_window:]
     b_low   = low[-base_window:]
     b_vol   = volume[-base_window:]
+    base_offset_global = n - base_window  # idx(local) + offset = idx(global df)
 
-    # Tìm đỉnh cao nhất trong base → đó là khởi đầu base (left side)
-    base_high_idx = int(np.argmax(b_high))
-    base_high_price = float(b_high[base_high_idx])
+    base_high_idx_local = int(np.argmax(b_high))
+    base_high_price     = float(b_high[base_high_idx_local])
+    base_low_price      = float(np.min(b_low[base_high_idx_local:]))
+    base_depth          = (base_high_price - base_low_price) / base_high_price * 100
+    base_length         = base_window - base_high_idx_local
+    base_start_global   = base_offset_global + base_high_idx_local
 
-    # Base depth = max drawdown từ đỉnh
-    base_low_price = float(np.min(b_low[base_high_idx:]))
-    base_depth = (base_high_price - base_low_price) / base_high_price * 100
-
-    # Base length (từ đỉnh đến hiện tại)
-    base_length = base_window - base_high_idx
-
-    # Filter: base depth hợp lý (Minervini: typical 10-35%, max 50%)
-    # TTCK VN volatile hơn → cho phép tới 50%
     if base_depth > 50 or base_depth < 8:
-        vol_ma30 = float(np.mean(b_vol[-30:])) if len(b_vol) >= 30 else 1.0
-        vol_ratio = float(b_vol[-1]) / vol_ma30 if vol_ma30 > 0 else 0
-        return {
-            "is_vcp": False,
-            "contracting": False,
-            "vol_contracting": False,
-            "uptrend_ok": True,
-            "tightness": round(base_depth, 2),
-            "pivot_buy": 0.0,
-            "near_pivot": False,
-            "vol_ratio": round(vol_ratio, 2),
-            "vol_confirmed": vol_ratio >= 1.3,
-            "segments": 0,
-            "t_count": 0,
-            "base_depth": round(base_depth, 2),
-            "base_length": base_length,
-            "stage": "base_too_deep" if base_depth > 50 else "base_too_shallow",
-        }
+        return _empty_vcp_result(
+            "base_too_deep" if base_depth > 50 else "base_too_shallow",
+            uptrend_ok=True,
+            base_depth=round(base_depth, 2),
+            base_length=base_length,
+            base_start_date=_idx_to_date(base_start_global),
+        )
 
     # ══════════════════════════════════════════════════════════════════════
-    # SWING POINT DETECTION — Tìm pivot highs/lows thực sự
+    # SWING POINTS + CONTRACTIONS
     # ══════════════════════════════════════════════════════════════════════
-    # Fix A: order=5 cho phần đầu base, tự động giảm xuống order=2
-    # ở 30% cuối base để bắt được "tay cầm" (handle) ngắn hạn.
-    analysis_high = b_high[base_high_idx:]
-    analysis_low  = b_low[base_high_idx:]
-    analysis_vol  = b_vol[base_high_idx:]
+    analysis_high  = b_high[base_high_idx_local:]
+    analysis_low   = b_low[base_high_idx_local:]
+    analysis_vol   = b_vol[base_high_idx_local:]
+    analysis_close = b_close[base_high_idx_local:]
+    analysis_offset_global = base_start_global  # = base_offset_global + base_high_idx_local
 
     swing_highs, swing_lows = _find_swing_points(analysis_high, analysis_low, order=5)
 
-    # ══════════════════════════════════════════════════════════════════════
-    # XÁC ĐỊNH CONTRACTIONS (T-count)
-    # ══════════════════════════════════════════════════════════════════════
-    # Tính vol_ma50 cho toàn bộ analysis zone — dùng làm benchmark cạn cung
-    vol_ma50_val = float(np.mean(analysis_vol[-50:])) if len(analysis_vol) >= 50 else float(np.mean(analysis_vol))
+    # vol_ma50 phải tính trên TOÀN dataset, không phải chỉ analysis_vol
+    vol_ma50_full = float(pd.Series(volume).rolling(50).mean().iloc[-1]) if n >= 50 else float(np.mean(volume))
+    if np.isnan(vol_ma50_full) or vol_ma50_full <= 0:
+        vol_ma50_full = float(np.mean(volume))
 
-    # Fix B+C: _find_contractions giờ lọc bằng duration (không depth),
-    # và đo volume tại trough thay vì trung bình toàn nhịp
-    contractions = _find_contractions(swing_highs, swing_lows, analysis_vol, vol_ma50_val)
-
+    contractions = _find_contractions(
+        swing_highs, swing_lows, analysis_vol, analysis_close, vol_ma50_full,
+    )
     t_count = len(contractions)
 
     # ══════════════════════════════════════════════════════════════════════
-    # KIỂM TRA VCP CONDITIONS
+    # PAIR-WISE REDUCTION ANALYSIS
     # ══════════════════════════════════════════════════════════════════════
-    # 1) Contracting: biên độ thu hẹp tổng thể
-    # Minervini core: contraction ĐẦU phải sâu hơn contraction CUỐI đáng kể.
-    # Cho phép micro-swing cùng depth (handle zone) miễn xu hướng tổng thể giảm.
-    contracting = False
-    if t_count >= 2:
-        first_depth = contractions[0]["depth"]
-        last_depth = contractions[-1]["depth"]
-        # Điều kiện chính: depth giảm ít nhất 40% từ T1 đến T cuối
-        overall_contraction = last_depth < first_depth * 0.6
-        # Hoặc: pair-wise check truyền thống (cho phép violations)
-        violations = 0
-        for i in range(t_count - 1):
-            if contractions[i + 1]["depth"] >= contractions[i]["depth"] * 1.05:
-                violations += 1
-        max_violations = t_count // 2  # cho phép ~50% violations (micro-swings)
-        pairwise_ok = violations <= max_violations
-        contracting = overall_contraction or pairwise_ok
+    # Mỗi cặp consecutive: reduction% = (T_i.depth - T_{i+1}.depth) / T_i.depth × 100
+    # STRICT: tất cả reductions ≥ 50%
+    # LOOSE: tối đa 1 violation (T_{i+1}.depth >= T_i.depth, tức reduction <= 0)
+    pair_reductions = []
+    for i in range(t_count - 1):
+        d1 = contractions[i]["depth"]
+        d2 = contractions[i + 1]["depth"]
+        reduction = (d1 - d2) / d1 * 100 if d1 > 0 else 0
+        pair_reductions.append(reduction)
+        contractions[i + 1]["reduction_from_prev_pct"] = round(reduction, 1)
 
-    # 2) Volume dry-up: kiểm tra volume tại trough giảm dần
-    # Fix C: Dùng is_volume_dry từ _find_contractions (đo tại đáy vs MA50)
-    vol_contracting = False
-    if t_count >= 2:
-        # Cách 1: Ít nhất contraction cuối phải cạn cung
-        last_dry = contractions[-1].get("is_volume_dry", False)
-        # Cách 2: Trough volume giảm dần qua các contraction
-        trough_vols = [c.get("trough_avg_vol", 0) for c in contractions]
-        if trough_vols:
-            vol_violations = 0
-            for i in range(len(trough_vols) - 1):
-                if trough_vols[i + 1] > trough_vols[i] * 1.2:  # cho phép 20% tolerance
-                    vol_violations += 1
-            # Cạn cung nếu: trough vol giảm dần HOẶC nhịp cuối cạn cung rõ ràng
-            vol_contracting = (vol_violations == 0) or last_dry
+    strict_pairwise_ok = bool(pair_reductions) and all(r >= 50 for r in pair_reductions)
+    loose_violations = sum(1 for r in pair_reductions if r < 0)
+    loose_pairwise_ok = loose_violations <= 1
+    overall_loose_ok = (
+        t_count >= 2 and
+        contractions[-1]["depth"] < contractions[0]["depth"] * 0.6
+    )
+    contracting_strict = strict_pairwise_ok
+    contracting_loose  = loose_pairwise_ok or overall_loose_ok
 
-    # 3) Tightness: contraction cuối (hoặc khoảng 10 ngày gần nhất)
-    if t_count >= 1:
-        tightness = contractions[-1]["depth"]
+    # ══════════════════════════════════════════════════════════════════════
+    # VOLUME CONTRACTION
+    # ══════════════════════════════════════════════════════════════════════
+    last_dry = contractions[-1]["is_volume_dry"] if t_count >= 1 else False
+    trough_vols = [c["trough_avg_vol"] for c in contractions]
+    vol_decline_violations = 0
+    for i in range(len(trough_vols) - 1):
+        if trough_vols[i + 1] > trough_vols[i] * 1.1:   # tolerance 10% (chặt hơn 20% cũ)
+            vol_decline_violations += 1
+    vol_decreasing = vol_decline_violations == 0
+
+    # STRICT: PHẢI cả 2: trough volume giảm dần AND handle khô
+    vol_contracting_strict = vol_decreasing and last_dry and t_count >= 2
+    # LOOSE: 1 trong 2
+    vol_contracting_loose  = (vol_decreasing or last_dry) and t_count >= 2
+
+    # DOWN/UP volume tổng thể trong base (institutional accumulation)
+    total_up_vol   = sum(c["up_vol_sum"]   for c in contractions)
+    total_down_vol = sum(c["down_vol_sum"] for c in contractions)
+    base_down_up_ratio = total_down_vol / total_up_vol if total_up_vol > 0 else 999.0
+    healthy_supply_demand = base_down_up_ratio < 1.0   # Minervini: down vol < up vol
+
+    # ══════════════════════════════════════════════════════════════════════
+    # HOLD ABOVE MA50 IN 2ND HALF OF BASE
+    # ══════════════════════════════════════════════════════════════════════
+    second_half_start = base_high_idx_local + max(base_length // 2, 1)
+    if second_half_start < base_window:
+        prices_2h = b_close[second_half_start:]
+        ma50_in_base = ma50_arr[-base_window:][second_half_start:]
+        valid_pairs = [(p, m) for p, m in zip(prices_2h, ma50_in_base) if not np.isnan(m)]
+        if valid_pairs:
+            days_above = sum(1 for p, m in valid_pairs if p >= m)
+            hold_ratio = days_above / len(valid_pairs)
+            hold_above_ma50 = hold_ratio >= 0.7
+        else:
+            hold_above_ma50 = False
     else:
-        # Fallback: biên 20 ngày gần nhất
+        hold_above_ma50 = True   # base ngắn quá, không penalty
+
+    # ══════════════════════════════════════════════════════════════════════
+    # TIGHTNESS, HANDLE, PIVOT, STOP LOSS
+    # ══════════════════════════════════════════════════════════════════════
+    if t_count >= 1:
+        last_c       = contractions[-1]
+        tightness    = last_c["depth"]
+        handle_low   = last_c["low_price"]
+        handle_dur   = last_c["duration"]
+        # Pivot = max(đỉnh handle, đỉnh 10 phiên gần nhất)
+        recent_high  = float(np.max(b_high[-10:])) if len(b_high) >= 10 else last_c["high_price"]
+        pivot_high   = max(last_c["high_price"], recent_high)
+    else:
         recent_h = float(np.max(b_high[-20:]))
         recent_l = float(np.min(b_low[-20:]))
-        tightness = (recent_h - recent_l) / recent_h * 100 if recent_h > 0 else 0
+        tightness   = (recent_h - recent_l) / recent_h * 100 if recent_h > 0 else 0
+        handle_low  = recent_l
+        handle_dur  = 0
+        pivot_high  = recent_h
 
-    # 4) Pivot buy point
-    if t_count >= 1:
-        # Pivot = đỉnh contraction cuối cùng + 0.5%
-        pivot_buy = round(contractions[-1]["high_price"] * 1.005, 2)
-    else:
-        # Fallback: đỉnh 20 ngày + 0.5%
-        pivot_buy = round(float(np.max(b_high[-20:])) * 1.005, 2)
+    pivot_buy = round(pivot_high, 2)
+    stop_loss = round(handle_low * 0.985, 2)   # -1.5% dưới handle low
 
-    # Giá hiện tại so với pivot (signed: âm = dưới pivot, dương = trên pivot)
     diff_pivot_pct = (current_close - pivot_buy) / pivot_buy * 100 if pivot_buy > 0 else 0
-    near_pivot = abs(diff_pivot_pct) < 3 if pivot_buy > 0 else False
+    near_pivot  = abs(diff_pivot_pct) < 3 if pivot_buy > 0 else False
     above_pivot = diff_pivot_pct > 0 if pivot_buy > 0 else False
 
-    # 5) Volume ratio hiện tại
-    vol_ma30 = float(np.mean(b_vol[-30:])) if len(b_vol) >= 30 else 1.0
-    current_vol = float(b_vol[-1])
-    vol_ratio = current_vol / vol_ma30 if vol_ma30 > 0 else 0
+    # ══════════════════════════════════════════════════════════════════════
+    # VOLUME RATIO HIỆN TẠI (vs MA50 toàn dataset)
+    # ══════════════════════════════════════════════════════════════════════
+    current_vol = float(volume[-1])
+    vol_ratio_ma50 = current_vol / vol_ma50_full if vol_ma50_full > 0 else 0
+    # Backward compat: vol_ratio so với MA30 trong base
+    vol_ma30_local = float(np.mean(b_vol[-30:])) if len(b_vol) >= 30 else 1.0
+    vol_ratio_legacy = current_vol / vol_ma30_local if vol_ma30_local > 0 else 0
+    vol_confirmed_strict = vol_ratio_ma50 >= 1.5
+    vol_confirmed_loose  = vol_ratio_ma50 >= 1.3
 
     # ══════════════════════════════════════════════════════════════════════
-    # FINAL VCP VERDICT
+    # FINAL VCP VERDICT — STRICT vs LOOSE
     # ══════════════════════════════════════════════════════════════════════
-    # Chuẩn Minervini:
-    #   - T-count >= 2 (ít nhất 2 contractions)
-    #   - Contracting (depth giảm dần)
-    #   - Tightness cuối < 15% (lý tưởng < 10%)
-    #   - Volume dry-up
-    #   - Uptrend (đã check ở trên)
-    #   - Base length 15-325 days (3-65 tuần)
-    is_vcp = (
-        t_count >= 2 and
-        contracting and
-        tightness < 15 and
-        uptrend_ok and
-        15 <= base_length <= 325
+    is_vcp_strict = (
+        uptrend_ok and ma_stack_ok and
+        t_count >= 3 and
+        contracting_strict and
+        tightness < 8 and
+        handle_dur >= 5 and
+        vol_contracting_strict and
+        healthy_supply_demand and
+        hold_above_ma50 and
+        base_length >= 35
     )
 
-    # Stage classification chi tiết hơn
-    if is_vcp and above_pivot:
-        stage = "breakout"      # VCP đã vượt pivot → đang breakout (mua xác nhận)
-    elif is_vcp and near_pivot:
-        stage = "vcp_pivot"     # VCP hoàn chỉnh + gần pivot → sẵn sàng breakout
-    elif is_vcp:
-        stage = "vcp"           # VCP hoàn chỉnh, chờ tiến vào pivot
-    elif t_count >= 2 and contracting:
-        stage = "contracting"   # Đang co lại nhưng chưa đủ tight
-    elif uptrend_ok and base_depth <= 50:
-        stage = "base_forming"  # Uptrend, base đang hình thành
-    else:
-        stage = "no_pattern"
+    is_vcp_loose = (
+        uptrend_ok and
+        t_count >= 2 and
+        contracting_loose and
+        tightness < 12 and
+        handle_dur >= 3 and
+        vol_contracting_loose and
+        base_length >= 25
+    )
+
+    # Stage classification per mode
+    def _stage(is_v: bool) -> str:
+        if is_v and above_pivot: return "breakout"
+        if is_v and near_pivot:  return "vcp_pivot"
+        if is_v:                 return "vcp"
+        if t_count >= 2 and (contracting_loose):  return "contracting"
+        if uptrend_ok and base_depth <= 50:       return "base_forming"
+        return "no_pattern"
+
+    stage_strict = _stage(is_vcp_strict)
+    stage_loose  = _stage(is_vcp_loose)
+
+    # ══════════════════════════════════════════════════════════════════════
+    # CONTRACTIONS METADATA — cho frontend chart annotations
+    # ══════════════════════════════════════════════════════════════════════
+    contractions_out = []
+    for i, c in enumerate(contractions):
+        gh_idx = analysis_offset_global + c["high_idx"]
+        gl_idx = analysis_offset_global + c["low_idx"]
+        # Reduction so với T trước (T1 không có)
+        red_prev = c.get("reduction_from_prev_pct")
+        passes_strict = red_prev is None or red_prev >= 50   # T1 luôn pass
+        passes_loose  = red_prev is None or red_prev >= 0
+        contractions_out.append({
+            "t_index":        i + 1,
+            "high_idx":       gh_idx,
+            "high_price":     round(c["high_price"], 2),
+            "low_idx":        gl_idx,
+            "low_price":      round(c["low_price"], 2),
+            "depth_pct":      round(c["depth"], 2),
+            "duration_bars":  c["duration"],
+            "trough_avg_vol": int(c["trough_avg_vol"]),
+            "is_volume_dry":  c["is_volume_dry"],
+            "down_up_ratio":  round(c["down_up_ratio"], 2),
+            "reduction_from_prev_pct": round(red_prev, 1) if red_prev is not None else None,
+            "passes_strict_reduction": passes_strict,
+            "passes_loose_reduction":  passes_loose,
+            "date_high":      _idx_to_date(gh_idx),
+            "date_low":       _idx_to_date(gl_idx),
+        })
+
+    pivot_date = (
+        contractions_out[-1]["date_high"] if contractions_out
+        else _idx_to_date(n - 1)
+    )
 
     return {
-        "is_vcp":          is_vcp,
-        "contracting":     contracting,
-        "vol_contracting": vol_contracting,
+        # ── Legacy (default = loose for backward compat) ──────────────────
+        "is_vcp":          is_vcp_loose,
+        "stage":           stage_loose,
+        "contracting":     contracting_loose,
+        "vol_contracting": vol_contracting_loose,
+        "vol_ratio":       round(vol_ratio_legacy, 2),
+        "vol_confirmed":   vol_confirmed_loose,
+        "segments":        t_count,
+
+        # ── New: dual-mode flags ──────────────────────────────────────────
+        "is_vcp_strict":   is_vcp_strict,
+        "is_vcp_loose":    is_vcp_loose,
+        "stage_strict":    stage_strict,
+        "stage_loose":     stage_loose,
+        "vol_confirmed_strict": vol_confirmed_strict,
+
+        # ── Common metrics ────────────────────────────────────────────────
         "uptrend_ok":      uptrend_ok,
+        "ma_stack_ok":     ma_stack_ok,
         "tightness":       round(tightness, 2),
         "pivot_buy":       pivot_buy,
         "near_pivot":      near_pivot,
-        "vol_ratio":       round(vol_ratio, 2),
-        "vol_confirmed":   vol_ratio >= 1.3,
-        "segments":        t_count,        # backward compat: segments → now = T-count
-        "t_count":         t_count,        # new: explicit T-count
+        "above_pivot":     above_pivot,
+        "vol_ratio_ma50":  round(vol_ratio_ma50, 2),
+        "t_count":         t_count,
         "base_depth":      round(base_depth, 2),
         "base_length":     base_length,
-        "stage":           stage,
+        "stop_loss":       stop_loss,
+        "handle_low":      round(handle_low, 2),
+        "handle_duration": handle_dur,
+        "hold_above_ma50": hold_above_ma50,
+        "down_up_ratio":   round(base_down_up_ratio, 2),
+        "healthy_supply_demand": healthy_supply_demand,
+
+        # ── Detailed contractions for chart annotations ───────────────────
+        "contractions":      contractions_out,
+        "base_start_date":   _idx_to_date(base_start_global),
+        "pivot_date":        pivot_date,
     }
 
 
