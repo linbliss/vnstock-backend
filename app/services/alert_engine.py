@@ -7,14 +7,14 @@ Chức năng:
   CL. Cảnh báo Cutloss: giá ≤ anchor × (1 − threshold%)
   TR. Trailing anchor: cuối phiên (15:01–15:30) cập nhật anchor lên nếu giá đóng cửa cao hơn
 
-Dữ liệu đọc từ Supabase:
+Dữ liệu đọc từ SQLite (qua user_store):
   • user_settings.settings.alert         — cutloss enabled, threshold, buyPoint, sepaMinScore
   • user_settings.settings.anchorPrices  — anchor prices (auto trailing)
   • user_settings.settings.holdingSettings — per-ticker anchor_price, cutloss_pct
   • watchlist_items                       — ticker, alert_price
   • trades                                — tính FIFO holdings
 
-Backend ghi lại Supabase sau trailing:
+Ghi lại SQLite sau trailing:
   • user_settings.settings.anchorPrices  — giá neo mới
   • user_settings.settings.holdingSettings — anchor thủ công đã trailing
 """
@@ -506,7 +506,7 @@ async def _trail_anchors(state: _UserState):
     if not updated:
         return
 
-    # Ghi lại Supabase
+    # Ghi lại SQLite
     current = await _load_settings(state.uid)
     current["anchorPrices"]    = anchors
     current["holdingSettings"] = hs

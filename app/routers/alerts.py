@@ -42,7 +42,7 @@ async def test_alert():
 
 @router.get("/status")
 async def alert_status():
-    """Trả về trạng thái alert engine — alerts được quản lý qua Supabase watchlist_items."""
+    """Trả về trạng thái alert engine — alerts được quản lý qua SQLite watchlist_items."""
     from app.services.alert_engine import _states
     return {
         "engine": "running",
