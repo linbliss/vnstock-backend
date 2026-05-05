@@ -293,6 +293,8 @@ async def _check_3a(state: _UserState):
         )
         await send_telegram(msg)
         state.set_cooldown("3a", ticker)
+        reason = f"Giá {_fp(price)} {'≥' if price >= alert_p else '≈'} ngưỡng {_fp(alert_p)} (cách {diff_pct:.1f}%)"
+        user_store.log_alert(state.uid, ticker, "3a_buy", reason, msg)
         print(f"🎯 3A alert {ticker}: {_fp(price)} ~ {_fp(alert_p)}")
 
 # ── 3B: VCP breakout + SEPA ───────────────────────────────────────────────────
@@ -397,6 +399,9 @@ async def _check_3b(state: _UserState):
         )
         await send_telegram(msg)
         state.vcp_state[ticker] = {"count": count, "last_sent": now}
+        zone_short = "Breakout" if diff_pct >= 0 else "Near pivot"
+        reason = f"VCP {zone_short} – Giá {_fp(price)}, Pivot {_fp(pivot_vnd)}, Vol {vol_ratio:.1f}x, SEPA {score}/8"
+        user_store.log_alert(state.uid, ticker, "3b_vcp", reason, msg)
         print(f"🟢 3B VCP {ticker}: {_fp(price)} pivot={_fp(pivot_buy)} sepa={score}/8")
 
 # ── Cutloss ───────────────────────────────────────────────────────────────────
@@ -446,6 +451,8 @@ async def _check_cutloss(state: _UserState):
         )
         await send_telegram(msg)
         state.set_cooldown("cutloss", ticker)
+        reason = f"Giá {_fp(price)} thủng ngưỡng cutloss {_fp(cl_price)} (neo {_fp(anchor)}, -{cl_pct:.0f}%, thủng {gap_pct:.1f}%)"
+        user_store.log_alert(state.uid, ticker, "cutloss", reason, msg)
         print(f"⚠️ Cutloss {ticker}: {_fp(price)} ≤ {_fp(cl_price)}")
 
 # ── Trailing anchor (15:01–15:30, 1 lần/ngày) ────────────────────────────────

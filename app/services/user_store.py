@@ -106,14 +106,35 @@ def init_db() -> None:
                 FOREIGN KEY (user_id) REFERENCES users(id)
             );
 
+            CREATE TABLE IF NOT EXISTS alert_log (
+                id         TEXT PRIMARY KEY,
+                user_id    TEXT NOT NULL,
+                ticker     TEXT NOT NULL,
+                alert_type TEXT NOT NULL,   -- '3a_buy' | '3b_vcp' | 'cutloss'
+                reason     TEXT NOT NULL,   -- tóm tắt 1 dòng
+                detail     TEXT NOT NULL DEFAULT '',  -- chi tiết đầy đủ
+                sent_at    TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_trades_user     ON trades(user_id);
             CREATE INDEX IF NOT EXISTS idx_accounts_user   ON broker_accounts(user_id);
             CREATE INDEX IF NOT EXISTS idx_watchlists_user ON watchlists(user_id);
             CREATE INDEX IF NOT EXISTS idx_wl_items_wl     ON watchlist_items(watchlist_id);
+            CREATE INDEX IF NOT EXISTS idx_alert_log_user  ON alert_log(user_id, sent_at);
             """
         )
 
         # Migrations for existing DBs
+        try: conn.execute(
+            "CREATE TABLE IF NOT EXISTS alert_log ("
+            "  id TEXT PRIMARY KEY, user_id TEXT NOT NULL, ticker TEXT NOT NULL,"
+            "  alert_type TEXT NOT NULL, reason TEXT NOT NULL,"
+            "  detail TEXT NOT NULL DEFAULT '', sent_at TEXT NOT NULL)"
+        )
+        except Exception: pass
+        try: conn.execute("CREATE INDEX IF NOT EXISTS idx_alert_log_user ON alert_log(user_id, sent_at)")
+        except Exception: pass
         try: conn.execute("ALTER TABLE broker_accounts ADD COLUMN account_name TEXT NOT NULL DEFAULT ''")
         except Exception: pass
         try: conn.execute("ALTER TABLE broker_accounts ADD COLUMN account_number TEXT NOT NULL DEFAULT ''")
@@ -511,3 +532,36 @@ def save_user_settings(user_id: str, settings_dict: dict) -> None:
                  settings=excluded.settings, updated_at=excluded.updated_at""",
             (user_id, json.dumps(settings_dict, ensure_ascii=False), now),
         )
+
+
+# ── Alert Log ─────────────────────────────────────────────────────────────────
+
+def log_alert(user_id: str, ticker: str, alert_type: str, reason: str, detail: str = "") -> None:
+    """Ghi lại 1 cảnh báo đã gửi. Giữ tối đa 200 bản ghi / user."""
+    lid = uuid.uuid4().hex
+    now = _now()
+    with _lock, _connect() as conn:
+        conn.execute(
+            "INSERT INTO alert_log(id, user_id, ticker, alert_type, reason, detail, sent_at)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (lid, user_id, ticker.upper(), alert_type, reason, detail, now),
+        )
+        # Giữ tối đa 200 bản ghi / user
+        conn.execute(
+            """DELETE FROM alert_log WHERE user_id=? AND id NOT IN (
+                SELECT id FROM alert_log WHERE user_id=? ORDER BY sent_at DESC LIMIT 200
+            )""",
+            (user_id, user_id),
+        )
+
+
+def get_recent_alerts(user_id: str, limit: int = 30) -> List[dict]:
+    """Trả về cảnh báo gần nhất, mới nhất trước."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """SELECT id, ticker, alert_type, reason, detail, sent_at
+               FROM alert_log WHERE user_id=?
+               ORDER BY sent_at DESC LIMIT ?""",
+            (user_id, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]

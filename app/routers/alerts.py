@@ -1,7 +1,9 @@
 import os
 import httpx
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
+from app.routers.auth import get_current_user
+from app.services import user_store
 
 router = APIRouter()
 
@@ -21,6 +23,15 @@ async def send_telegram(text: str) -> bool:
     except Exception as e:
         print(f"Telegram error: {e}")
         return False
+
+@router.get("/log")
+def get_alert_log(
+    limit: int = 30,
+    current_user: dict = Depends(get_current_user),
+):
+    """Lấy lịch sử cảnh báo đã gửi gần nhất."""
+    return user_store.get_recent_alerts(current_user["id"], limit=min(limit, 100))
+
 
 @router.get("/test")
 async def test_alert():
