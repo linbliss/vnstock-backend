@@ -689,12 +689,10 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
         return _empty_vcp_result("no_uptrend", uptrend_ok=False)
 
     # ══════════════════════════════════════════════════════════════════════
-    # BASE PATTERN — scan FULL 200 ngày, KHÔNG cắt từ peak max
+    # BASE PATTERN — scan 200 ngày gần nhất
+    # Robust base detection: ưu tiên đỉnh local 100 ngày gần nhất nếu nó
+    # >= 95% overall max → tránh climax cũ "ăn" mất base hiện tại
     # ══════════════════════════════════════════════════════════════════════
-    # CRITICAL: Code cũ cắt analysis_zone từ argmax(b_high) → mọi contraction
-    # TRƯỚC peak max bị mất. Trong uptrend (GMD/MBB/PHR), peak max thường là
-    # đỉnh gần nhất → tất cả T trước đó bị xóa → chỉ còn T cuối làm "T1".
-    # Fix: Scan zigzag trên TOÀN base_window, lọc contractions theo thời gian.
     base_window = min(200, n)
     b_close = close[-base_window:]
     b_high  = high[-base_window:]
@@ -702,71 +700,64 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
     b_vol   = volume[-base_window:]
     base_offset_global = n - base_window  # idx(local) + offset = idx(global df)
 
-    # Sanity check: overall drawdown trong 200 ngày (loại bear market sâu)
     overall_max_idx   = int(np.argmax(b_high))
     overall_max_price = float(b_high[overall_max_idx])
-    overall_low       = float(np.min(b_low[overall_max_idx:]))
-    overall_drawdown  = (overall_max_price - overall_low) / overall_max_price * 100
-    if overall_drawdown > 60:
-        return _empty_vcp_result(
-            "base_too_deep",
-            uptrend_ok=True,
-            base_depth=round(overall_drawdown, 2),
-            base_length=base_window - overall_max_idx,
-        )
 
-    # vol_ma50 trên TOÀN dataset (không phải chỉ analysis_vol)
-    vol_ma50_full = float(pd.Series(volume).rolling(50).mean().iloc[-1]) if n >= 50 else float(np.mean(volume))
-    if np.isnan(vol_ma50_full) or vol_ma50_full <= 0:
-        vol_ma50_full = float(np.mean(volume))
-
-    # ══════════════════════════════════════════════════════════════════════
-    # SWING POINTS + CONTRACTIONS — scan toàn 200 ngày
-    # ══════════════════════════════════════════════════════════════════════
-    swing_highs, swing_lows = _zigzag_swings(b_high, b_low, threshold_pct=2.0)
-
-    all_contractions = _find_contractions(
-        swing_highs, swing_lows, b_vol, b_close, vol_ma50_full,
-    )
-
-    # Lọc contractions theo thời gian: chỉ giữ những cái có low_idx
-    # trong 150 phiên gần nhất (~7 tháng) → loại contractions từ chu kỳ cũ
-    RECENT_LOOKBACK = 150
-    cutoff_idx = max(0, base_window - RECENT_LOOKBACK)
-    contractions = [c for c in all_contractions if c["low_idx"] >= cutoff_idx]
-    t_count = len(contractions)
-
-    # Base properties: tính từ FIRST contraction (start of VCP base)
-    if t_count >= 1:
-        base_high_idx_local = contractions[0]["high_idx"]
-        base_high_price     = contractions[0]["high_price"]
-        base_length         = base_window - base_high_idx_local
-        base_start_global   = base_offset_global + base_high_idx_local
-        # base_depth = max contraction depth (= T1 thường là sâu nhất)
-        base_depth = max(c["depth"] for c in contractions)
+    # Tìm đỉnh trong 100 ngày gần nhất (đỉnh "fresh")
+    if base_window >= 100:
+        recent_window = b_high[-100:]
+        recent_offset = base_window - 100
+        recent_high_idx_local = int(np.argmax(recent_window)) + recent_offset
     else:
-        # Không có contraction nào → fallback dùng peak max
+        recent_high_idx_local = overall_max_idx
+    recent_high_price = float(b_high[recent_high_idx_local])
+
+    # Nếu đỉnh recent gần bằng overall max (≥95%) → dùng recent (base mới đang hình thành)
+    # Ngược lại dùng overall max (chưa break đỉnh cũ → vẫn trong base cũ)
+    if recent_high_price >= overall_max_price * 0.95:
+        base_high_idx_local = recent_high_idx_local
+        base_high_price     = recent_high_price
+    else:
         base_high_idx_local = overall_max_idx
         base_high_price     = overall_max_price
-        base_length         = base_window - overall_max_idx
-        base_start_global   = base_offset_global + overall_max_idx
-        base_depth          = overall_drawdown
 
-    # Filter base_depth quá nông (không có contraction thực sự)
-    if base_depth < 8:
+    base_low_price    = float(np.min(b_low[base_high_idx_local:]))
+    base_depth        = (base_high_price - base_low_price) / base_high_price * 100
+    base_length       = base_window - base_high_idx_local
+    base_start_global = base_offset_global + base_high_idx_local
+
+    if base_depth > 50 or base_depth < 8:
         return _empty_vcp_result(
-            "base_too_shallow",
+            "base_too_deep" if base_depth > 50 else "base_too_shallow",
             uptrend_ok=True,
             base_depth=round(base_depth, 2),
             base_length=base_length,
             base_start_date=_idx_to_date(base_start_global),
         )
 
-    # Để hold_above_ma50 và metadata indices reference vào b_close,
-    # analysis_offset_global giờ = base_offset_global (toàn base window)
-    analysis_offset_global = base_offset_global
-    analysis_close = b_close
-    analysis_vol   = b_vol
+    # ══════════════════════════════════════════════════════════════════════
+    # SWING POINTS + CONTRACTIONS
+    # ══════════════════════════════════════════════════════════════════════
+    analysis_high  = b_high[base_high_idx_local:]
+    analysis_low   = b_low[base_high_idx_local:]
+    analysis_vol   = b_vol[base_high_idx_local:]
+    analysis_close = b_close[base_high_idx_local:]
+    analysis_offset_global = base_start_global  # = base_offset_global + base_high_idx_local
+
+    # ZigZag swing detection — threshold 2% (bắt cả handle tight 2-3%)
+    # Khác fractal: confirm swing khi đảo chiều ≥ threshold% từ pivot,
+    # tự nhiên align với "contraction depth" → không bỏ sót swings sát nhau
+    swing_highs, swing_lows = _zigzag_swings(analysis_high, analysis_low, threshold_pct=2.0)
+
+    # vol_ma50 phải tính trên TOÀN dataset, không phải chỉ analysis_vol
+    vol_ma50_full = float(pd.Series(volume).rolling(50).mean().iloc[-1]) if n >= 50 else float(np.mean(volume))
+    if np.isnan(vol_ma50_full) or vol_ma50_full <= 0:
+        vol_ma50_full = float(np.mean(volume))
+
+    contractions = _find_contractions(
+        swing_highs, swing_lows, analysis_vol, analysis_close, vol_ma50_full,
+    )
+    t_count = len(contractions)
 
     # ══════════════════════════════════════════════════════════════════════
     # PAIR-WISE REDUCTION ANALYSIS
