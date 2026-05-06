@@ -71,6 +71,11 @@ jobs:
 
       - name: Deploy lên VPS qua SSH
         uses: appleboy/ssh-action@v1.0.3
+        env:
+          # Pass via env vars để tránh shell-injection khi message chứa quotes/brackets
+          COMMIT_SHA:    ${{ steps.commit_info.outputs.sha_short }}
+          COMMIT_MSG:    ${{ steps.commit_info.outputs.message }}
+          COMMIT_AUTHOR: ${{ steps.commit_info.outputs.author }}
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
@@ -78,11 +83,12 @@ jobs:
           port: ${{ secrets.VPS_PORT || '22' }}
           timeout: 120s
           script_stop: true    # Dừng nếu có lỗi bất kỳ
+          envs: COMMIT_SHA,COMMIT_MSG,COMMIT_AUTHOR
           script: |
             set -e
             echo "🚀 Deploy từ GitHub Actions bắt đầu..."
-            echo "   Commit: [${{ steps.commit_info.outputs.sha_short }}] ${{ steps.commit_info.outputs.message }}"
-            echo "   By: ${{ steps.commit_info.outputs.author }}"
+            echo "   Commit: [$COMMIT_SHA] $COMMIT_MSG"
+            echo "   By: $COMMIT_AUTHOR"
             echo ""
 
             # Chạy deploy script
@@ -93,10 +99,13 @@ jobs:
 
       - name: Thông báo deploy thành công
         if: success()
+        env:
+          COMMIT_SHA: ${{ steps.commit_info.outputs.sha_short }}
+          COMMIT_MSG: ${{ steps.commit_info.outputs.message }}
         run: |
           echo "✅ Deploy thành công!"
           echo "   Server: ${{ secrets.VPS_HOST }}"
-          echo "   Commit: [${{ steps.commit_info.outputs.sha_short }}] ${{ steps.commit_info.outputs.message }}"
+          echo "   Commit: [$COMMIT_SHA] $COMMIT_MSG"
 
       - name: Thông báo deploy thất bại
         if: failure()
