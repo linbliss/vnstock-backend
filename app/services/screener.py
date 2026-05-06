@@ -863,32 +863,32 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
 
     # ══════════════════════════════════════════════════════════════════════
     # SWING POINTS + CONTRACTIONS — scan toàn 200 ngày
+    # Pipeline diagnostics tracked for debug
     # ══════════════════════════════════════════════════════════════════════
-    swing_highs, swing_lows = _zigzag_swings(b_high, b_low, threshold_pct=2.0)
+    swing_highs_raw, swing_lows_raw = _zigzag_swings(b_high, b_low, threshold_pct=2.0)
 
     # REFINE swing positions: tìm extreme thực (max/min) giữa 2 swings adjacent
     # → H/L không bị "lệch" 2-3 bars do ZigZag confirm timing
-    swing_highs, swing_lows = _refine_swings(swing_highs, swing_lows, b_high, b_low)
+    swing_highs, swing_lows = _refine_swings(
+        swing_highs_raw, swing_lows_raw, b_high, b_low
+    )
 
-    all_contractions = _find_contractions(
+    contractions_walker = _find_contractions(
         swing_highs, swing_lows, b_vol, b_close, vol_ma50_full,
     )
 
     # MERGE: gộp T_{i+1} vào T_i nếu T_{i+1}.low ≤ T_i.low (continued drop)
-    # → 1 deep correction không bị tách thành nhiều mini-swings
-    all_contractions = _merge_continued_drops(all_contractions)
+    contractions_merged = _merge_continued_drops(contractions_walker)
 
     # Lọc theo thời gian: chỉ giữ contractions có low_idx ≥ cutoff (7 tháng gần)
     RECENT_LOOKBACK = 150
     cutoff_idx = max(0, base_window - RECENT_LOOKBACK)
-    contractions = [c for c in all_contractions if c["low_idx"] >= cutoff_idx]
+    contractions_recent = [c for c in contractions_merged if c["low_idx"] >= cutoff_idx]
 
     # CLUSTER filter: walk backwards từ T cuối, build cluster của những T
-    # gần thời gian + cùng resistance level. Stop khi gap > 35 bars hoặc
-    # height drop > 6% so với cluster max.
-    # → Loại T1 sớm trong rally (STB) + loại T cô lập về thời gian (TLD).
+    # gần thời gian + cùng resistance level
     contractions = _filter_to_recent_cluster(
-        contractions, max_gap_bars=35, min_high_ratio=0.94,
+        contractions_recent, max_gap_bars=35, min_high_ratio=0.94,
     )
 
     # Cap MAX 6 contractions (Minervini: 2-6 typical)
@@ -896,6 +896,43 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
     if len(contractions) > MAX_CONTRACTIONS:
         contractions = contractions[-MAX_CONTRACTIONS:]
     t_count = len(contractions)
+
+    # ── Build pipeline diagnostics ──
+    # Liệt kê những T bị drop ở từng filter step + lý do (cho debug)
+    _diag_dropped: List[dict] = []
+    final_ids = {(c["high_idx"], c["low_idx"]) for c in contractions}
+    for c in contractions_merged:
+        cid = (c["high_idx"], c["low_idx"])
+        if cid in final_ids:
+            continue
+        # Dropped — xác định lý do
+        if c["low_idx"] < cutoff_idx:
+            reason = f"recent_filter (low_idx={c['low_idx']} < cutoff={cutoff_idx})"
+        else:
+            # Bị cluster filter loại
+            if not contractions:
+                reason = "cluster_filter (no anchor)"
+            else:
+                cluster_first_high = contractions[0]["high_idx"]
+                cluster_max_high = max(cc["high_price"] for cc in contractions)
+                gap = cluster_first_high - c["low_idx"]
+                ratio = c["high_price"] / cluster_max_high if cluster_max_high > 0 else 0
+                if gap > 35:
+                    reason = f"cluster_gap ({gap} bars > 35)"
+                elif ratio < 0.94:
+                    reason = f"cluster_height ({c['high_price']:.2f}/{cluster_max_high:.2f}={ratio:.3f} < 0.94)"
+                else:
+                    reason = "cluster_other"
+        _diag_dropped.append({
+            "high_idx":   int(c["high_idx"]),
+            "low_idx":    int(c["low_idx"]),
+            "high_price": round(c["high_price"], 2),
+            "low_price":  round(c["low_price"], 2),
+            "depth_pct":  round(c["depth"], 2),
+            "date_high":  _idx_to_date(base_offset_global + c["high_idx"]),
+            "date_low":   _idx_to_date(base_offset_global + c["low_idx"]),
+            "reason":     reason,
+        })
 
     # Base properties: tính từ FIRST contraction (start of VCP base)
     if t_count >= 1:
@@ -1197,6 +1234,31 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
         "contractions":      contractions_out,
         "base_start_date":   _idx_to_date(base_start_global),
         "pivot_date":        pivot_date,
+
+        # ── Pipeline diagnostics — debug filter steps ─────────────────────
+        "_diagnostics": {
+            "raw_swing_highs_count":    len(swing_highs_raw),
+            "raw_swing_lows_count":     len(swing_lows_raw),
+            "after_walker_count":       len(contractions_walker),
+            "after_merge_count":        len(contractions_merged),
+            "after_recent_count":       len(contractions_recent),
+            "after_cluster_count":      len(contractions),
+            "cutoff_idx":               int(cutoff_idx),
+            "max_gap_bars":             35,
+            "min_high_ratio":           0.94,
+            "max_contractions_cap":     MAX_CONTRACTIONS,
+            "raw_swing_highs":          [
+                {"idx": int(i), "price": round(float(p), 2),
+                 "date": _idx_to_date(base_offset_global + int(i))}
+                for i, p in swing_highs_raw
+            ],
+            "raw_swing_lows":           [
+                {"idx": int(i), "price": round(float(p), 2),
+                 "date": _idx_to_date(base_offset_global + int(i))}
+                for i, p in swing_lows_raw
+            ],
+            "dropped_contractions":     _diag_dropped,
+        },
     }
 
 
