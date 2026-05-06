@@ -449,6 +449,66 @@ def _find_swing_points(high: np.ndarray, low: np.ndarray, order: int = 5) -> tup
     return _zigzag_swings(high, low, threshold_pct=2.0)
 
 
+def _refine_swings(
+    swing_highs: list, swing_lows: list,
+    high: np.ndarray, low: np.ndarray,
+) -> tuple:
+    """
+    Refine vị trí swing: tìm extreme THỰC SỰ (max/min absolute) trong khoảng
+    giữa 2 swings adjacent, thay vì pivot do ZigZag confirm.
+
+    Lý do:
+    ZigZag confirm swing khi reversal ≥ threshold. Sau khi confirm SH ở bar K,
+    bar K+1, K+2 có thể vẫn cao hơn (rebound trong down-leg) nhưng KHÔNG
+    được track vì đã chuyển trend='down'. → Swing vị trí không phải đỉnh thực.
+
+    Refine: với mỗi swing high/low, search trong [prev_swing_idx, next_swing_idx]
+    cho true max/min của high/low array → cập nhật idx và price.
+
+    Constraint: H-L-H-L alternation được preserve (search trong adjacent bounds).
+    """
+    if not swing_highs and not swing_lows:
+        return swing_highs, swing_lows
+
+    # Merge events theo idx, label H/L để biết loại
+    events = sorted(
+        [(i, p, 'H', k) for k, (i, p) in enumerate(swing_highs)] +
+        [(i, p, 'L', k) for k, (i, p) in enumerate(swing_lows)],
+        key=lambda x: x[0],
+    )
+
+    refined_h: list = list(swing_highs)
+    refined_l: list = list(swing_lows)
+
+    n = len(high)
+    for j, (idx, _p, typ, orig_k) in enumerate(events):
+        # Bound search: từ swing trước → swing sau
+        prev_idx = events[j - 1][0] + 1 if j > 0 else 0
+        next_idx = events[j + 1][0] - 1 if j < len(events) - 1 else n - 1
+        if next_idx < prev_idx:
+            continue
+
+        if typ == 'H':
+            seg = high[prev_idx : next_idx + 1]
+            if len(seg) == 0:
+                continue
+            local_max_idx = int(np.argmax(seg)) + prev_idx
+            local_max_val = float(high[local_max_idx])
+            refined_h[orig_k] = (local_max_idx, local_max_val)
+        else:   # 'L'
+            seg = low[prev_idx : next_idx + 1]
+            if len(seg) == 0:
+                continue
+            local_min_idx = int(np.argmin(seg)) + prev_idx
+            local_min_val = float(low[local_min_idx])
+            refined_l[orig_k] = (local_min_idx, local_min_val)
+
+    # Sort lại theo idx (do refined có thể đã shift)
+    refined_h.sort(key=lambda x: x[0])
+    refined_l.sort(key=lambda x: x[0])
+    return refined_h, refined_l
+
+
 def _merge_continued_drops(contractions: list) -> list:
     """
     Merge T_{i+1} vào T_i nếu T_{i+1}.low ≤ T_i.low.
@@ -762,6 +822,10 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
     # ══════════════════════════════════════════════════════════════════════
     swing_highs, swing_lows = _zigzag_swings(b_high, b_low, threshold_pct=2.0)
 
+    # REFINE swing positions: tìm extreme thực (max/min) giữa 2 swings adjacent
+    # → H/L không bị "lệch" 2-3 bars do ZigZag confirm timing
+    swing_highs, swing_lows = _refine_swings(swing_highs, swing_lows, b_high, b_low)
+
     all_contractions = _find_contractions(
         swing_highs, swing_lows, b_vol, b_close, vol_ma50_full,
     )
@@ -774,6 +838,14 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
     RECENT_LOOKBACK = 150
     cutoff_idx = max(0, base_window - RECENT_LOOKBACK)
     contractions = [c for c in all_contractions if c["low_idx"] >= cutoff_idx]
+
+    # FILTER "T1 sớm quá": chỉ giữ contractions test cùng resistance level.
+    # Drop những T có high < max_high × 0.92 (ngưỡng 8% dưới đỉnh dominant).
+    # → loại pullbacks trên sườn rally không thuộc base, T1 thực sự bắt đầu
+    # ở/gần đỉnh cao nhất.
+    if contractions:
+        max_t_high = max(c["high_price"] for c in contractions)
+        contractions = [c for c in contractions if c["high_price"] >= max_t_high * 0.92]
 
     # Cap MAX 6 contractions (Minervini: 2-6 typical) — lấy 6 cái GẦN nhất
     MAX_CONTRACTIONS = 6
