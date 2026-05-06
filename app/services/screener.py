@@ -449,6 +449,43 @@ def _find_swing_points(high: np.ndarray, low: np.ndarray, order: int = 5) -> tup
     return _zigzag_swings(high, low, threshold_pct=2.0)
 
 
+def _merge_continued_drops(contractions: list) -> list:
+    """
+    Merge T_{i+1} vào T_i nếu T_{i+1}.low ≤ T_i.low.
+
+    LÝ DO: ZigZag threshold thấp (2%) tách 1 deep correction thành nhiều
+    mini-swings vì bắt cả rebounds 2-4%. Ví dụ thực tế GMD:
+      Real: T1 = 2/3-10/3 (1 contraction sâu 14%)
+      ZigZag: T15(2/3-4/3, 15%) + T16(5/3-10/3, 12%) — tách 2 vì rebound 4/3-5/3
+
+    LOGIC VCP CHUẨN (key insight):
+      - T_{i+1}.low > T_i.low (Higher Low) = real new contraction trong cùng base
+      - T_{i+1}.low ≤ T_i.low = continued drop, T_{i+1} chỉ là sub-swing → MERGE
+
+    Sau merge: T1 = (T_i.high → T_{i+1}.low [đáy sâu hơn], depth tổng).
+    """
+    if not contractions:
+        return contractions
+    merged = [dict(contractions[0])]   # copy để không mutate input
+    for c in contractions[1:]:
+        last = merged[-1]
+        if c["low_price"] <= last["low_price"]:
+            # Continued drop → extend last contraction xuống đáy mới
+            last["low_idx"]   = c["low_idx"]
+            last["low_price"] = c["low_price"]
+            last["duration"]  = last["low_idx"] - last["high_idx"]
+            last["depth"]     = (last["high_price"] - last["low_price"]) / last["high_price"] * 100
+            last["trough_avg_vol"] = c["trough_avg_vol"]
+            last["is_volume_dry"]  = c["is_volume_dry"]
+            last["up_vol_sum"]   += c["up_vol_sum"]
+            last["down_vol_sum"] += c["down_vol_sum"]
+            up_v = last["up_vol_sum"]
+            last["down_up_ratio"] = (last["down_vol_sum"] / up_v) if up_v > 0 else 999.0
+        else:
+            merged.append(dict(c))
+    return merged
+
+
 def _find_contractions(
     swing_highs: list, swing_lows: list,
     vol: np.ndarray, close: np.ndarray, vol_ma50_full: float,
@@ -729,11 +766,19 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
         swing_highs, swing_lows, b_vol, b_close, vol_ma50_full,
     )
 
-    # Lọc contractions theo thời gian: chỉ giữ những cái có low_idx
-    # trong 150 phiên gần nhất (~7 tháng) → loại contractions từ chu kỳ cũ
+    # MERGE: gộp T_{i+1} vào T_i nếu T_{i+1}.low ≤ T_i.low (continued drop)
+    # → 1 deep correction không bị tách thành nhiều mini-swings
+    all_contractions = _merge_continued_drops(all_contractions)
+
+    # Lọc theo thời gian: chỉ giữ contractions có low_idx ≥ cutoff (7 tháng gần)
     RECENT_LOOKBACK = 150
     cutoff_idx = max(0, base_window - RECENT_LOOKBACK)
     contractions = [c for c in all_contractions if c["low_idx"] >= cutoff_idx]
+
+    # Cap MAX 6 contractions (Minervini: 2-6 typical) — lấy 6 cái GẦN nhất
+    MAX_CONTRACTIONS = 6
+    if len(contractions) > MAX_CONTRACTIONS:
+        contractions = contractions[-MAX_CONTRACTIONS:]
     t_count = len(contractions)
 
     # Base properties: tính từ FIRST contraction (start of VCP base)
