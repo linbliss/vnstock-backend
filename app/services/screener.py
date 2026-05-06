@@ -529,6 +529,12 @@ def _refine_swings(
         # Bound search: từ swing trước → swing sau
         prev_idx = events[j - 1][0] + 1 if j > 0 else 0
         next_idx = events[j + 1][0] - 1 if j < len(events) - 1 else n - 1
+        # CRITICAL FIX: Đảm bảo idx của chính swing này trong search range.
+        # Khi 2 swings cùng idx (single bar có range lớn → cả H và L đều
+        # confirmed tại bar đó), naive prev_idx/next_idx có thể loại trừ
+        # bar gốc → refine downgrade swing xuống bar khác có giá thấp hơn.
+        prev_idx = min(prev_idx, idx)
+        next_idx = max(next_idx, idx)
         if next_idx < prev_idx:
             continue
 
