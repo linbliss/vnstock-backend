@@ -927,6 +927,20 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
         pivot_fresh_loose          # handle ≤ 50 phiên (10 tuần)
     )
 
+    # ── DEBUG: liệt kê lý do fail loose mode ──
+    loose_fail_reasons: List[str] = []
+    if not uptrend_ok:               loose_fail_reasons.append(f"uptrend_ok=False (close={current_close:.2f} ma150={ma150:.2f} g12m={gain_12m:.1f}% g6m={gain_6m:.1f}%)")
+    if t_count < 2:                  loose_fail_reasons.append(f"t_count={t_count} (cần ≥2)")
+    if not first_depth_ok_loose:
+        d0 = contractions[0]["depth"] if contractions else 0
+        loose_fail_reasons.append(f"first_depth={d0:.1f}% (cần [6,50])")
+    if not contracting_loose:        loose_fail_reasons.append(f"contracting_loose=False (loose_violations={loose_violations}, overall_loose_ok={overall_loose_ok})")
+    if not (tightness < 12):         loose_fail_reasons.append(f"tightness={tightness:.1f}% (cần <12)")
+    if not (handle_dur >= 2):        loose_fail_reasons.append(f"handle_dur={handle_dur} (cần ≥2)")
+    if not vol_contracting_loose:    loose_fail_reasons.append(f"vol_contracting_loose=False (vol_decreasing_loose={vol_decreasing_loose}, last_dry={last_dry})")
+    if not (base_length >= 20):      loose_fail_reasons.append(f"base_length={base_length} (cần ≥20)")
+    if not pivot_fresh_loose:        loose_fail_reasons.append(f"days_since_handle={days_since_handle} (cần ≤50)")
+
     # Stage classification per mode
     def _stage(is_v: bool) -> str:
         if is_v and above_pivot: return "breakout"
@@ -1016,6 +1030,7 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
         "first_depth_ok_strict": first_depth_ok_strict,
         "first_depth_ok_loose":  first_depth_ok_loose,
         "first_depth_pct":      round(contractions[0]["depth"], 2) if contractions else 0.0,
+        "loose_fail_reasons":   loose_fail_reasons,
 
         # ── Detailed contractions for chart annotations ───────────────────
         "contractions":      contractions_out,
