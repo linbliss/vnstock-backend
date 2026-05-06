@@ -642,7 +642,7 @@ def _find_contractions(
     if not swing_highs or not swing_lows:
         return []
 
-    REBOUND_PCT = 0.08   # 8% rebound từ running_min = recovery có ý nghĩa
+    REBOUND_PCT = 0.05   # 5% rebound — bắt cả contractions nông hơn (HPG)
 
     events = (
         [(i, p, 'H') for i, p in swing_highs] +
@@ -930,6 +930,21 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
     while len(contractions) >= 2 and contractions[0]["depth"] < contractions[1]["depth"]:
         contractions = contractions[1:]
 
+    # DROP VALLEY T's: T_i depth < 0.7 × min(neighbors) → outlier shallow.
+    # Ví dụ GMD: T1 (21.56%), T2 (6.91%), T3 (10.01%). T2 là valley
+    # giữa T1 và T3, depth nhỏ hơn nhiều → bỏ. Khác T1 sớm: valley có thể
+    # ở giữa cluster.
+    i = 1
+    while i < len(contractions) - 1:
+        prev_d = contractions[i - 1]["depth"]
+        curr_d = contractions[i]["depth"]
+        next_d = contractions[i + 1]["depth"]
+        if curr_d < min(prev_d, next_d) * 0.7:
+            contractions.pop(i)
+            # Không tăng i — kiểm tra lại vị trí hiện tại
+        else:
+            i += 1
+
     # Cap MAX 6 contractions: GIỮ T1 (deepest first) + 5 cái GẦN nhất.
     # Trước: cắt từ đầu → mất T1 quan trọng (vd GMD T_a depth 21.56%).
     MAX_CONTRACTIONS = 6
@@ -990,8 +1005,10 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
         base_start_global   = base_offset_global + overall_max_idx
         base_depth          = overall_drawdown
 
-    # Filter base_depth quá nông (không có contraction thực sự)
-    if base_depth < 8:
+    # Filter base_depth quá nông (không có contraction thực sự).
+    # Threshold 5% (was 8%) — cho phép base nông hơn nhưng vẫn có T's hợp lệ.
+    # HPG có drawdown ~7.6%, threshold 8% loại sai.
+    if base_depth < 5:
         return _empty_vcp_result(
             "base_too_shallow",
             uptrend_ok=True,
