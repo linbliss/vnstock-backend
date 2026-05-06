@@ -853,20 +853,21 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
         handle_low = last_c["low_price"]
         handle_dur = last_c["duration"]
         pivot_high = last_c["high_price"]   # ← FROZEN tại đỉnh handle
-        # Freshness: handle phải gần hiện tại (≤ 25 phiên = 5 tuần)
+        # Freshness có 2 ngưỡng: strict ≤ 25 phiên, loose ≤ 50 phiên (10 tuần)
         last_high_global   = analysis_offset_global + last_c["high_idx"]
         days_since_handle  = (n - 1) - last_high_global
-        pivot_fresh        = days_since_handle <= 25
+        pivot_fresh_strict = days_since_handle <= 25
+        pivot_fresh_loose  = days_since_handle <= 50
     else:
-        # Không có contraction → fallback dùng đỉnh 20 phiên (chỉ áp dụng khi t_count=0)
         recent_h   = float(np.max(b_high[-20:]))
         recent_l   = float(np.min(b_low[-20:]))
         tightness  = (recent_h - recent_l) / recent_h * 100 if recent_h > 0 else 0
         handle_low = recent_l
         handle_dur = 0
         pivot_high = recent_h
-        days_since_handle = 0
-        pivot_fresh = False
+        days_since_handle  = 0
+        pivot_fresh_strict = False
+        pivot_fresh_loose  = False
 
     pivot_buy = round(pivot_high, 2)
     stop_loss = round(handle_low * 0.985, 2)   # -1.5% dưới handle low
@@ -875,13 +876,16 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
     near_pivot  = abs(diff_pivot_pct) < 3 if pivot_buy > 0 else False
     above_pivot = diff_pivot_pct > 0 if pivot_buy > 0 else False
 
-    # First contraction depth check (Minervini textbook): T₁ phải 10-50%
-    # < 10%: chưa có correction đủ để gọi là contraction thực
-    # > 50%: cú giảm quá sâu, không phải VCP base mà là recovery
-    first_depth_ok = (
-        10 <= contractions[0]["depth"] <= 50
-        if contractions else False
-    )
+    # First contraction depth — 2 ngưỡng:
+    # Strict: T₁ ∈ [10%, 50%] textbook Minervini
+    # Loose: T₁ ∈ [6%, 50%] — cho phép contractions nông hơn (mã ít volatile)
+    if contractions:
+        d0 = contractions[0]["depth"]
+        first_depth_ok_strict = 10 <= d0 <= 50
+        first_depth_ok_loose  = 6  <= d0 <= 50
+    else:
+        first_depth_ok_strict = False
+        first_depth_ok_loose  = False
 
     # ══════════════════════════════════════════════════════════════════════
     # VOLUME RATIO HIỆN TẠI (vs MA50 toàn dataset)
@@ -900,7 +904,7 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
     is_vcp_strict = (
         uptrend_ok and ma_stack_ok and
         t_count >= 3 and
-        first_depth_ok and        # T₁ ∈ [10%, 50%]
+        first_depth_ok_strict and  # T₁ ∈ [10%, 50%]
         contracting_strict and
         tightness < 8 and
         handle_dur >= 5 and
@@ -908,19 +912,19 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
         healthy_supply_demand and
         hold_above_ma50 and
         base_length >= 35 and
-        pivot_fresh               # handle ≤ 25 phiên gần nhất
+        pivot_fresh_strict         # handle ≤ 25 phiên (5 tuần)
     )
 
     is_vcp_loose = (
         uptrend_ok and
         t_count >= 2 and
-        first_depth_ok and        # T₁ ∈ [10%, 50%] (kể cả loose)
+        first_depth_ok_loose and   # T₁ ∈ [6%, 50%]
         contracting_loose and
         tightness < 12 and
-        handle_dur >= 3 and
+        handle_dur >= 2 and        # nới từ 3 → 2 phiên
         vol_contracting_loose and
-        base_length >= 25 and
-        pivot_fresh               # handle phải mới (loose vẫn cần)
+        base_length >= 20 and      # nới từ 25 → 20 phiên (4 tuần)
+        pivot_fresh_loose          # handle ≤ 50 phiên (10 tuần)
     )
 
     # Stage classification per mode
@@ -1004,9 +1008,13 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
         "hold_above_ma50": hold_above_ma50,
         "down_up_ratio":   round(base_down_up_ratio, 2),
         "healthy_supply_demand": healthy_supply_demand,
-        "pivot_fresh":          pivot_fresh,
+        "pivot_fresh":          pivot_fresh_loose,           # legacy = loose
+        "pivot_fresh_strict":   pivot_fresh_strict,
+        "pivot_fresh_loose":    pivot_fresh_loose,
         "days_since_handle":    int(days_since_handle),
-        "first_depth_ok":       first_depth_ok,
+        "first_depth_ok":       first_depth_ok_loose,         # legacy = loose
+        "first_depth_ok_strict": first_depth_ok_strict,
+        "first_depth_ok_loose":  first_depth_ok_loose,
         "first_depth_pct":      round(contractions[0]["depth"], 2) if contractions else 0.0,
 
         # ── Detailed contractions for chart annotations ───────────────────
