@@ -619,111 +619,120 @@ def _find_contractions(
     vol: np.ndarray, close: np.ndarray, vol_ma50_full: float,
 ) -> list:
     """
-    Tìm contractions VCP — Sequential Walker.
+    Tìm contractions VCP — Walker với "Running Minimum Low" approach.
 
-    Thuật toán:
-      1. Merge swing_highs + swing_lows, sort theo (idx, type) — H trước L cùng idx
-      2. Walk tuần tự với state machine:
-         - Gặp H: nhận làm pending_high (override nếu price cao hơn pending,
-                  nghĩa là pattern chưa hình thành L)
-         - Gặp L (sau pending_high):
-           * price >= pending_high.price → bỏ qua
-           * duration < 2 → bỏ qua (chờ L tiếp theo, không reset pending)
-           * Đáp ứng → tạo contraction, reset pending
+    Vấn đề cũ: walker tạo T tại L đầu tiên gặp rồi reset pending. Mất các L
+    SÂU HƠN xuất hiện sau (vì dur<2 từ pending mới). Ví dụ PHR T2:
+      H 166 → L 169 (tạo T, reset) → H 169 → L 170 (dur=1, SKIP)
+      L 170 (3/23) là đáy THẬT nhưng bị mất.
 
-    Lưu ý — KHÔNG enforce Higher Lows ở mức swing:
-      VCP textbook nói "Higher Lows" là đặc trưng IDEAL nhưng dữ liệu thực
-      thường có shake-out (Minervini gọi "undercut & rally") — T₂ thủng nhẹ
-      L của T₁ để rũ weak hands. Strict HL → reject T₂ → chuỗi T₃,T₄ cũng
-      mắc kẹt vì last_low không update. Kết quả: chỉ thấy T1.
+    Approach mới — Running Min:
+      - Maintain pending_high (đỉnh đang xét)
+      - Track running_min_low: đáy SÂU NHẤT từ khi pending bắt đầu
+      - Finalize contraction (using running_min, not first L) khi:
+        a) New H >= pending → hard recovery (giá hồi phục về resistance)
+        b) New H < pending nhưng rebound > 8% từ running_min AND dur >= 2
+           → soft recovery có ý nghĩa, T này hoàn thành
+        c) End of events
+      - Each L: chỉ update running_min nếu sâu hơn (extend T's low)
 
-    Higher Lows được track như METADATA (`higher_low_vs_prev`) để frontend
-    hiển thị quality, KHÔNG dùng làm gate. Gate chính là depth contraction
-    (xử lý ở pair_reductions trong detect_vcp).
-
-    Args:
-      swing_highs / swing_lows: [(idx_local_to_analysis, price)]
-      vol, close:    arrays của analysis_zone
-      vol_ma50_full: MA50 volume trên TOÀN DATASET
-
-    Returns:
-      list contractions tuần tự H₁→L₁→H₂→L₂→... với H_i ≤ H_{i-1}.
-      Mỗi item có `higher_low_vs_prev` (bool) cho post-hoc quality check.
+    8% threshold chọn vì: PHR T_c trace cho thấy 7-10% là vùng phân biệt
+    "minor pullback within drop" vs "real recovery to start new T".
     """
     if not swing_highs or not swing_lows:
         return []
 
-    # Merge events, sort theo idx (H trước L nếu cùng idx để bắt cặp đúng)
+    REBOUND_PCT = 0.08   # 8% rebound từ running_min = recovery có ý nghĩa
+
     events = (
         [(i, p, 'H') for i, p in swing_highs] +
         [(i, p, 'L') for i, p in swing_lows]
     )
     events.sort(key=lambda x: (x[0], 0 if x[2] == 'H' else 1))
 
-    contractions = []
-    pending_high  = None     # (idx, price) — đỉnh đang chờ ghép
-    prev_low      = None     # tracking để metadata higher_low_vs_prev
+    contractions: list = []
+    pending_high = None     # (idx, price) — đỉnh đang xét
+    running_min  = None     # (idx, price) — đáy sâu nhất under pending
+    prev_low     = None
 
-    for idx, price, typ in events:
-        if typ == 'H':
-            # Update pending_high khi chưa có HOẶC đỉnh mới cao hơn
-            if pending_high is None or price > pending_high[1]:
-                pending_high = (idx, price)
-            continue
-
-        # typ == 'L'
-        if pending_high is None:
-            continue
-        sh_idx, sh_price = pending_high
-
-        if price >= sh_price:
-            continue
-
-        duration = idx - sh_idx
+    def _build(sh_idx, sh_price, sl_idx, sl_price):
+        duration = sl_idx - sh_idx
         if duration < 2:
-            continue   # Quá ngắn — đợi L tiếp theo, không reset pending
-
-        depth = (sh_price - price) / sh_price * 100
-
-        # Volume tại trough (3 phiên quanh đáy) so với MA50 toàn dataset
-        trough_start = max(0, idx - 1)
-        trough_end   = min(len(vol), idx + 2)
-        trough_vol_slice = vol[trough_start:trough_end]
-        trough_avg_vol   = float(np.mean(trough_vol_slice)) if len(trough_vol_slice) > 0 else 0
-        is_volume_dry    = trough_avg_vol < (vol_ma50_full * 0.6) if vol_ma50_full > 0 else False
-
-        # UP/DOWN volume trong segment [sh_idx, idx] (institutional accumulation)
-        seg_end = min(idx + 1, len(close))
-        up_vol_sum, down_vol_sum = 0.0, 0.0
+            return None
+        depth = (sh_price - sl_price) / sh_price * 100 if sh_price > 0 else 0
+        # Volume tại trough
+        trough_start = max(0, sl_idx - 1)
+        trough_end   = min(len(vol), sl_idx + 2)
+        trough_slice = vol[trough_start:trough_end]
+        trough_avg   = float(np.mean(trough_slice)) if len(trough_slice) > 0 else 0
+        is_vol_dry   = trough_avg < (vol_ma50_full * 0.6) if vol_ma50_full > 0 else False
+        # UP/DOWN volume in segment [sh_idx, sl_idx]
+        seg_end = min(sl_idx + 1, len(close))
+        up_v = down_v = 0.0
         for i in range(sh_idx + 1, seg_end):
             if i >= len(vol) or i >= len(close):
                 break
             chg = close[i] - close[i - 1]
             if chg > 0:
-                up_vol_sum += float(vol[i])
+                up_v += float(vol[i])
             elif chg < 0:
-                down_vol_sum += float(vol[i])
-        down_up_ratio = down_vol_sum / up_vol_sum if up_vol_sum > 0 else 999.0
-
-        # Higher Lows metadata (quality indicator, not a gate)
-        higher_low = prev_low is None or price > prev_low
-
-        contractions.append({
+                down_v += float(vol[i])
+        return {
             "high_idx":         sh_idx,
             "high_price":       sh_price,
-            "low_idx":          idx,
-            "low_price":        price,
-            "depth":            depth,
-            "duration":         duration,
-            "trough_avg_vol":   trough_avg_vol,
-            "is_volume_dry":    is_volume_dry,
-            "up_vol_sum":       up_vol_sum,
-            "down_vol_sum":     down_vol_sum,
-            "down_up_ratio":    down_up_ratio,
-            "higher_low_vs_prev": higher_low,
-        })
-        prev_low     = price
-        pending_high = None        # Đợi đỉnh tiếp theo
+            "low_idx":          sl_idx,
+            "low_price":        sl_price,
+            "depth":             depth,
+            "duration":          duration,
+            "trough_avg_vol":   trough_avg,
+            "is_volume_dry":    is_vol_dry,
+            "up_vol_sum":       up_v,
+            "down_vol_sum":     down_v,
+            "down_up_ratio":    down_v / up_v if up_v > 0 else 999.0,
+            "higher_low_vs_prev": True,   # sẽ override sau
+        }
+
+    def _finalize():
+        nonlocal pending_high, running_min, prev_low
+        if pending_high is None or running_min is None:
+            pending_high = None
+            running_min  = None
+            return
+        c = _build(pending_high[0], pending_high[1], running_min[0], running_min[1])
+        if c is not None:
+            c["higher_low_vs_prev"] = (prev_low is None) or (c["low_price"] > prev_low)
+            contractions.append(c)
+            prev_low = c["low_price"]
+        pending_high = None
+        running_min  = None
+
+    for idx, price, typ in events:
+        if typ == 'H':
+            if pending_high is None:
+                pending_high = (idx, price)
+            elif price >= pending_high[1]:
+                # Hard recovery — finalize current pending
+                _finalize()
+                pending_high = (idx, price)
+            else:
+                # H thấp hơn pending — kiểm tra soft recovery
+                if running_min is not None:
+                    rebound_pct = (price - running_min[1]) / running_min[1] if running_min[1] > 0 else 0
+                    duration    = running_min[0] - pending_high[0]
+                    if rebound_pct > REBOUND_PCT and duration >= 2:
+                        _finalize()
+                        pending_high = (idx, price)
+                # else: H thấp hơn pending, chưa có running_min — bỏ qua
+        else:   # 'L'
+            if pending_high is None:
+                continue
+            if price >= pending_high[1]:
+                continue
+            if running_min is None or price < running_min[1]:
+                running_min = (idx, price)
+
+    # End: finalize last pending
+    _finalize()
 
     return contractions
 
@@ -921,10 +930,11 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
     while len(contractions) >= 2 and contractions[0]["depth"] < contractions[1]["depth"]:
         contractions = contractions[1:]
 
-    # Cap MAX 6 contractions (Minervini: 2-6 typical)
+    # Cap MAX 6 contractions: GIỮ T1 (deepest first) + 5 cái GẦN nhất.
+    # Trước: cắt từ đầu → mất T1 quan trọng (vd GMD T_a depth 21.56%).
     MAX_CONTRACTIONS = 6
     if len(contractions) > MAX_CONTRACTIONS:
-        contractions = contractions[-MAX_CONTRACTIONS:]
+        contractions = [contractions[0]] + contractions[-(MAX_CONTRACTIONS - 1):]
     t_count = len(contractions)
 
     # ── Build pipeline diagnostics ──
