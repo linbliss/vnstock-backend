@@ -449,6 +449,50 @@ def _find_swing_points(high: np.ndarray, low: np.ndarray, order: int = 5) -> tup
     return _zigzag_swings(high, low, threshold_pct=2.0)
 
 
+def _filter_to_recent_cluster(
+    contractions: list,
+    max_gap_bars: int = 35,
+    min_high_ratio: float = 0.94,
+) -> list:
+    """
+    Lọc đến CỤM contractions gần nhất + cùng resistance level.
+
+    Walking backwards từ T cuối cùng, build cluster. Stop khi:
+      - Gap thời gian từ T_i.low đến cluster.first.high > max_gap_bars
+        (T_i quá xa T tiếp theo, thuộc base/wave khác)
+      - HOẶC T_i.high < cluster_max_high * min_high_ratio
+        (T_i ở resistance level thấp hơn nhiều, không cùng base)
+
+    → Chỉ giữ T thật sự cùng "wave" của VCP base hiện tại.
+
+    Ví dụ STB: T1=64, T2=65, T3=72, T4=70, T5=70.
+      - cluster=[T5], max=70
+      - T4: gap small, 70/70=1.0 → add. cluster=[T4,T5]
+      - T3: gap small, max=72, 72/72=1.0 → add. cluster=[T3,T4,T5]
+      - T2: gap small, 65/72=0.903 < 0.94 → STOP
+      - Final: [T3, T4, T5] ✓
+
+    Ví dụ TLD: T3 cách T4 ~6 tuần.
+      - cluster=[T5]; T4: add; T3: gap 30+ > 35 → STOP
+      - Final: [T4, T5] ✓
+    """
+    if not contractions:
+        return contractions
+    cluster = [contractions[-1]]
+    cluster_max_high = cluster[0]["high_price"]
+    for i in range(len(contractions) - 2, -1, -1):
+        c = contractions[i]
+        gap = cluster[0]["high_idx"] - c["low_idx"]
+        if gap > max_gap_bars:
+            break
+        new_max = max(cluster_max_high, c["high_price"])
+        if c["high_price"] < new_max * min_high_ratio:
+            break
+        cluster.insert(0, c)
+        cluster_max_high = new_max
+    return cluster
+
+
 def _refine_swings(
     swing_highs: list, swing_lows: list,
     high: np.ndarray, low: np.ndarray,
@@ -839,15 +883,15 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
     cutoff_idx = max(0, base_window - RECENT_LOOKBACK)
     contractions = [c for c in all_contractions if c["low_idx"] >= cutoff_idx]
 
-    # FILTER "T1 sớm quá": chỉ giữ contractions test cùng resistance level.
-    # Drop những T có high < max_high × 0.92 (ngưỡng 8% dưới đỉnh dominant).
-    # → loại pullbacks trên sườn rally không thuộc base, T1 thực sự bắt đầu
-    # ở/gần đỉnh cao nhất.
-    if contractions:
-        max_t_high = max(c["high_price"] for c in contractions)
-        contractions = [c for c in contractions if c["high_price"] >= max_t_high * 0.92]
+    # CLUSTER filter: walk backwards từ T cuối, build cluster của những T
+    # gần thời gian + cùng resistance level. Stop khi gap > 35 bars hoặc
+    # height drop > 6% so với cluster max.
+    # → Loại T1 sớm trong rally (STB) + loại T cô lập về thời gian (TLD).
+    contractions = _filter_to_recent_cluster(
+        contractions, max_gap_bars=35, min_high_ratio=0.94,
+    )
 
-    # Cap MAX 6 contractions (Minervini: 2-6 typical) — lấy 6 cái GẦN nhất
+    # Cap MAX 6 contractions (Minervini: 2-6 typical)
     MAX_CONTRACTIONS = 6
     if len(contractions) > MAX_CONTRACTIONS:
         contractions = contractions[-MAX_CONTRACTIONS:]
