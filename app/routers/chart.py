@@ -63,28 +63,42 @@ def _merge_intraday_candle(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     """
     Append/update candle hôm nay từ market_service.quotes nếu có data.
     Đảm bảo MA tính trên data có ngày hiện tại → chart không bị thiếu cây nến hôm nay.
+
+    CRITICAL UNIT FIX: market_service.quotes trả giá ở REAL VND (28600),
+    nhưng ohlcv_store lưu ở NGHÌN VND (28.6). Phải quy đổi trước khi merge,
+    nếu không sẽ tạo 1 cây nến với giá gấp 1000x → chart squeeze hoàn toàn.
     """
     quote = market_service.quotes.get(ticker, {})
     if not quote:
         return df
 
-    price = float(quote.get('price', 0) or 0)
-    if price <= 0:
+    raw_price = float(quote.get('price', 0) or 0)
+    if raw_price <= 0:
         return df
+
+    # Detect unit của df (nghìn VND nếu giá trung bình < 1000 — chuẩn VN)
+    sample_close = float(df['close'].iloc[-1]) if len(df) > 0 else raw_price
+    df_in_kvnd   = sample_close < 1000
+
+    # Quy đổi quote về cùng unit với df
+    def _to_df_unit(v: float) -> float:
+        if df_in_kvnd and v > 1000:
+            return v / 1000.0
+        return v
+
+    price  = _to_df_unit(raw_price)
+    open_p = _to_df_unit(float(quote.get('open',  raw_price) or raw_price))
+    high_p = _to_df_unit(float(quote.get('high',  raw_price) or raw_price))
+    low_p  = _to_df_unit(float(quote.get('low',   raw_price) or raw_price))
+    volume = int(quote.get('volume', 0) or 0)
 
     today_str = date.today().isoformat()
     last_date = str(df['date'].iloc[-1]) if len(df) > 0 else None
-
-    open_p   = float(quote.get('open',  price) or price)
-    high_p   = float(quote.get('high',  price) or price)
-    low_p    = float(quote.get('low',   price) or price)
-    volume   = int(quote.get('volume', 0)      or 0)
 
     if last_date != today_str:
         # Chưa có candle hôm nay trong store → append
         if not _is_market_open_or_post():
             # Ngoài giờ + chưa có T row → có thể đang sáng sớm, đừng append (data có thể stale)
-            # Trừ khi quote.timestamp gần đây
             return df
         new_row = pd.DataFrame([{
             'date':   today_str,
@@ -96,7 +110,7 @@ def _merge_intraday_candle(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
         }])
         df = pd.concat([df, new_row], ignore_index=True)
     else:
-        # Đã có candle hôm nay (có thể là EOD T-1 đã sync) → update với intraday
+        # Đã có candle hôm nay → update với intraday data realtime
         if _is_market_open_or_post():
             idx = df.index[-1]
             df.at[idx, 'high']   = max(float(df.at[idx, 'high']), high_p)
