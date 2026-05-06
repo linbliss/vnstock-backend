@@ -561,38 +561,56 @@ def _refine_swings(
 
 def _merge_continued_drops(contractions: list) -> list:
     """
-    Merge T_{i+1} vào T_i nếu T_{i+1}.low ≤ T_i.low.
+    Merge T_{i+1} vào T_i nếu T_{i+1} là CONTINUED DROP (không phải contraction mới).
 
-    LÝ DO: ZigZag threshold thấp (2%) tách 1 deep correction thành nhiều
-    mini-swings vì bắt cả rebounds 2-4%. Ví dụ thực tế GMD:
-      Real: T1 = 2/3-10/3 (1 contraction sâu 14%)
-      ZigZag: T15(2/3-4/3, 15%) + T16(5/3-10/3, 12%) — tách 2 vì rebound 4/3-5/3
+    Quyết định merge dựa trên 2 tiêu chí (cả 2 đều cần):
+      1. T_{i+1}.low ≤ T_i.low (Lower Low → vẫn còn drop)
+      2. Rebound giữa T_i.low → T_{i+1}.high < 50% × T_i depth_range
+         (recovery yếu → là sub-swing, không phải contraction riêng)
 
-    LOGIC VCP CHUẨN (key insight):
-      - T_{i+1}.low > T_i.low (Higher Low) = real new contraction trong cùng base
-      - T_{i+1}.low ≤ T_i.low = continued drop, T_{i+1} chỉ là sub-swing → MERGE
+    Nếu rebound > 50% (giá hồi phục đáng kể), T_{i+1} là CONTRACTION MỚI dù
+    có Lower Low. Không merge → walker giữ 2 contractions riêng.
 
-    Sau merge: T1 = (T_i.high → T_{i+1}.low [đáy sâu hơn], depth tổng).
+    Ví dụ PHR:
+      T_a (1/19, H=69.6, L=58.4, depth_range=11.2)
+      T_b (2/27, H=64.8, L=57.0)
+      Rebound = 64.8 - 58.4 = 6.4 (57% của 11.2) > 50% → KHÔNG merge.
+      → T_a, T_b riêng → matches user expectation.
+
+    Ví dụ GMD T15+T16 (continued drop):
+      T15 (H=90, L=76, depth=14)
+      T16 (H=80, L=70)
+      Rebound = 80-76 = 4 (28% của 14) < 50% → MERGE → T1 = 90→70 ✓
     """
     if not contractions:
         return contractions
-    merged = [dict(contractions[0])]   # copy để không mutate input
+    merged = [dict(contractions[0])]
     for c in contractions[1:]:
         last = merged[-1]
-        if c["low_price"] <= last["low_price"]:
-            # Continued drop → extend last contraction xuống đáy mới
-            last["low_idx"]   = c["low_idx"]
-            last["low_price"] = c["low_price"]
-            last["duration"]  = last["low_idx"] - last["high_idx"]
-            last["depth"]     = (last["high_price"] - last["low_price"]) / last["high_price"] * 100
-            last["trough_avg_vol"] = c["trough_avg_vol"]
-            last["is_volume_dry"]  = c["is_volume_dry"]
-            last["up_vol_sum"]   += c["up_vol_sum"]
-            last["down_vol_sum"] += c["down_vol_sum"]
-            up_v = last["up_vol_sum"]
-            last["down_up_ratio"] = (last["down_vol_sum"] / up_v) if up_v > 0 else 999.0
-        else:
+        # Không merge nếu Higher Low (real new contraction trong cùng base)
+        if c["low_price"] > last["low_price"]:
             merged.append(dict(c))
+            continue
+        # Không merge nếu rebound từ last.low đến c.high > 40% của last depth
+        # (recovery đáng kể → c là contraction mới, không phải sub-swing)
+        # 40% chọn vì: thử 50% qua case PHR, T_c và T_d rebound 46% ngay dưới
+        # ngưỡng → user vẫn muốn separate. 40% bắt được recovery thật như vậy.
+        last_range = last["high_price"] - last["low_price"]
+        rebound    = c["high_price"] - last["low_price"]
+        if last_range > 0 and rebound > last_range * 0.4:
+            merged.append(dict(c))
+            continue
+        # Continued drop với rebound nhỏ → MERGE
+        last["low_idx"]   = c["low_idx"]
+        last["low_price"] = c["low_price"]
+        last["duration"]  = last["low_idx"] - last["high_idx"]
+        last["depth"]     = (last["high_price"] - last["low_price"]) / last["high_price"] * 100
+        last["trough_avg_vol"] = c["trough_avg_vol"]
+        last["is_volume_dry"]  = c["is_volume_dry"]
+        last["up_vol_sum"]   += c["up_vol_sum"]
+        last["down_vol_sum"] += c["down_vol_sum"]
+        up_v = last["up_vol_sum"]
+        last["down_up_ratio"] = (last["down_vol_sum"] / up_v) if up_v > 0 else 999.0
     return merged
 
 
@@ -896,6 +914,12 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
     contractions = _filter_to_recent_cluster(
         contractions_recent, max_gap_bars=35, min_high_ratio=0.94,
     )
+
+    # DROP EARLY shallow T's: VCP đúng có T1 sâu nhất, T_i+1 shallower.
+    # Nếu T_1.depth < T_2.depth → T_1 không phải first contraction thật,
+    # chỉ là pullback nhỏ trước đó. Drop liên tiếp đến khi T_1 ≥ T_2.
+    while len(contractions) >= 2 and contractions[0]["depth"] < contractions[1]["depth"]:
+        contractions = contractions[1:]
 
     # Cap MAX 6 contractions (Minervini: 2-6 typical)
     MAX_CONTRACTIONS = 6
