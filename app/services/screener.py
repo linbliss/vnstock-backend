@@ -356,6 +356,62 @@ def compute_rs_line(stock_close: pd.Series, index_close: pd.Series, length: int 
         return 50.0
 
 
+def compute_rs_line_breakout(
+    stock_close: pd.Series, index_close: pd.Series,
+    lookback: int = 20,
+) -> Tuple[bool, float]:
+    """
+    Phát hiện RS Line breakout — Minervini principle: "RS line breaks before price".
+
+    RS Line = Stock / Index (raw ratio)
+    Breakout = rs_line_today > max(rs_line trong `lookback` phiên TRƯỚC hôm nay)
+
+    Returns: (is_breakout, breakout_strength_pct)
+      - is_breakout: True nếu RS line hôm nay vượt đỉnh lookback
+      - breakout_strength_pct: % vượt so với đỉnh cũ (>0 nếu breakout)
+
+    Lý do quan trọng:
+      RS line tracks performance vs benchmark. Khi RS line break new high
+      TRƯỚC khi price break pivot → smart money đã accumulate, breakout
+      sắp tới có xác suất thành công cao hơn.
+    """
+    try:
+        # Align by tail (Min length needed)
+        n = min(len(stock_close), len(index_close))
+        if n < lookback + 2:
+            return False, 0.0
+        stock = stock_close.iloc[-n:].astype(float).reset_index(drop=True)
+        index = index_close.iloc[-n:].astype(float).reset_index(drop=True)
+
+        # Filter outliers (VNINDEX corrupt rows)
+        median_idx = float(index.median())
+        if median_idx > 0:
+            mask = (index > median_idx * 0.3) & (index < median_idx * 3)
+            stock = stock[mask].reset_index(drop=True)
+            index = index[mask].reset_index(drop=True)
+        if len(stock) < lookback + 2:
+            return False, 0.0
+
+        # RS Line raw ratio
+        rs_ratio = (stock / index).values
+        rs_now      = float(rs_ratio[-1])
+        # Đỉnh trong `lookback` phiên TRƯỚC (exclude today)
+        prior       = rs_ratio[-(lookback + 1):-1]
+        if len(prior) == 0:
+            return False, 0.0
+        rs_prev_max = float(np.max(prior))
+
+        if rs_prev_max <= 0:
+            return False, 0.0
+
+        is_break  = rs_now > rs_prev_max
+        strength  = (rs_now / rs_prev_max - 1) * 100   # % vượt
+        return is_break, round(strength, 2)
+    except Exception:
+        return False, 0.0
+
+
+
 def _zigzag_swings(
     high: np.ndarray, low: np.ndarray, threshold_pct: float = 2.0,
 ) -> tuple:
@@ -1447,9 +1503,15 @@ class ScreenerService:
             stk = df.set_index(pd.to_datetime(df['date']))['close']
             idx = self._index_data.set_index(pd.to_datetime(self._index_data['date']))['close']
             rs_rating = compute_rs_rating(stk, idx)
+        # RS Line value + RS Line breakout flag (Minervini: "RS line breaks before price")
+        rs_line_breakout      = False
+        rs_line_breakout_pct  = 0.0
         if self._index_data is not None and len(self._index_data) >= 60:
             rs_line_val = compute_rs_line(
                 df['close'], self._index_data['close']
+            )
+            rs_line_breakout, rs_line_breakout_pct = compute_rs_line_breakout(
+                df['close'], self._index_data['close'], lookback=20,
             )
 
         # Giá hiện tại từ cache quotes (REALTIME) — truyền vào VCP/Trend
@@ -1473,12 +1535,43 @@ class ScreenerService:
         vol_ma20 = int(float(pd.Series(vol).rolling(20).mean().iloc[-1])) if len(vol) >= 20 else 0
         vol_ma50 = int(float(pd.Series(vol).rolling(50).mean().iloc[-1])) if len(vol) >= 50 else 0
 
-        # Tổng điểm (0-100)
-        trend_pts = trend["score"] * 5          # max 40
-        rs_pts    = min(rs_rating * 0.3, 30)    # max 30
+        # ════════════════════════════════════════════════════════════════
+        # Tổng điểm: CORE 100 + BONUS có thể đẩy lên 125 (mã elite)
+        # Đổi trọng số: RS=40 (cao hơn), Trend=30 (thấp hơn) — RS Rating
+        # là chỉ báo dẫn dắt mạnh nhất theo Minervini.
+        # ════════════════════════════════════════════════════════════════
+        trend_pts = trend["score"] * 3.75       # max 30 (was 40)
+        rs_pts    = min(rs_rating * 0.4, 40)    # max 40 (was 30)
         vcp_pts   = 20 if vcp["is_vcp"] else (10 if vcp["contracting"] else 0)
         near_pts  = 10 if vcp.get("near_pivot") else 0
-        total     = round(trend_pts + rs_pts + vcp_pts + near_pts, 1)
+
+        # ── BONUS 1: Tightness (handle siêu chặt = supply cạn, elite setup) ──
+        tightness = float(vcp.get("tightness", 100))
+        if tightness > 0:
+            if tightness < 3:
+                tightness_bonus = 10   # Elite — handle gần như không có biến động
+            elif tightness < 5:
+                tightness_bonus = 6
+            elif tightness < 8:
+                tightness_bonus = 3
+            else:
+                tightness_bonus = 0
+        else:
+            tightness_bonus = 0
+
+        # ── BONUS 2: RS Line breakout (Minervini early signal) ──
+        # RS line vượt đỉnh 20 phiên = smart money accumulating BEFORE price breaks
+        if rs_line_breakout:
+            # Strength-based: vượt nhẹ (<1%) = +10, vượt rõ (>=1%) = +15
+            rs_line_bonus = 15 if rs_line_breakout_pct >= 1.0 else 10
+        else:
+            rs_line_bonus = 0
+
+        total = round(
+            trend_pts + rs_pts + vcp_pts + near_pts +
+            tightness_bonus + rs_line_bonus,
+            1,
+        )
 
         result = {
             "ticker":       ticker,
@@ -1493,8 +1586,18 @@ class ScreenerService:
             "ma200":        trend.get("ma200", 0),
             "rs_rating":    rs_rating,
             "rs_line":      rs_line_val,
+            "rs_line_breakout":     rs_line_breakout,
+            "rs_line_breakout_pct": rs_line_breakout_pct,
             "vcp":          vcp,
             "total_score":  total,
+            "score_breakdown": {
+                "trend":            round(trend_pts, 1),
+                "rs":               round(rs_pts, 1),
+                "vcp":              vcp_pts,
+                "near_pivot":       near_pts,
+                "tightness_bonus":  tightness_bonus,
+                "rs_line_bonus":    rs_line_bonus,
+            },
             "vol_ma20":     vol_ma20,
             "vol_ma50":     vol_ma50,
             "analysis_time": now.isoformat(),
