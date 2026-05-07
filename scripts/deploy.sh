@@ -67,24 +67,32 @@ docker compose up -d
 success "Container đã khởi động với code mới"
 
 # ── Bước 4: Health check ────────────────────────────────────────────────────
+# App startup mất ~30-60s vì phải:
+#   - Init OHLCV/User DB
+#   - Preload top 25 quotes (qua vnstock API có rate limit)
+#   - Print vnstock library banner (chậm)
+# → Cần timeout ≥ 90s để tránh false-alarm
 info "Bước 4/5: Kiểm tra health check..."
-MAX_RETRIES=15
+MAX_RETRIES=45    # 45 × 2s = 90s
 RETRY=0
-sleep 3   # Chờ container start
+sleep 5   # Chờ container start
 
 while [ $RETRY -lt $MAX_RETRIES ]; do
     HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/health 2>/dev/null || echo "000")
     if [ "$HTTP_CODE" = "200" ]; then
-        success "Health check OK (HTTP 200) sau $((RETRY * 2))s"
+        success "Health check OK (HTTP 200) sau $((RETRY * 2 + 5))s"
         break
     fi
     RETRY=$((RETRY + 1))
-    info "Đang chờ... ($RETRY/$MAX_RETRIES) — HTTP $HTTP_CODE"
+    # Giảm log spam: chỉ in mỗi 5 lần thử
+    if [ $((RETRY % 5)) -eq 0 ] || [ $RETRY -eq 1 ]; then
+        info "Đang chờ app startup... ($RETRY/$MAX_RETRIES, $((RETRY * 2 + 5))s) — HTTP $HTTP_CODE"
+    fi
     sleep 2
 done
 
 if [ $RETRY -eq $MAX_RETRIES ]; then
-    error "Health check THẤT BẠI sau $((MAX_RETRIES * 2))s — xem logs: docker compose logs"
+    error "Health check THẤT BẠI sau $((MAX_RETRIES * 2))s — xem logs: docker logs vnstock-backend"
 fi
 
 # ── Bước 5: Dọn dẹp Docker images cũ ──────────────────────────────────────
