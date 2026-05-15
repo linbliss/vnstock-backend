@@ -117,11 +117,26 @@ def init_db() -> None:
                 FOREIGN KEY (user_id) REFERENCES users(id)
             );
 
+            CREATE TABLE IF NOT EXISTS dividends (
+                id                 TEXT PRIMARY KEY,
+                user_id            TEXT NOT NULL,
+                broker_account_id  TEXT,
+                ticker             TEXT NOT NULL,
+                dividend_per_share REAL NOT NULL,    -- VND / cổ phiếu
+                quantity           REAL NOT NULL,    -- số CP nắm tại ngày ex-div
+                total_amount       REAL NOT NULL,    -- = div_per_share × qty
+                ex_date            TEXT NOT NULL,
+                notes              TEXT NOT NULL DEFAULT '',
+                created_at         TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_trades_user     ON trades(user_id);
             CREATE INDEX IF NOT EXISTS idx_accounts_user   ON broker_accounts(user_id);
             CREATE INDEX IF NOT EXISTS idx_watchlists_user ON watchlists(user_id);
             CREATE INDEX IF NOT EXISTS idx_wl_items_wl     ON watchlist_items(watchlist_id);
             CREATE INDEX IF NOT EXISTS idx_alert_log_user  ON alert_log(user_id, sent_at);
+            CREATE INDEX IF NOT EXISTS idx_dividends_user  ON dividends(user_id, ticker);
             """
         )
 
@@ -134,6 +149,17 @@ def init_db() -> None:
         )
         except Exception: pass
         try: conn.execute("CREATE INDEX IF NOT EXISTS idx_alert_log_user ON alert_log(user_id, sent_at)")
+        except Exception: pass
+        try: conn.execute(
+            "CREATE TABLE IF NOT EXISTS dividends ("
+            "  id TEXT PRIMARY KEY, user_id TEXT NOT NULL,"
+            "  broker_account_id TEXT, ticker TEXT NOT NULL,"
+            "  dividend_per_share REAL NOT NULL, quantity REAL NOT NULL,"
+            "  total_amount REAL NOT NULL, ex_date TEXT NOT NULL,"
+            "  notes TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL)"
+        )
+        except Exception: pass
+        try: conn.execute("CREATE INDEX IF NOT EXISTS idx_dividends_user ON dividends(user_id, ticker)")
         except Exception: pass
         try: conn.execute("ALTER TABLE broker_accounts ADD COLUMN account_name TEXT NOT NULL DEFAULT ''")
         except Exception: pass
@@ -565,3 +591,96 @@ def get_recent_alerts(user_id: str, limit: int = 30) -> List[dict]:
             (user_id, limit),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ── Dividends (cổ tức tiền mặt) ───────────────────────────────────────────────
+
+def add_dividend(
+    user_id: str, ticker: str, dividend_per_share: float, quantity: float,
+    ex_date: str, broker_account_id: Optional[str] = None, notes: str = "",
+) -> dict:
+    """Ghi nhận 1 lần cổ tức tiền mặt. total_amount = div_per_share × quantity."""
+    did = uuid.uuid4().hex
+    now = _now()
+    total = round(float(dividend_per_share) * float(quantity), 2)
+    ticker_up = ticker.upper().strip()
+    with _lock, _connect() as conn:
+        conn.execute(
+            """INSERT INTO dividends(
+                 id, user_id, broker_account_id, ticker,
+                 dividend_per_share, quantity, total_amount,
+                 ex_date, notes, created_at
+               ) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (did, user_id, broker_account_id, ticker_up,
+             float(dividend_per_share), float(quantity), total,
+             ex_date, notes, now),
+        )
+    return {
+        "id": did, "user_id": user_id,
+        "broker_account_id": broker_account_id, "ticker": ticker_up,
+        "dividend_per_share": float(dividend_per_share),
+        "quantity": float(quantity), "total_amount": total,
+        "ex_date": ex_date, "notes": notes, "created_at": now,
+    }
+
+
+def get_dividends(user_id: str) -> List[dict]:
+    """Lấy toàn bộ dividends của user, sort theo ex_date desc."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """SELECT id, user_id, broker_account_id, ticker,
+                      dividend_per_share, quantity, total_amount,
+                      ex_date, notes, created_at
+               FROM dividends WHERE user_id=?
+               ORDER BY ex_date DESC, created_at DESC""",
+            (user_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_dividend(div_id: str, user_id: str, patch: dict) -> Optional[dict]:
+    """Update các field cho phép, tự tính lại total_amount."""
+    allowed = {"ticker", "dividend_per_share", "quantity", "ex_date",
+               "notes", "broker_account_id"}
+    sets, args = [], []
+    for k, v in patch.items():
+        if k not in allowed:
+            continue
+        if k == "ticker" and v:
+            v = v.upper().strip()
+        sets.append(f"{k}=?")
+        args.append(v)
+    if not sets:
+        return None
+    args.extend([div_id, user_id])
+    with _lock, _connect() as conn:
+        conn.execute(
+            f"UPDATE dividends SET {','.join(sets)} WHERE id=? AND user_id=?",
+            args,
+        )
+        # Recompute total_amount
+        row = conn.execute(
+            "SELECT dividend_per_share, quantity FROM dividends WHERE id=? AND user_id=?",
+            (div_id, user_id),
+        ).fetchone()
+        if row:
+            new_total = round(float(row["dividend_per_share"]) * float(row["quantity"]), 2)
+            conn.execute(
+                "UPDATE dividends SET total_amount=? WHERE id=? AND user_id=?",
+                (new_total, div_id, user_id),
+            )
+        # Return updated
+        updated = conn.execute(
+            "SELECT * FROM dividends WHERE id=? AND user_id=?",
+            (div_id, user_id),
+        ).fetchone()
+    return dict(updated) if updated else None
+
+
+def delete_dividend(div_id: str, user_id: str) -> bool:
+    with _lock, _connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM dividends WHERE id=? AND user_id=?",
+            (div_id, user_id),
+        )
+    return cur.rowcount > 0

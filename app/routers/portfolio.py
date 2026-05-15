@@ -65,6 +65,24 @@ class AccPatch(BaseModel):
     is_active: Optional[bool] = None
 
 
+class DividendCreate(BaseModel):
+    ticker: str
+    dividend_per_share: float    # VND/cổ phiếu
+    quantity: float              # số CP nắm tại ngày ex-div
+    ex_date: str                 # YYYY-MM-DD
+    broker_account_id: Optional[str] = None
+    notes: Optional[str] = ""
+
+
+class DividendPatch(BaseModel):
+    ticker: Optional[str] = None
+    dividend_per_share: Optional[float] = None
+    quantity: Optional[float] = None
+    ex_date: Optional[str] = None
+    broker_account_id: Optional[str] = None
+    notes: Optional[str] = None
+
+
 # ── Trades ────────────────────────────────────────────────────────────────────
 
 @router.get("/trades")
@@ -157,4 +175,49 @@ def delete_account(acct_id: str, current_user: dict = Depends(get_current_user))
     ok = user_store.delete_account(acct_id, current_user["id"])
     if not ok:
         raise HTTPException(status_code=404, detail="Account not found")
+    return {"ok": True}
+
+
+# ── Dividends (cổ tức tiền mặt) ───────────────────────────────────────────────
+
+@router.get("/dividends")
+def list_dividends(current_user: dict = Depends(get_current_user)):
+    return user_store.get_dividends(current_user["id"])
+
+
+@router.post("/dividends", status_code=201)
+def create_dividend(body: DividendCreate, current_user: dict = Depends(get_current_user)):
+    if body.dividend_per_share <= 0:
+        raise HTTPException(status_code=400, detail="dividend_per_share phải > 0")
+    if body.quantity <= 0:
+        raise HTTPException(status_code=400, detail="quantity phải > 0")
+    return user_store.add_dividend(
+        user_id=current_user["id"],
+        ticker=body.ticker,
+        dividend_per_share=body.dividend_per_share,
+        quantity=body.quantity,
+        ex_date=body.ex_date,
+        broker_account_id=body.broker_account_id,
+        notes=body.notes or "",
+    )
+
+
+@router.put("/dividends/{div_id}")
+def update_div(div_id: str, body: DividendPatch, current_user: dict = Depends(get_current_user)):
+    patch = body.model_dump(exclude_unset=True)
+    if "dividend_per_share" in patch and patch["dividend_per_share"] is not None and patch["dividend_per_share"] <= 0:
+        raise HTTPException(status_code=400, detail="dividend_per_share phải > 0")
+    if "quantity" in patch and patch["quantity"] is not None and patch["quantity"] <= 0:
+        raise HTTPException(status_code=400, detail="quantity phải > 0")
+    updated = user_store.update_dividend(div_id, current_user["id"], patch)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Dividend not found")
+    return updated
+
+
+@router.delete("/dividends/{div_id}")
+def delete_div(div_id: str, current_user: dict = Depends(get_current_user)):
+    ok = user_store.delete_dividend(div_id, current_user["id"])
+    if not ok:
+        raise HTTPException(status_code=404, detail="Dividend not found")
     return {"ok": True}
