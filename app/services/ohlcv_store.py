@@ -182,6 +182,26 @@ def get_last_date(ticker: str) -> Optional[str]:
     return row["last_date"] if row else None
 
 
+def get_last_close(ticker: str) -> Optional[float]:
+    """Lấy giá close của phiên giao dịch cuối cùng đang lưu trong SQLite."""
+    t = ticker.upper()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT close FROM ohlcv WHERE ticker=? ORDER BY date DESC LIMIT 1",
+            (t,),
+        ).fetchone()
+    return float(row["close"]) if row and row["close"] else None
+
+
+def delete_ohlcv(ticker: str) -> int:
+    """Xoá toàn bộ OHLCV rows + backfill_status của 1 ticker (để re-fetch)."""
+    t = ticker.upper()
+    with _lock, _connect() as conn:
+        n = conn.execute("DELETE FROM ohlcv WHERE ticker=?", (t,)).rowcount
+        conn.execute("DELETE FROM backfill_status WHERE ticker=?", (t,))
+    return n
+
+
 def list_tickers() -> List[str]:
     with _connect() as conn:
         rows = conn.execute(

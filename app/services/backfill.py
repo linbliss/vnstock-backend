@@ -234,31 +234,80 @@ def cancel_backfill(job_id: str) -> bool:
 
 async def daily_update() -> Dict:
     """Cập nhật tất cả ticker trong store từ last_date (+1) → hôm nay.
-    Chạy tự động lúc 16:00 Việt Nam."""
+    Chạy tự động lúc 16:00 Việt Nam.
+
+    Tự động phát hiện điều chỉnh giá (corporate action: thưởng CP, tách/gộp cổ phiếu):
+    Nếu open của ngày mới lệch > GAP_THRESHOLD so với close cuối → re-fetch toàn bộ lịch sử
+    để lấy giá đã được điều chỉnh ngược từ data provider.
+    """
+    # Gap > 15%: dấu hiệu corporate action (thưởng CP, tách cổ phiếu, quyền mua...)
+    # Thay đổi thông thường trong phiên hiếm khi vượt 15% (trần sàn VN thường ±7%)
+    GAP_THRESHOLD = 0.15
+
     tickers = ohlcv_store.list_tickers()
     if not tickers:
         return {"updated": 0, "total": 0, "message": "store empty"}
     today = datetime.now().strftime("%Y-%m-%d")
-    updated, failed = 0, 0
+    updated, failed, readjusted = 0, 0, []
+
     for t in tickers:
         last = ohlcv_store.get_last_date(t)
         if last and last >= today:
             continue
-        # start = last+1 nếu có, ngược lại 7 ngày trước (safety)
         if last:
             nxt = (datetime.strptime(last, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
         else:
             nxt = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
         try:
+            # Lấy close cuối trước khi fetch (để so sánh gap)
+            prev_close = ohlcv_store.get_last_close(t)
+
             n = await _backfill_one(t, nxt, today)
+
+            # Phát hiện corporate action: so sánh close cũ với open mới
+            if n > 0 and prev_close and prev_close > 0:
+                new_close = ohlcv_store.get_last_close(t)
+                if new_close and new_close > 0:
+                    gap = abs(new_close - prev_close) / prev_close
+                    if gap > GAP_THRESHOLD:
+                        print(
+                            f"🔔 Corporate action detected {t}: "
+                            f"prev_close={prev_close:.1f} → new_close={new_close:.1f} "
+                            f"gap={gap*100:.1f}% > {GAP_THRESHOLD*100:.0f}% → re-fetch full history",
+                            flush=True,
+                        )
+                        await refetch_ticker(t)
+                        readjusted.append(t)
+
             if n > 0:
                 updated += 1
         except BaseException as e:
             failed += 1
             print(f"❌ daily_update {t}: {type(e).__name__}: {e}")
-    msg = f"daily_update {datetime.now().isoformat()}: {updated}/{len(tickers)} updated, {failed} failed"
+
+    msg = (
+        f"daily_update {datetime.now().isoformat()}: "
+        f"{updated}/{len(tickers)} updated, {failed} failed"
+    )
+    if readjusted:
+        msg += f", {len(readjusted)} readjusted: {readjusted}"
     print("✅", msg)
-    return {"updated": updated, "failed": failed, "total": len(tickers), "message": msg}
+    return {"updated": updated, "failed": failed, "total": len(tickers),
+            "readjusted": readjusted, "message": msg}
+
+
+async def refetch_ticker(ticker: str, years: int = 3) -> int:
+    """Xoá OHLCV cũ và fetch lại toàn bộ lịch sử cho 1 ticker.
+    Dùng khi phát hiện corporate action (giá điều chỉnh ngược) hoặc gọi thủ công.
+    Trả về số rows đã ghi."""
+    t = ticker.upper()
+    start = (datetime.now() - timedelta(days=365 * years)).strftime("%Y-%m-%d")
+    end   = datetime.now().strftime("%Y-%m-%d")
+    print(f"🔄 refetch_ticker {t}: xoá cache cũ, fetch lại {years} năm [{start}..{end}]", flush=True)
+    ohlcv_store.delete_ohlcv(t)
+    n = await _backfill_one(t, start, end, timeout=90.0)
+    print(f"✅ refetch_ticker {t}: {n} rows", flush=True)
+    return n
 
 
 async def refresh_fundamentals() -> Dict:

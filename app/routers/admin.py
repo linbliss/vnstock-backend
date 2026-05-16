@@ -112,6 +112,17 @@ async def ohlcv_tickers():
     return {"count": len(tickers), "tickers": tickers}
 
 
+@router.post("/ohlcv/refetch/{ticker}")
+async def refetch_ticker_ohlcv(
+    ticker: str,
+    years: int = Query(default=3, ge=1, le=15, description="Số năm lịch sử cần fetch lại"),
+):
+    """Xoá OHLCV cũ và fetch lại toàn bộ lịch sử cho 1 ticker.
+    Dùng khi corporate action (thưởng CP, tách/gộp cổ phiếu) làm giá lịch sử bị sai."""
+    n = await backfill.refetch_ticker(ticker.upper(), years=years)
+    return {"ticker": ticker.upper(), "rows_fetched": n, "years": years, "ok": n > 0}
+
+
 @router.get("/ohlcv/{ticker}")
 async def ohlcv_detail(
     ticker: str,
