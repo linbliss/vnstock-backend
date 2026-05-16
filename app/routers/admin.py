@@ -3,7 +3,9 @@
 Auth: mỗi request phải có header `X-Admin-Token` khớp env `ADMIN_TOKEN`.
 Nếu `ADMIN_TOKEN` không set → endpoint trả 503 để tránh mở cửa toàn bộ ra public.
 """
+import asyncio
 import os
+from datetime import datetime
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Query, Header, Depends
 
@@ -121,6 +123,47 @@ async def refetch_ticker_ohlcv(
     Dùng khi corporate action (thưởng CP, tách/gộp cổ phiếu) làm giá lịch sử bị sai."""
     n = await backfill.refetch_ticker(ticker.upper(), years=years)
     return {"ticker": ticker.upper(), "rows_fetched": n, "years": years, "ok": n > 0}
+
+
+@router.post("/stock-list/refresh")
+async def refresh_stock_list():
+    """Fetch toàn bộ danh sách mã CK từ vnstock Listing và lưu vào SQLite.
+    Chạy 1 lần sau khi deploy, hoặc khi cần cập nhật mã mới lên/xuống sàn."""
+    loop = asyncio.get_event_loop()
+
+    def _fetch() -> list:
+        from vnstock import Listing
+        df = Listing().symbols_by_exchange()
+        if df is None or df.empty:
+            return []
+        mask = (df["type"] == "stock") & (df["exchange"].isin(["HOSE", "HNX", "UPCOM"]))
+        filtered = df[mask][["symbol", "organ_name", "exchange"]].drop_duplicates("symbol")
+        result = []
+        for _, r in filtered.iterrows():
+            ticker = str(r["symbol"]).strip().upper()
+            name   = str(r["organ_name"]).strip() if r["organ_name"] else ""
+            exch   = str(r["exchange"]).strip().upper()
+            if ticker and exch in ("HOSE", "HNX", "UPCOM"):
+                result.append({"ticker": ticker, "name": name, "exchange": exch})
+        return result
+
+    try:
+        stocks = await loop.run_in_executor(None, _fetch)
+    except BaseException as e:
+        raise HTTPException(status_code=500, detail=f"vnstock error: {type(e).__name__}: {e}")
+
+    if not stocks:
+        raise HTTPException(status_code=500, detail="Không lấy được dữ liệu từ vnstock")
+
+    n = ohlcv_store.upsert_stock_list(stocks)
+    stats = ohlcv_store.get_stock_list_stats()
+    return {"ok": True, "count": n, "stats": stats}
+
+
+@router.get("/stock-list/stats")
+async def stock_list_stats():
+    """Thống kê bảng stock_list."""
+    return ohlcv_store.get_stock_list_stats()
 
 
 @router.get("/ohlcv/{ticker}")

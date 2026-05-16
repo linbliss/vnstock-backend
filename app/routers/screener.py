@@ -438,6 +438,14 @@ async def get_tickers_by_exchange(exchange: str) -> List[str]:
         return []
 
 
+@router.get("/stock-list")
+async def get_stock_list():
+    """Trả về danh sách mã CK đã lưu trong SQLite (được cập nhật qua Admin)."""
+    from app.services import ohlcv_store as store
+    stocks = store.get_stock_list()
+    return {"count": len(stocks), "stocks": stocks}
+
+
 @router.get("/tickers/{exchange}")
 async def get_exchange_tickers(exchange: str):
     ex = exchange.upper()

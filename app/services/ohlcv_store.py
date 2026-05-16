@@ -85,6 +85,13 @@ def init_db() -> None:
                 total       INTEGER NOT NULL,
                 updated_at  TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS stock_list (
+                ticker     TEXT PRIMARY KEY,
+                name       TEXT,
+                exchange   TEXT,
+                updated_at TEXT
+            );
             """
         )
     print(f"✅ OHLCV DB ready at {DB_PATH}")
@@ -390,3 +397,48 @@ def is_rs_ratings_stale() -> bool:
     from datetime import datetime as dt
     last_update = dt.fromisoformat(row["m"])
     return (dt.now() - last_update).total_seconds() > 86400  # >24h
+
+
+# ── Stock List ────────────────────────────────────────────────────────────────
+
+def upsert_stock_list(stocks: List[Dict[str, Any]]) -> int:
+    """Bulk upsert danh sách mã CK (ticker, name, exchange)."""
+    if not stocks:
+        return 0
+    now = datetime.now().isoformat()
+    rows = [(s["ticker"], s.get("name", ""), s["exchange"], now) for s in stocks]
+    with _lock, _connect() as conn:
+        conn.executemany(
+            """INSERT INTO stock_list(ticker, name, exchange, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(ticker) DO UPDATE SET
+                 name=excluded.name,
+                 exchange=excluded.exchange,
+                 updated_at=excluded.updated_at""",
+            rows,
+        )
+    return len(rows)
+
+
+def get_stock_list() -> List[Dict[str, Any]]:
+    """Trả về toàn bộ danh sách mã CK đã lưu."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT ticker, name, exchange FROM stock_list ORDER BY exchange, ticker"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_stock_list_stats() -> Dict[str, Any]:
+    """Thống kê bảng stock_list."""
+    with _connect() as conn:
+        total = conn.execute("SELECT COUNT(*) c FROM stock_list").fetchone()["c"]
+        updated = conn.execute("SELECT MAX(updated_at) m FROM stock_list").fetchone()["m"]
+        rows = conn.execute(
+            "SELECT exchange, COUNT(*) c FROM stock_list GROUP BY exchange ORDER BY exchange"
+        ).fetchall()
+    return {
+        "total": total,
+        "updated_at": updated,
+        "by_exchange": {r["exchange"]: r["c"] for r in rows},
+    }
