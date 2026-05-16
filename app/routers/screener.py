@@ -698,8 +698,10 @@ async def get_fundamental(ticker: str):
     await market_service._limiter.acquire()
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(None, _fetch_fundamental_via_api, sym)
-    # Chỉ lưu nếu có dữ liệu thực (eps không rỗng)
-    if result.get("eps"):
+    # Chỉ lưu vào cache khi có EPS VÀ ROE hợp lệ
+    # Nếu roe_latest=0 thì không cache → force refetch lần sau
+    has_valid_roe = result.get("roe_latest", 0) != 0 or any(v != 0 for v in result.get("roe", []))
+    if result.get("eps") and has_valid_roe:
         ohlcv_store.upsert_fundamental(sym, result)
     return result
 
