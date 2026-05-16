@@ -39,7 +39,9 @@ def _fetch_fundamental_via_api(ticker: str) -> Dict[str, Any]:
                 fund_data = fund_resp.json()
                 shares = fund_data.get("sharesOutstanding", 0) or 0
 
-            # 1a2. Lấy ROE từ financial-indicators (fundamental không có roe)
+            # 1a2. Lấy ROE từ financial-indicators — thu thập TẤT CẢ quý, không chỉ 1 điểm
+            # API trả list [{shortName, period, value}, ...] mỗi item = 1 chỉ số 1 quý
+            roe_by_period: dict = {}   # "Q4/2024" → roe_value
             try:
                 ind_resp = requests.get(
                     f"https://restv2.fireant.vn/symbols/{ticker}/financial-indicators?type=quarterly&count=20",
@@ -49,11 +51,26 @@ def _fetch_fundamental_via_api(ticker: str) -> Dict[str, Any]:
                     indicators = ind_resp.json()
                     if isinstance(indicators, list):
                         for item in indicators:
-                            if isinstance(item, dict) and item.get("shortName") == "ROE":
-                                roe_latest = float(item.get("value", 0) or 0)
-                                break
-            except Exception:
-                pass
+                            if not isinstance(item, dict):
+                                continue
+                            sn = (item.get("shortName") or "").upper().replace(" ", "")
+                            if sn in ("ROE", "ROE(%)"):
+                                period = item.get("period") or item.get("quarter") or ""
+                                val = item.get("value")
+                                try:
+                                    fval = float(val or 0)
+                                    if period:
+                                        roe_by_period[str(period)] = fval
+                                    # Cập nhật roe_latest = quý mới nhất (item đầu tiên)
+                                    if roe_latest == 0.0 and fval != 0:
+                                        roe_latest = fval
+                                except (ValueError, TypeError):
+                                    pass
+            except Exception as e_ind:
+                print(f"⚠️  Fundamental {ticker} indicators error: {e_ind}", flush=True)
+
+            n_roe = len(roe_by_period)
+            print(f"📊 Fundamental {ticker}: roe_latest={roe_latest:.2f}, roe_by_period={n_roe} quý", flush=True)
 
             # 1b. Lấy quarterly NetProfit từ financial-reports
             report_resp = requests.get(
@@ -62,7 +79,7 @@ def _fetch_fundamental_via_api(ticker: str) -> Dict[str, Any]:
             )
             if report_resp.status_code == 200:
                 report_data = report_resp.json()
-                result = _parse_fireant_reports(ticker, report_data, shares, roe_latest)
+                result = _parse_fireant_reports(ticker, report_data, shares, roe_latest, roe_by_period)
                 if result:
                     print(f"✅ Fundamental {ticker} via FireAnt: OK", flush=True)
                     return result
@@ -112,7 +129,7 @@ def _fetch_fundamental_via_api(ticker: str) -> Dict[str, Any]:
     return empty
 
 
-def _parse_fireant_reports(ticker: str, report_data: Any, shares: float, roe_latest: float) -> Dict[str, Any]:
+def _parse_fireant_reports(ticker: str, report_data: Any, shares: float, roe_latest: float, roe_by_period: dict = None) -> Dict[str, Any]:
     """Parse FireAnt /financial-reports response → fundamental dict.
 
     Format:
@@ -190,7 +207,14 @@ def _parse_fireant_reports(ticker: str, report_data: Any, shares: float, roe_lat
         else:
             eps_q = 0.0
 
+        # Gắn ROE thực từ roe_by_period nếu có (ưu tiên dữ liệu thực vs ước lượng)
+        roe_q = 0.0
+        if roe_by_period:
+            # col_label format "Q4/2024" → khớp trực tiếp với key từ FireAnt
+            roe_q = roe_by_period.get(col_label, 0.0)
+
         raw_eps.append(eps_q)
+        raw_roe.append(round(roe_q, 2))
         raw_quarters.append({"year": year, "quarter": quarter})
 
     if not raw_eps:
@@ -198,38 +222,40 @@ def _parse_fireant_reports(ticker: str, report_data: Any, shares: float, roe_lat
 
     # Nếu ít hơn 4 quý, trả về raw data (không tính TTM)
     if len(raw_eps) < 4:
-        raw_roe = [round(roe_latest, 2)] * len(raw_eps)
+        # Nếu không có ROE thực, điền bằng roe_latest
+        filled_roe = [r if r != 0.0 else round(roe_latest, 2) for r in raw_roe]
         return {
             "ticker": ticker,
             "eps": raw_eps,
-            "roe": raw_roe,
+            "roe": filled_roe,
             "quarters": raw_quarters,
             "eps_growth": False,
             "roe_latest": round(roe_latest, 2),
             "roe_growth": False,
         }
 
-    # Tính TTM EPS trước, rồi suy ra ROE ước lượng theo quý
-    # ROE = EPS_TTM / Equity_per_share * 100
-    # Equity_per_share = EPS_TTM_latest / (ROE_latest / 100)  (suy ngược từ snapshot)
-    result = _compute_ttm(ticker, raw_eps, [0.0] * len(raw_eps), raw_quarters)
-    if not result:
-        return None
+    # Tính TTM EPS; ROE dùng giá trị thực từ roe_by_period nếu có,
+    # fallback ước lượng từ roe_latest nếu không có dữ liệu thực.
+    has_real_roe = any(r != 0.0 for r in raw_roe)
 
-    # Tính ROE ước lượng cho từng quý TTM
-    eps_ttm_list = result["eps"]
-    if roe_latest and roe_latest > 0 and eps_ttm_list and eps_ttm_list[-1] != 0:
-        # Suy Equity per share từ snapshot: Equity = EPS_TTM_latest / (ROE% / 100)
-        equity_ps = abs(eps_ttm_list[-1]) / (roe_latest / 100.0)
-        roe_estimated = [round(e / equity_ps * 100, 2) if equity_ps > 0 else 0.0 for e in eps_ttm_list]
-        result["roe"] = roe_estimated
-        result["roe_latest"] = roe_estimated[-1] if roe_estimated else round(roe_latest, 2)
-        # ROE growth: kiểm tra 2 quý gần nhất tăng
-        if len(roe_estimated) >= 2:
-            result["roe_growth"] = roe_estimated[-1] > roe_estimated[-2]
+    if has_real_roe:
+        # Trường hợp có ROE thực từng quý → dùng trực tiếp (không cần ước lượng)
+        result = _compute_ttm(ticker, raw_eps, raw_roe, raw_quarters)
     else:
-        result["roe"] = [round(roe_latest, 2)] * len(eps_ttm_list)
-        result["roe_latest"] = round(roe_latest, 2)
+        # Fallback: ước lượng ROE từ roe_latest snapshot
+        result = _compute_ttm(ticker, raw_eps, [0.0] * len(raw_eps), raw_quarters)
+        if result:
+            eps_ttm_list = result["eps"]
+            if roe_latest and roe_latest > 0 and eps_ttm_list and eps_ttm_list[-1] != 0:
+                equity_ps = abs(eps_ttm_list[-1]) / (roe_latest / 100.0)
+                roe_estimated = [round(e / equity_ps * 100, 2) if equity_ps > 0 else 0.0 for e in eps_ttm_list]
+                result["roe"] = roe_estimated
+                result["roe_latest"] = roe_estimated[-1] if roe_estimated else round(roe_latest, 2)
+                if len(roe_estimated) >= 2:
+                    result["roe_growth"] = roe_estimated[-1] > roe_estimated[-2]
+            else:
+                result["roe"] = [round(roe_latest, 2)] * len(eps_ttm_list)
+                result["roe_latest"] = round(roe_latest, 2)
 
     return result
 
