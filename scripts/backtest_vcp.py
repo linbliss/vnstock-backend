@@ -111,6 +111,44 @@ def _stop_aware_returns(close: np.ndarray, low: np.ndarray, i: int,
     return out
 
 
+def _trailing_stop_returns(close: np.ndarray, low: np.ndarray, i: int,
+                           init_stop: float, trail_pct: float) -> dict:
+    """Forward return với TRAILING stop (chandelier %): stop = max(init_stop,
+    đỉnh × (1 - trail_pct%)). Stop dời LÊN theo đỉnh giá kể từ khi vào lệnh.
+
+    Phản ánh thực chiến Minervini: stop sát ban đầu chặn thất bại tức thì, khi
+    lệnh chạy thì dời stop lên khoá lời thay vì giữ stop ban đầu (gây whipsaw).
+
+    No-lookahead: stop ngày j dựa trên đỉnh TỚI j-1 (đỉnh cập nhật bằng close
+    sau khi đã check low ngày j).
+    """
+    base = close[i]
+    out = {h: None for h in HORIZONS}
+    if base <= 0:
+        return out
+    maxh = max(HORIZONS)
+    end = min(i + maxh, len(close) - 1)
+    peak = base
+    exit_j = exit_price = None
+    for j in range(i + 1, end + 1):
+        trail = peak * (1 - trail_pct / 100)
+        eff_stop = max(init_stop, trail) if init_stop and init_stop > 0 else trail
+        if low[j] <= eff_stop:
+            exit_j, exit_price = j, eff_stop
+            break
+        if close[j] > peak:                       # cập nhật đỉnh SAU khi check (no-lookahead)
+            peak = close[j]
+    for h in HORIZONS:
+        j = i + h
+        if j >= len(close):
+            continue
+        if exit_j is not None and exit_j <= j:
+            out[h] = _clip((exit_price / base - 1) * 100)
+        else:
+            out[h] = _clip((close[j] / base - 1) * 100)
+    return out
+
+
 def _regime_ok(cur_date, idx_close_dt: pd.Series, idx_ma50: pd.Series) -> bool:
     """Market regime: VNINDEX > MA50 tại (hoặc trước) cur_date — no-lookahead."""
     ic = idx_close_dt.asof(cur_date)
@@ -126,7 +164,9 @@ def backtest_ticker(ticker: str, signal_fn, config, step: int,
                     use_regime: bool = False,
                     idx_ma50: Optional[pd.Series] = None,
                     use_stop: bool = False,
-                    stop_pct: float = 8.0) -> list:
+                    stop_pct: float = 8.0,
+                    use_trail: bool = False,
+                    trail_pct: float = 15.0) -> list:
     """Trả về list forward-return dict cho mỗi phiên có tín hiệu.
 
     RS gate (min_rs): tính RS score TẠI từng phiên từ window TỚI phiên đó
@@ -135,7 +175,7 @@ def backtest_ticker(ticker: str, signal_fn, config, step: int,
 
     Regime filter (use_regime): chỉ tính tín hiệu khi VNINDEX > MA50 tại phiên đó.
 
-    Stop-loss (use_stop): thoát tại vcp.stop_loss (fallback -stop_pct% nếu thiếu).
+    Exit: use_trail (trailing %) > use_stop (stop cố định) > buy&hold tới horizon.
     """
     df = ohlcv_store.get_ohlcv(ticker)
     if df is None or len(df) < MIN_HISTORY + max(HORIZONS) + 1:
@@ -174,12 +214,15 @@ def backtest_ticker(ticker: str, signal_fn, config, step: int,
                 rs = 0.0
             if rs < min_rs:
                 continue
-        if use_stop:
+        if use_trail or use_stop:
             # vcp.stop_loss cùng đơn vị close (đều từ df). Fallback -stop_pct%.
             sl = float(vcp.get("stop_loss") or 0)
             if not (0 < sl < close[i]):
                 sl = close[i] * (1 - stop_pct / 100)
-            fr = _stop_aware_returns(close, low, i, sl)
+            if use_trail:
+                fr = _trailing_stop_returns(close, low, i, sl, trail_pct)
+            else:
+                fr = _stop_aware_returns(close, low, i, sl)
         else:
             fr = _forward_returns(close, i)
         if all(fr[h] is not None for h in HORIZONS):
@@ -192,15 +235,16 @@ def baseline_ticker(ticker: str, step: int,
                     idx_close_dt: Optional[pd.Series] = None,
                     idx_ma50: Optional[pd.Series] = None,
                     use_stop: bool = False,
-                    stop_pct: float = 8.0) -> list:
+                    stop_pct: float = 8.0,
+                    use_trail: bool = False,
+                    trail_pct: float = 15.0) -> list:
     """Baseline: forward return của MỌI phiên (không lọc tín hiệu).
 
     Nếu use_regime: baseline cũng chỉ lấy phiên VNINDEX > MA50 → so sánh CÔNG
-    BẰNG (cô lập edge của tín hiệu VCP trong cùng điều kiện up-regime, tránh
-    nhầm cải thiện do regime với cải thiện do detector).
+    BẰNG (cô lập edge của tín hiệu VCP trong cùng điều kiện up-regime).
 
-    Nếu use_stop: baseline dùng stop cố định -stop_pct% (không có pivot) → so
-    sánh signal-có-stop vs baseline-có-stop cùng quy tắc thoát.
+    use_stop / use_trail: baseline dùng init_stop = -stop_pct% (không có pivot)
+    + cùng quy tắc thoát với signal → so sánh công bằng.
     """
     df = ohlcv_store.get_ohlcv(ticker)
     if df is None or len(df) < MIN_HISTORY + max(HORIZONS) + 1:
@@ -213,7 +257,9 @@ def baseline_ticker(ticker: str, step: int,
     for i in range(MIN_HISTORY, n - max(HORIZONS), step):
         if use_regime and not _regime_ok(dates.iloc[i], idx_close_dt, idx_ma50):
             continue
-        if use_stop:
+        if use_trail:
+            fr = _trailing_stop_returns(close, low, i, close[i] * (1 - stop_pct / 100), trail_pct)
+        elif use_stop:
             fr = _stop_aware_returns(close, low, i, close[i] * (1 - stop_pct / 100))
         else:
             fr = _forward_returns(close, i)
@@ -288,6 +334,11 @@ def main():
                          "baseline thoát tại -stop_pct%%. Phản ánh trade thật.")
     ap.add_argument("--stop-pct", type=float, default=8.0,
                     help="%% stop cho baseline (và fallback signal). Mặc định 8.")
+    ap.add_argument("--trail", action="store_true",
+                    help="trailing stop: dời stop lên theo đỉnh giá (chandelier). "
+                         "init_stop=vcp.stop_loss, trail dưới đỉnh -trail_pct%%.")
+    ap.add_argument("--trail-pct", type=float, default=15.0,
+                    help="%% trailing dưới đỉnh giá. Mặc định 15.")
     args = ap.parse_args()
 
     global CLIP_PCT, HORIZONS
@@ -321,7 +372,9 @@ def main():
         print(f"  (RS gate: RS score >= {args.min_rs} vs {args.index}, no-lookahead)")
     if args.regime:
         print(f"  (regime filter: {args.index} > MA50, áp cho signal + baseline)")
-    if args.stop:
+    if args.trail:
+        print(f"  (trailing stop: init=vcp.stop_loss, trail -{args.trail_pct:.0f}% dưới đỉnh)")
+    elif args.stop:
         print(f"  (stop-loss: signal=vcp.stop_loss, baseline=-{args.stop_pct:.0f}%)")
     print("-" * 60)
 
@@ -330,10 +383,12 @@ def main():
         hits = backtest_ticker(t, signal_fn, config, args.step,
                                min_rs=args.min_rs, idx_close_dt=idx_close_dt,
                                use_regime=args.regime, idx_ma50=idx_ma50,
-                               use_stop=args.stop, stop_pct=args.stop_pct)
+                               use_stop=args.stop, stop_pct=args.stop_pct,
+                               use_trail=args.trail, trail_pct=args.trail_pct)
         base = baseline_ticker(t, args.step, use_regime=args.regime,
                                idx_close_dt=idx_close_dt, idx_ma50=idx_ma50,
-                               use_stop=args.stop, stop_pct=args.stop_pct)
+                               use_stop=args.stop, stop_pct=args.stop_pct,
+                               use_trail=args.trail, trail_pct=args.trail_pct)
         sig_all.extend(hits)
         base_all.extend(base)
         if hits:
