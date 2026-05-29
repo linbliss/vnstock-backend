@@ -376,12 +376,15 @@ def compute_rs_line_breakout(
       sắp tới có xác suất thành công cao hơn.
     """
     try:
-        # Align by tail (Min length needed)
-        n = min(len(stock_close), len(index_close))
-        if n < lookback + 2:
+        # Align THEO NGÀY (không tail-align) — mã có phiên nghỉ giao dịch
+        # (suspension) sẽ lệch ngày so với index → so sánh RS line sai phiên,
+        # sinh breakout giả hoặc bỏ sót. _align_by_date dùng intersection ngày
+        # nếu cả 2 series có DatetimeIndex, ngược lại fallback tail-align.
+        stock_a, index_a = _align_by_date(stock_close, index_close)
+        if index_a is None or len(index_a) < lookback + 2 or len(stock_a) < lookback + 2:
             return False, 0.0
-        stock = stock_close.iloc[-n:].astype(float).reset_index(drop=True)
-        index = index_close.iloc[-n:].astype(float).reset_index(drop=True)
+        stock = stock_a.astype(float).reset_index(drop=True)
+        index = index_a.astype(float).reset_index(drop=True)
 
         # Filter outliers (VNINDEX corrupt rows)
         median_idx = float(index.median())
@@ -806,6 +809,7 @@ def _empty_vcp_result(stage: str, **extra) -> Dict:
         "pivot_buy": 0.0,
         "near_pivot": False,
         "above_pivot": False,
+        "diff_pivot_pct": 0.0,
         "vol_ratio": 0.0,
         "vol_ratio_ma50": 0.0,
         "vol_confirmed": False,
@@ -826,6 +830,150 @@ def _empty_vcp_result(stage: str, **extra) -> Dict:
     }
     base.update(extra)
     return base
+
+
+def evaluate_contractions(contractions: list, t_count: int) -> Dict:
+    """Đánh giá chất lượng chuỗi contraction — STRICT vs LOOSE (pure, testable).
+
+    Tách khỏi detect_vcp để regression test trực tiếp logic gating.
+
+    SIDE EFFECT: ghi 'reduction_from_prev_pct' vào từng contraction[i+1].
+
+    LOOSE scaling (sửa lỗi quá lỏng khi t_count=2):
+      - Trước: loose_pairwise_ok = violations <= 1 → 1 pair mà 1 violation
+        = 100% vi phạm vẫn pass.
+      - Nay:  violations <= max(0, n_pairs - 1) → t_count=2 (1 pair) bắt buộc
+        0 violation; t_count=3 cho ≤1; ...
+      - vol_decreasing_loose = violations <= max(0, t_count - 2) (cùng nguyên tắc).
+      - contracting_loose có gateway bắt buộc: T_cuối phải NÔNG hơn T_đầu.
+    """
+    # ── Pairwise depth reduction ──
+    pair_reductions = []
+    for i in range(t_count - 1):
+        d1 = contractions[i]["depth"]
+        d2 = contractions[i + 1]["depth"]
+        reduction = (d1 - d2) / d1 * 100 if d1 > 0 else 0
+        pair_reductions.append(reduction)
+        contractions[i + 1]["reduction_from_prev_pct"] = round(reduction, 1)
+
+    strict_pairwise_ok = bool(pair_reductions) and all(r >= 50 for r in pair_reductions)
+    loose_violations = sum(1 for r in pair_reductions if r < 0)
+    # SCALE theo số pair: 1 pair → 0 violation cho phép
+    loose_pairwise_ok = loose_violations <= max(0, len(pair_reductions) - 1)
+    overall_loose_ok = (
+        t_count >= 2 and
+        bool(contractions) and
+        contractions[-1]["depth"] < contractions[0]["depth"] * 0.6
+    )
+    # GATEWAY bắt buộc: T_cuối nông hơn T_đầu (không thì không phải đang co lại)
+    basic = bool(contractions) and contractions[-1]["depth"] < contractions[0]["depth"]
+    contracting_strict = strict_pairwise_ok
+    contracting_loose  = basic and (loose_pairwise_ok or overall_loose_ok)
+
+    # ── Volume contraction ──
+    last_dry = contractions[-1]["is_volume_dry"] if t_count >= 1 else False
+    trough_vols = [c["trough_avg_vol"] for c in contractions]
+    vol_decline_violations = 0
+    for i in range(len(trough_vols) - 1):
+        if trough_vols[i + 1] > trough_vols[i] * 1.1:   # tolerance 10%
+            vol_decline_violations += 1
+    # Cho phép 1 violation khi t_count >= 4 (chuỗi dài, micro-bumps tự nhiên)
+    max_vol_violations_strict = 1 if t_count >= 4 else 0
+    vol_decreasing_strict = vol_decline_violations <= max_vol_violations_strict
+    # SCALE: t_count=2 → 0 violation; t_count=3 → ≤1; t_count=4 → ≤2
+    vol_decreasing_loose  = vol_decline_violations <= max(0, t_count - 2)
+
+    # STRICT: PHẢI cả 2: trough volume giảm dần AND handle khô
+    vol_contracting_strict = vol_decreasing_strict and last_dry and t_count >= 2
+    # LOOSE: 1 trong 2
+    vol_contracting_loose  = (vol_decreasing_loose or last_dry) and t_count >= 2
+
+    return {
+        "pair_reductions":        pair_reductions,
+        "strict_pairwise_ok":     strict_pairwise_ok,
+        "loose_violations":       loose_violations,
+        "loose_pairwise_ok":      loose_pairwise_ok,
+        "overall_loose_ok":       overall_loose_ok,
+        "contracting_strict":     contracting_strict,
+        "contracting_loose":      contracting_loose,
+        "last_dry":               last_dry,
+        "vol_decline_violations": vol_decline_violations,
+        "vol_decreasing_strict":  vol_decreasing_strict,
+        "vol_decreasing_loose":   vol_decreasing_loose,
+        "vol_contracting_strict": vol_contracting_strict,
+        "vol_contracting_loose":  vol_contracting_loose,
+    }
+
+
+def compute_score(
+    trend: Dict, rs_rating: float, vcp: Dict,
+    rs_line_breakout: bool = False, rs_line_breakout_pct: float = 0.0,
+) -> Dict:
+    """Tính tổng điểm screener (pure, testable).
+
+    CORE 100 (trend 30 + rs 40 + vcp 20 + buy-zone 10)
+    + BONUS tối đa 40 (tightness 10 + rs_line 15 + breakout 15) → trần 140.
+
+    Sửa 2 lỗi thiết kế:
+      1. Đảo ngược scoring: near_pivot=|diff|<3 khiến mã breakout +5%
+         (above_pivot) bị 0 điểm — THẤP hơn mã chưa breakout. Nay dùng
+         "buy zone" (-3 < diff < 5) + breakout_bonus khi breakout có volume.
+      2. tightness_bonus / rs_line_bonus cộng bất kể cấu trúc → gate sau
+         t_count≥2 (tightness) và contracting=True (rs_line).
+    """
+    trend_pts = trend.get("score", 0) * 3.75            # max 30
+    rs_pts    = min(rs_rating * 0.4, 40)                # max 40
+    is_vcp      = bool(vcp.get("is_vcp"))
+    contracting = bool(vcp.get("contracting"))
+    vcp_pts   = 20 if is_vcp else (10 if contracting else 0)
+
+    # ── Buy zone: sát pivot HOẶC vừa vượt pivot (không quá 5%) ──
+    diff = float(vcp.get("diff_pivot_pct", 0.0))
+    in_buy_zone = (-3 < diff < 5) if vcp.get("pivot_buy", 0) > 0 else False
+    near_pts = 10 if in_buy_zone else 0
+
+    # ── BONUS 1: Tightness — gate sau cấu trúc VCP tối thiểu (t_count≥2) ──
+    tightness = float(vcp.get("tightness", 100))
+    has_structure = vcp.get("t_count", 0) >= 2
+    if has_structure and tightness > 0:
+        if   tightness < 3: tightness_bonus = 10   # Elite — handle gần như không biến động
+        elif tightness < 5: tightness_bonus = 6
+        elif tightness < 8: tightness_bonus = 3
+        else:               tightness_bonus = 0
+    else:
+        tightness_bonus = 0
+
+    # ── BONUS 2: RS Line breakout — chỉ ý nghĩa khi base đang thắt lại ──
+    if rs_line_breakout and contracting:
+        rs_line_bonus = 15 if rs_line_breakout_pct >= 1.0 else 10
+    else:
+        rs_line_bonus = 0
+
+    # ── BONUS 3: Breakout xác nhận bằng volume (conviction cao nhất Minervini) ──
+    above_pivot = bool(vcp.get("above_pivot"))
+    vol_conf    = bool(vcp.get("vol_confirmed"))
+    vol_conf_s  = bool(vcp.get("vol_confirmed_strict"))
+    if is_vcp and above_pivot and vol_conf:
+        breakout_bonus = 15 if vol_conf_s else 8   # ≥1.5× MA50 = full
+    else:
+        breakout_bonus = 0
+
+    total = round(
+        trend_pts + rs_pts + vcp_pts + near_pts +
+        tightness_bonus + rs_line_bonus + breakout_bonus, 1,
+    )
+    return {
+        "total_score": total,
+        "score_breakdown": {
+            "trend":           round(trend_pts, 1),
+            "rs":              round(rs_pts, 1),
+            "vcp":             vcp_pts,
+            "near_pivot":      near_pts,
+            "tightness_bonus": tightness_bonus,
+            "rs_line_bonus":   rs_line_bonus,
+            "breakout_bonus":  breakout_bonus,
+        },
+    }
 
 
 def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
@@ -1080,47 +1228,22 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
     analysis_vol   = b_vol
 
     # ══════════════════════════════════════════════════════════════════════
-    # PAIR-WISE REDUCTION ANALYSIS
+    # PAIR-WISE REDUCTION + VOLUME CONTRACTION (pure helper — testable)
     # ══════════════════════════════════════════════════════════════════════
-    # Mỗi cặp consecutive: reduction% = (T_i.depth - T_{i+1}.depth) / T_i.depth × 100
-    # STRICT: tất cả reductions ≥ 50%
-    # LOOSE: tối đa 1 violation (T_{i+1}.depth >= T_i.depth, tức reduction <= 0)
-    pair_reductions = []
-    for i in range(t_count - 1):
-        d1 = contractions[i]["depth"]
-        d2 = contractions[i + 1]["depth"]
-        reduction = (d1 - d2) / d1 * 100 if d1 > 0 else 0
-        pair_reductions.append(reduction)
-        contractions[i + 1]["reduction_from_prev_pct"] = round(reduction, 1)
-
-    strict_pairwise_ok = bool(pair_reductions) and all(r >= 50 for r in pair_reductions)
-    loose_violations = sum(1 for r in pair_reductions if r < 0)
-    loose_pairwise_ok = loose_violations <= 1
-    overall_loose_ok = (
-        t_count >= 2 and
-        contractions[-1]["depth"] < contractions[0]["depth"] * 0.6
-    )
-    contracting_strict = strict_pairwise_ok
-    contracting_loose  = loose_pairwise_ok or overall_loose_ok
-
-    # ══════════════════════════════════════════════════════════════════════
-    # VOLUME CONTRACTION
-    # ══════════════════════════════════════════════════════════════════════
-    last_dry = contractions[-1]["is_volume_dry"] if t_count >= 1 else False
-    trough_vols = [c["trough_avg_vol"] for c in contractions]
-    vol_decline_violations = 0
-    for i in range(len(trough_vols) - 1):
-        if trough_vols[i + 1] > trough_vols[i] * 1.1:   # tolerance 10%
-            vol_decline_violations += 1
-    # Cho phép 1 violation khi t_count >= 4 (chuỗi dài, micro-bumps tự nhiên)
-    max_vol_violations_strict = 1 if t_count >= 4 else 0
-    vol_decreasing_strict = vol_decline_violations <= max_vol_violations_strict
-    vol_decreasing_loose  = vol_decline_violations <= 1
-
-    # STRICT: PHẢI cả 2: trough volume giảm dần AND handle khô
-    vol_contracting_strict = vol_decreasing_strict and last_dry and t_count >= 2
-    # LOOSE: 1 trong 2
-    vol_contracting_loose  = (vol_decreasing_loose or last_dry) and t_count >= 2
+    _cq = evaluate_contractions(contractions, t_count)
+    pair_reductions        = _cq["pair_reductions"]
+    strict_pairwise_ok     = _cq["strict_pairwise_ok"]
+    loose_violations       = _cq["loose_violations"]
+    loose_pairwise_ok      = _cq["loose_pairwise_ok"]
+    overall_loose_ok       = _cq["overall_loose_ok"]
+    contracting_strict     = _cq["contracting_strict"]
+    contracting_loose      = _cq["contracting_loose"]
+    last_dry               = _cq["last_dry"]
+    vol_decline_violations = _cq["vol_decline_violations"]
+    vol_decreasing_strict  = _cq["vol_decreasing_strict"]
+    vol_decreasing_loose   = _cq["vol_decreasing_loose"]
+    vol_contracting_strict = _cq["vol_contracting_strict"]
+    vol_contracting_loose  = _cq["vol_contracting_loose"]
 
     # DOWN/UP volume tổng thể trên TOÀN ANALYSIS_ZONE (không chỉ trong contractions)
     # Bao gồm cả rally legs giữa các T → bức tranh accumulation đầy đủ
@@ -1323,6 +1446,7 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
         "pivot_buy":       pivot_buy,
         "near_pivot":      near_pivot,
         "above_pivot":     above_pivot,
+        "diff_pivot_pct":  round(diff_pivot_pct, 2),
         "vol_ratio_ma50":  round(vol_ratio_ma50, 2),
         "t_count":         t_count,
         "base_depth":      round(base_depth, 2),
@@ -1507,11 +1631,13 @@ class ScreenerService:
         rs_line_breakout      = False
         rs_line_breakout_pct  = 0.0
         if self._index_data is not None and len(self._index_data) >= 60:
-            rs_line_val = compute_rs_line(
-                df['close'], self._index_data['close']
-            )
+            # DatetimeIndex để compute_rs_line_breakout align CHUẨN theo ngày
+            # (handle suspension gaps) thay vì tail-align.
+            stk_dt = df.set_index(pd.to_datetime(df['date']))['close']
+            idx_dt = self._index_data.set_index(pd.to_datetime(self._index_data['date']))['close']
+            rs_line_val = compute_rs_line(stk_dt, idx_dt)
             rs_line_breakout, rs_line_breakout_pct = compute_rs_line_breakout(
-                df['close'], self._index_data['close'], lookback=20,
+                stk_dt, idx_dt, lookback=20,
             )
 
         # Giá hiện tại từ cache quotes (REALTIME) — truyền vào VCP/Trend
@@ -1536,42 +1662,13 @@ class ScreenerService:
         vol_ma50 = int(float(pd.Series(vol).rolling(50).mean().iloc[-1])) if len(vol) >= 50 else 0
 
         # ════════════════════════════════════════════════════════════════
-        # Tổng điểm: CORE 100 + BONUS có thể đẩy lên 125 (mã elite)
-        # Đổi trọng số: RS=40 (cao hơn), Trend=30 (thấp hơn) — RS Rating
-        # là chỉ báo dẫn dắt mạnh nhất theo Minervini.
+        # Tổng điểm: CORE 100 + BONUS đẩy lên tối đa 140 (mã elite)
+        # trend 30 + rs 40 + vcp 20 + buy-zone 10
+        #   + tightness 10 + rs_line 15 + breakout 15
+        # Logic chấm điểm tách ra compute_score() (pure, có regression test).
         # ════════════════════════════════════════════════════════════════
-        trend_pts = trend["score"] * 3.75       # max 30 (was 40)
-        rs_pts    = min(rs_rating * 0.4, 40)    # max 40 (was 30)
-        vcp_pts   = 20 if vcp["is_vcp"] else (10 if vcp["contracting"] else 0)
-        near_pts  = 10 if vcp.get("near_pivot") else 0
-
-        # ── BONUS 1: Tightness (handle siêu chặt = supply cạn, elite setup) ──
-        tightness = float(vcp.get("tightness", 100))
-        if tightness > 0:
-            if tightness < 3:
-                tightness_bonus = 10   # Elite — handle gần như không có biến động
-            elif tightness < 5:
-                tightness_bonus = 6
-            elif tightness < 8:
-                tightness_bonus = 3
-            else:
-                tightness_bonus = 0
-        else:
-            tightness_bonus = 0
-
-        # ── BONUS 2: RS Line breakout (Minervini early signal) ──
-        # RS line vượt đỉnh 20 phiên = smart money accumulating BEFORE price breaks
-        if rs_line_breakout:
-            # Strength-based: vượt nhẹ (<1%) = +10, vượt rõ (>=1%) = +15
-            rs_line_bonus = 15 if rs_line_breakout_pct >= 1.0 else 10
-        else:
-            rs_line_bonus = 0
-
-        total = round(
-            trend_pts + rs_pts + vcp_pts + near_pts +
-            tightness_bonus + rs_line_bonus,
-            1,
-        )
+        _score = compute_score(trend, rs_rating, vcp, rs_line_breakout, rs_line_breakout_pct)
+        total = _score["total_score"]
 
         result = {
             "ticker":       ticker,
@@ -1590,14 +1687,7 @@ class ScreenerService:
             "rs_line_breakout_pct": rs_line_breakout_pct,
             "vcp":          vcp,
             "total_score":  total,
-            "score_breakdown": {
-                "trend":            round(trend_pts, 1),
-                "rs":               round(rs_pts, 1),
-                "vcp":              vcp_pts,
-                "near_pivot":       near_pts,
-                "tightness_bonus":  tightness_bonus,
-                "rs_line_bonus":    rs_line_bonus,
-            },
+            "score_breakdown": _score["score_breakdown"],
             "vol_ma20":     vol_ma20,
             "vol_ma50":     vol_ma50,
             "analysis_time": now.isoformat(),
