@@ -1,6 +1,7 @@
 import asyncio
 import pandas as pd
 import numpy as np
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 from app.services.market_data import market_service
@@ -13,6 +14,49 @@ _limiter = market_service._limiter
 # RS_MIN_VN: TTCK Việt Nam mẫu nhỏ (~1600 mã, thanh khoản mỏng) → dùng 55
 # thay vì chuẩn Minervini gốc 70. Giá trị có thể đổi trong alert settings.
 RS_MIN_VN = 55.0
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# VCPConfig — gom mọi threshold rải rác vào 1 nơi để tune strict/loose và
+# để test inject params. DEFAULT = giá trị hiện hành → behavior KHÔNG đổi.
+# ════════════════════════════════════════════════════════════════════════════
+@dataclass(frozen=True)
+class VCPConfig:
+    # ── Swing detection ──
+    zigzag_threshold: float = 2.0        # % đảo chiều tối thiểu để confirm swing
+    cluster_max_gap: int = 35            # gap tối đa (bars) giữa các T trong 1 cluster
+    cluster_min_high_ratio: float = 0.94 # T phải cao ≥ 94% đỉnh cluster
+
+    # ── Volume ──
+    vol_dry_ratio: float = 0.6           # trough vol < 0.6× MA50 = "khô"
+    vol_confirmed_strict: float = 1.5    # breakout vol ≥ 1.5× MA50 (strict)
+    vol_confirmed_loose: float = 1.3     # ≥ 1.3× (loose)
+
+    # ── Contraction depth ──
+    first_depth_strict: Tuple[float, float] = (10.0, 50.0)  # T₁ ∈ [10,50]% (strict)
+    first_depth_loose: Tuple[float, float] = (6.0, 50.0)    # T₁ ∈ [6,50]% (loose)
+    overall_loose_ratio: float = 0.6     # T_cuối < 0.6× T_đầu (overall loose ok)
+
+    # ── Handle tightness ──
+    tightness_strict: float = 8.0        # handle < 8% (strict)
+
+    # ── Pivot proximity ──
+    near_pivot_pct: float = 3.0          # |diff| < 3% = sát pivot
+    buy_zone_low: float = -3.0           # buy zone: -3% < diff < +5%
+    buy_zone_high: float = 5.0
+
+    # ── VDU / Pocket Pivot (item 7) ──
+    vdu_window: int = 15                 # phiên cuối để xét volume thấp nhất
+    vdu_ratio: float = 0.5               # VDU day: vol < 0.5× MA50
+    pocket_pivot_lookback: int = 10      # số down-day gần nhất để so volume
+
+    # ── ATR normalization (item 9, opt-in) ──
+    use_atr_depth: bool = False          # bật để chuẩn hoá threshold theo ATR
+    atr_period: int = 14
+    atr_zigzag_mult: float = 1.5         # zigzag threshold = atr_zigzag_mult × ATR%
+
+
+DEFAULT_VCP_CONFIG = VCPConfig()
 
 def check_trend_template(df: pd.DataFrame, rs_rating: float = 0.0,
                          current_price: float = None) -> Dict:
@@ -676,6 +720,7 @@ def _merge_continued_drops(contractions: list) -> list:
 def _find_contractions(
     swing_highs: list, swing_lows: list,
     vol: np.ndarray, close: np.ndarray, vol_ma50_full: float,
+    vol_dry_ratio: float = 0.6,
 ) -> list:
     """
     Tìm contractions VCP — Walker với "Running Minimum Low" approach.
@@ -724,7 +769,7 @@ def _find_contractions(
         trough_end   = min(len(vol), sl_idx + 2)
         trough_slice = vol[trough_start:trough_end]
         trough_avg   = float(np.mean(trough_slice)) if len(trough_slice) > 0 else 0
-        is_vol_dry   = trough_avg < (vol_ma50_full * 0.6) if vol_ma50_full > 0 else False
+        is_vol_dry   = trough_avg < (vol_ma50_full * vol_dry_ratio) if vol_ma50_full > 0 else False
         # UP/DOWN volume in segment [sh_idx, sl_idx]
         seg_end = min(sl_idx + 1, len(close))
         up_v = down_v = 0.0
@@ -810,6 +855,9 @@ def _empty_vcp_result(stage: str, **extra) -> Dict:
         "near_pivot": False,
         "above_pivot": False,
         "diff_pivot_pct": 0.0,
+        "vdu_today": False,
+        "pocket_pivot": False,
+        "atr_pct": 0.0,
         "vol_ratio": 0.0,
         "vol_ratio_ma50": 0.0,
         "vol_confirmed": False,
@@ -912,7 +960,8 @@ def compute_score(
     """Tính tổng điểm screener (pure, testable).
 
     CORE 100 (trend 30 + rs 40 + vcp 20 + buy-zone 10)
-    + BONUS tối đa 40 (tightness 10 + rs_line 15 + breakout 15) → trần 140.
+    + BONUS tối đa 45 (tightness 10 + rs_line 15 + breakout 15 + early-entry 5)
+    → trần 145.
 
     Sửa 2 lỗi thiết kế:
       1. Đảo ngược scoring: near_pivot=|diff|<3 khiến mã breakout +5%
@@ -958,25 +1007,87 @@ def compute_score(
     else:
         breakout_bonus = 0
 
+    # ── BONUS 4: Early-entry (VDU day / Pocket Pivot) — chỉ khi base đang co lại ──
+    vdu    = bool(vcp.get("vdu_today"))
+    pocket = bool(vcp.get("pocket_pivot"))
+    early_entry_bonus = 5 if (contracting and (vdu or pocket)) else 0
+
     total = round(
         trend_pts + rs_pts + vcp_pts + near_pts +
-        tightness_bonus + rs_line_bonus + breakout_bonus, 1,
+        tightness_bonus + rs_line_bonus + breakout_bonus + early_entry_bonus, 1,
     )
     return {
         "total_score": total,
         "score_breakdown": {
-            "trend":           round(trend_pts, 1),
-            "rs":              round(rs_pts, 1),
-            "vcp":             vcp_pts,
-            "near_pivot":      near_pts,
-            "tightness_bonus": tightness_bonus,
-            "rs_line_bonus":   rs_line_bonus,
-            "breakout_bonus":  breakout_bonus,
+            "trend":             round(trend_pts, 1),
+            "rs":                round(rs_pts, 1),
+            "vcp":               vcp_pts,
+            "near_pivot":        near_pts,
+            "tightness_bonus":   tightness_bonus,
+            "rs_line_bonus":     rs_line_bonus,
+            "breakout_bonus":    breakout_bonus,
+            "early_entry_bonus": early_entry_bonus,
         },
     }
 
 
-def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
+def compute_atr(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> float:
+    """ATR (Average True Range) phiên cuối — pure, dùng cho ATR normalization.
+
+    TR = max(high-low, |high-prev_close|, |low-prev_close|); ATR = SMA(TR, period).
+    Trả về 0.0 nếu không đủ dữ liệu.
+    """
+    n = len(close)
+    if n < period + 1:
+        return 0.0
+    h, l, c = np.asarray(high, float), np.asarray(low, float), np.asarray(close, float)
+    prev_c = c[:-1]
+    tr = np.maximum.reduce([
+        h[1:] - l[1:],
+        np.abs(h[1:] - prev_c),
+        np.abs(l[1:] - prev_c),
+    ])
+    if len(tr) < period:
+        return 0.0
+    return float(np.mean(tr[-period:]))
+
+
+def detect_vdu(volume: np.ndarray, vol_ma50_full: float,
+               window: int = 15, ratio: float = 0.5) -> bool:
+    """Volume Dry-Up day (Minervini) — phiên CUỐI có volume thấp nhất `window`
+    phiên VÀ < `ratio`× MA50. "Ngày yên tĩnh" → breakout thường đến trong 1-3 phiên.
+
+    Khác is_volume_dry (đo trung bình quanh trough): VDU là MỘT phiên cụ thể.
+    """
+    v = np.asarray(volume, float)
+    if len(v) < window or vol_ma50_full <= 0:
+        return False
+    last = v[-1]
+    return bool(last == np.min(v[-window:]) and last < vol_ma50_full * ratio)
+
+
+def detect_pocket_pivot(close: np.ndarray, volume: np.ndarray, lookback: int = 10) -> bool:
+    """Pocket Pivot (Kacher/Minervini early entry) — phiên CUỐI là up-day với
+    volume > volume LỚN NHẤT trong các down-day của `lookback` phiên gần nhất.
+
+    Cho phép vào sớm TRƯỚC pivot chính thức (trong base).
+    """
+    c = np.asarray(close, float)
+    v = np.asarray(volume, float)
+    if len(c) < lookback + 2:
+        return False
+    if c[-1] <= c[-2]:          # phiên cuối phải là up-day
+        return False
+    # Down-day volumes trong lookback phiên trước hôm nay
+    down_vols = [v[i] for i in range(len(c) - lookback - 1, len(c) - 1)
+                 if i >= 1 and c[i] < c[i - 1]]
+    if not down_vols:
+        return False
+    return bool(v[-1] > max(down_vols))
+
+
+def detect_vcp(df: pd.DataFrame, current_price: float = None,
+               config: VCPConfig = DEFAULT_VCP_CONFIG) -> Dict:
     """
     Nhận diện VCP (Volatility Contraction Pattern) — chuẩn Minervini.
     Tính cả 2 mode đồng thời: STRICT (textbook) và LOOSE (relaxed cho VN).
@@ -1098,11 +1209,24 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
     if np.isnan(vol_ma50_full) or vol_ma50_full <= 0:
         vol_ma50_full = float(np.mean(volume))
 
+    # ── ATR normalization (opt-in) — zigzag threshold thích nghi theo biến động ──
+    # Mã penny (ATR% cao) cần ngưỡng đảo chiều lớn hơn blue chip để swing không
+    # bị nhiễu. Khi tắt (mặc định) → dùng zigzag_threshold cố định như cũ.
+    zigzag_pct = config.zigzag_threshold
+    atr_val = 0.0
+    atr_pct = 0.0
+    if config.use_atr_depth:
+        atr_val = compute_atr(high, low, close, period=config.atr_period)
+        last_close = float(close[-1]) if close[-1] else 0.0
+        if atr_val > 0 and last_close > 0:
+            atr_pct = atr_val / last_close * 100
+            zigzag_pct = max(config.zigzag_threshold, atr_pct * config.atr_zigzag_mult)
+
     # ══════════════════════════════════════════════════════════════════════
     # SWING POINTS + CONTRACTIONS — scan toàn 200 ngày
     # Pipeline diagnostics tracked for debug
     # ══════════════════════════════════════════════════════════════════════
-    swing_highs_raw, swing_lows_raw = _zigzag_swings(b_high, b_low, threshold_pct=2.0)
+    swing_highs_raw, swing_lows_raw = _zigzag_swings(b_high, b_low, threshold_pct=zigzag_pct)
 
     # REFINE swing positions: tìm extreme thực (max/min) giữa 2 swings adjacent
     # → H/L không bị "lệch" 2-3 bars do ZigZag confirm timing
@@ -1112,6 +1236,7 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
 
     contractions_walker = _find_contractions(
         swing_highs, swing_lows, b_vol, b_close, vol_ma50_full,
+        vol_dry_ratio=config.vol_dry_ratio,
     )
 
     # MERGE: gộp T_{i+1} vào T_i nếu T_{i+1}.low ≤ T_i.low (continued drop)
@@ -1125,7 +1250,9 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
     # CLUSTER filter: walk backwards từ T cuối, build cluster của những T
     # gần thời gian + cùng resistance level
     contractions = _filter_to_recent_cluster(
-        contractions_recent, max_gap_bars=35, min_high_ratio=0.94,
+        contractions_recent,
+        max_gap_bars=config.cluster_max_gap,
+        min_high_ratio=config.cluster_min_high_ratio,
     )
 
     # DROP EARLY shallow T's: VCP đúng có T1 sâu nhất, T_i+1 shallower.
@@ -1307,16 +1434,18 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
     stop_loss = round(handle_low * 0.985, 2)   # -1.5% dưới handle low
 
     diff_pivot_pct = (current_close - pivot_buy) / pivot_buy * 100 if pivot_buy > 0 else 0
-    near_pivot  = abs(diff_pivot_pct) < 3 if pivot_buy > 0 else False
+    near_pivot  = abs(diff_pivot_pct) < config.near_pivot_pct if pivot_buy > 0 else False
     above_pivot = diff_pivot_pct > 0 if pivot_buy > 0 else False
 
-    # First contraction depth — 2 ngưỡng:
+    # First contraction depth — 2 ngưỡng (config-driven):
     # Strict: T₁ ∈ [10%, 50%] textbook Minervini
     # Loose: T₁ ∈ [6%, 50%] — cho phép contractions nông hơn (mã ít volatile)
     if contractions:
         d0 = contractions[0]["depth"]
-        first_depth_ok_strict = 10 <= d0 <= 50
-        first_depth_ok_loose  = 6  <= d0 <= 50
+        _fs_lo, _fs_hi = config.first_depth_strict
+        _fl_lo, _fl_hi = config.first_depth_loose
+        first_depth_ok_strict = _fs_lo <= d0 <= _fs_hi
+        first_depth_ok_loose  = _fl_lo <= d0 <= _fl_hi
     else:
         first_depth_ok_strict = False
         first_depth_ok_loose  = False
@@ -1329,8 +1458,14 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
     # Backward compat: vol_ratio so với MA30 trong base
     vol_ma30_local = float(np.mean(b_vol[-30:])) if len(b_vol) >= 30 else 1.0
     vol_ratio_legacy = current_vol / vol_ma30_local if vol_ma30_local > 0 else 0
-    vol_confirmed_strict = vol_ratio_ma50 >= 1.5
-    vol_confirmed_loose  = vol_ratio_ma50 >= 1.3
+    vol_confirmed_strict = vol_ratio_ma50 >= config.vol_confirmed_strict
+    vol_confirmed_loose  = vol_ratio_ma50 >= config.vol_confirmed_loose
+
+    # ── VDU day + Pocket Pivot (Minervini early-entry signals) ──
+    vdu_today     = detect_vdu(volume, vol_ma50_full,
+                               window=config.vdu_window, ratio=config.vdu_ratio)
+    pocket_pivot  = detect_pocket_pivot(close, volume,
+                                        lookback=config.pocket_pivot_lookback)
 
     # ══════════════════════════════════════════════════════════════════════
     # FINAL VCP VERDICT — STRICT vs LOOSE
@@ -1340,7 +1475,7 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
         t_count >= 3 and
         first_depth_ok_strict and  # T₁ ∈ [10%, 50%]
         contracting_strict and
-        tightness < 8 and
+        tightness < config.tightness_strict and
         handle_dur >= 5 and
         vol_contracting_strict and
         healthy_supply_demand and
@@ -1447,6 +1582,9 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None) -> Dict:
         "near_pivot":      near_pivot,
         "above_pivot":     above_pivot,
         "diff_pivot_pct":  round(diff_pivot_pct, 2),
+        "vdu_today":       vdu_today,
+        "pocket_pivot":    pocket_pivot,
+        "atr_pct":         round(atr_pct, 2),
         "vol_ratio_ma50":  round(vol_ratio_ma50, 2),
         "t_count":         t_count,
         "base_depth":      round(base_depth, 2),

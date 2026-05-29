@@ -23,6 +23,11 @@ from app.services.screener import (  # noqa: E402
     evaluate_contractions,
     compute_rs_line_breakout,
     _align_by_date,
+    compute_atr,
+    detect_vdu,
+    detect_pocket_pivot,
+    VCPConfig,
+    DEFAULT_VCP_CONFIG,
 )
 
 
@@ -203,6 +208,78 @@ def test_rs_line_breakout_handles_suspension_gap():
     is_break, strength = compute_rs_line_breakout(stock, idx, lookback=20)
     assert is_break is True
     assert strength > 0
+
+
+# ── ITEM 6/7/8/9: VCPConfig, VDU, Pocket Pivot, ATR ─────────────────────────────
+def test_vcp_config_defaults_unchanged():
+    """DEFAULT_VCP_CONFIG giữ nguyên giá trị hiện hành (behavior không đổi)."""
+    c = DEFAULT_VCP_CONFIG
+    assert c.zigzag_threshold == 2.0
+    assert c.vol_dry_ratio == 0.6
+    assert c.cluster_max_gap == 35
+    assert c.vol_confirmed_strict == 1.5 and c.vol_confirmed_loose == 1.3
+    assert c.use_atr_depth is False           # ATR opt-in, mặc định TẮT
+    assert c.near_pivot_pct == 3.0
+
+
+def test_vcp_config_override():
+    """Có thể override threshold qua dataclass replace/khởi tạo."""
+    c = VCPConfig(zigzag_threshold=3.5, use_atr_depth=True)
+    assert c.zigzag_threshold == 3.5
+    assert c.use_atr_depth is True
+    assert c.vol_dry_ratio == 0.6             # field khác giữ default
+
+
+def test_compute_atr_basic():
+    """ATR > 0 với dữ liệu hợp lệ; 0 khi thiếu dữ liệu."""
+    n = 30
+    close = np.linspace(100, 110, n)
+    high = close + 2.0
+    low = close - 2.0
+    atr = compute_atr(high, low, close, period=14)
+    assert atr > 0
+    # True range tối thiểu = high-low = 4 → ATR quanh 4
+    assert 3.0 < atr < 6.0
+    assert compute_atr(close[:5], close[:5], close[:5], period=14) == 0.0
+
+
+def test_detect_vdu_true_when_quiet_and_below_ma():
+    """VDU day: phiên cuối volume thấp nhất window VÀ < ratio×MA50."""
+    vol = np.array([1000.0] * 14 + [300.0])   # phiên cuối thấp nhất
+    assert detect_vdu(vol, vol_ma50_full=1000.0, window=15, ratio=0.5) is True
+    # Không thấp nhất → False
+    vol2 = np.array([200.0] + [1000.0] * 13 + [300.0])
+    assert detect_vdu(vol2, vol_ma50_full=1000.0, window=15, ratio=0.5) is False
+    # Thấp nhất nhưng KHÔNG < 0.5×MA50 → False
+    vol3 = np.array([1000.0] * 14 + [600.0])
+    assert detect_vdu(vol3, vol_ma50_full=1000.0, window=15, ratio=0.5) is False
+
+
+def test_detect_pocket_pivot():
+    """Pocket pivot: up-day với volume > max volume các down-day gần nhất."""
+    # 12 phiên: tạo vài down-day vol thấp, phiên cuối up-day vol cao
+    close = np.array([10, 11, 10.5, 11.2, 10.8, 11.5, 11.0, 11.8, 11.3, 12.0, 11.6, 12.5])
+    vol   = np.array([100, 90, 80, 95, 70, 110, 60, 120, 65, 130, 75, 300.0])
+    assert detect_pocket_pivot(close, vol, lookback=10) is True
+    # Phiên cuối là down-day → False
+    close_dn = close.copy(); close_dn[-1] = 11.0
+    assert detect_pocket_pivot(close_dn, vol, lookback=10) is False
+    # Up-day nhưng volume thấp hơn down-day max → False
+    vol_low = vol.copy(); vol_low[-1] = 50.0
+    assert detect_pocket_pivot(close, vol_low, lookback=10) is False
+
+
+def test_compute_score_early_entry_bonus():
+    """early_entry_bonus +5 khi contracting & (VDU hoặc pocket pivot)."""
+    trend = {"score": 5}
+    on = compute_score(trend, 60.0, _vcp(contracting=True, vdu_today=True))
+    assert on["score_breakdown"]["early_entry_bonus"] == 5
+    # Không có cấu trúc co lại → không bonus
+    off = compute_score(trend, 60.0, _vcp(contracting=False, is_vcp=False, vdu_today=True))
+    assert off["score_breakdown"]["early_entry_bonus"] == 0
+    # Pocket pivot cũng kích hoạt
+    pp = compute_score(trend, 60.0, _vcp(contracting=True, pocket_pivot=True))
+    assert pp["score_breakdown"]["early_entry_bonus"] == 5
 
 
 # ── Standalone runner (không cần pytest) ────────────────────────────────────────
