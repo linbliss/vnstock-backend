@@ -66,19 +66,48 @@ MIN_HISTORY = 120          # cần tối thiểu để detect_vcp chạy ổn
 CLIP_PCT = 0.0
 
 
+def _clip(r: float) -> float:
+    return max(-CLIP_PCT, min(CLIP_PCT, r)) if CLIP_PCT > 0 else r
+
+
 def _forward_returns(close: np.ndarray, i: int) -> dict:
     """% thay đổi giá từ phiên i đến i+h cho mỗi horizon. None nếu thiếu data."""
     out = {}
     base = close[i]
     for h in HORIZONS:
         j = i + h
-        if j < len(close) and base > 0:
-            r = (close[j] / base - 1) * 100
-            if CLIP_PCT > 0:
-                r = max(-CLIP_PCT, min(CLIP_PCT, r))   # winsorize ±CLIP_PCT
-            out[h] = r
+        out[h] = _clip((close[j] / base - 1) * 100) if (j < len(close) and base > 0) else None
+    return out
+
+
+def _stop_aware_returns(close: np.ndarray, low: np.ndarray, i: int,
+                        stop_price: float) -> dict:
+    """Forward return CÓ stop-loss: vào lệnh tại close[i], thoát khi low chạm
+    stop_price (khớp tại stop) hoặc giữ tới hết horizon. Phản ánh cách trade
+    thật — short-term drawdown bị chặn, winner dài hạn vẫn chạy.
+    """
+    base = close[i]
+    out = {h: None for h in HORIZONS}
+    if base <= 0:
+        return out
+    maxh = max(HORIZONS)
+    end = min(i + maxh, len(close) - 1)
+    # Phiên ĐẦU TIÊN stop bị chạm trong khoảng [i+1, end]
+    stop_j = None
+    if stop_price and stop_price > 0:
+        for j in range(i + 1, end + 1):
+            if low[j] <= stop_price:
+                stop_j = j
+                break
+    stop_ret = (stop_price / base - 1) * 100 if stop_price > 0 else None
+    for h in HORIZONS:
+        j = i + h
+        if j >= len(close):
+            continue
+        if stop_j is not None and stop_j <= j:
+            out[h] = _clip(stop_ret)              # đã thoát ở stop trước/đúng horizon
         else:
-            out[h] = None
+            out[h] = _clip((close[j] / base - 1) * 100)
     return out
 
 
@@ -95,7 +124,9 @@ def backtest_ticker(ticker: str, signal_fn, config, step: int,
                     min_rs: Optional[float] = None,
                     idx_close_dt: Optional[pd.Series] = None,
                     use_regime: bool = False,
-                    idx_ma50: Optional[pd.Series] = None) -> list:
+                    idx_ma50: Optional[pd.Series] = None,
+                    use_stop: bool = False,
+                    stop_pct: float = 8.0) -> list:
     """Trả về list forward-return dict cho mỗi phiên có tín hiệu.
 
     RS gate (min_rs): tính RS score TẠI từng phiên từ window TỚI phiên đó
@@ -103,12 +134,15 @@ def backtest_ticker(ticker: str, signal_fn, config, step: int,
     table (chỉ có RS hôm nay → dùng cho quá khứ = lookahead bias).
 
     Regime filter (use_regime): chỉ tính tín hiệu khi VNINDEX > MA50 tại phiên đó.
+
+    Stop-loss (use_stop): thoát tại vcp.stop_loss (fallback -stop_pct% nếu thiếu).
     """
     df = ohlcv_store.get_ohlcv(ticker)
     if df is None or len(df) < MIN_HISTORY + max(HORIZONS) + 1:
         return []
     df = df.reset_index(drop=True)
     close = df["close"].to_numpy(dtype=float)
+    low = df["low"].to_numpy(dtype=float) if "low" in df.columns else close
     n = len(close)
 
     use_rs = min_rs is not None and idx_close_dt is not None
@@ -140,7 +174,14 @@ def backtest_ticker(ticker: str, signal_fn, config, step: int,
                 rs = 0.0
             if rs < min_rs:
                 continue
-        fr = _forward_returns(close, i)
+        if use_stop:
+            # vcp.stop_loss cùng đơn vị close (đều từ df). Fallback -stop_pct%.
+            sl = float(vcp.get("stop_loss") or 0)
+            if not (0 < sl < close[i]):
+                sl = close[i] * (1 - stop_pct / 100)
+            fr = _stop_aware_returns(close, low, i, sl)
+        else:
+            fr = _forward_returns(close, i)
         if all(fr[h] is not None for h in HORIZONS):
             hits.append(fr)
     return hits
@@ -149,24 +190,33 @@ def backtest_ticker(ticker: str, signal_fn, config, step: int,
 def baseline_ticker(ticker: str, step: int,
                     use_regime: bool = False,
                     idx_close_dt: Optional[pd.Series] = None,
-                    idx_ma50: Optional[pd.Series] = None) -> list:
+                    idx_ma50: Optional[pd.Series] = None,
+                    use_stop: bool = False,
+                    stop_pct: float = 8.0) -> list:
     """Baseline: forward return của MỌI phiên (không lọc tín hiệu).
 
     Nếu use_regime: baseline cũng chỉ lấy phiên VNINDEX > MA50 → so sánh CÔNG
     BẰNG (cô lập edge của tín hiệu VCP trong cùng điều kiện up-regime, tránh
     nhầm cải thiện do regime với cải thiện do detector).
+
+    Nếu use_stop: baseline dùng stop cố định -stop_pct% (không có pivot) → so
+    sánh signal-có-stop vs baseline-có-stop cùng quy tắc thoát.
     """
     df = ohlcv_store.get_ohlcv(ticker)
     if df is None or len(df) < MIN_HISTORY + max(HORIZONS) + 1:
         return []
     close = df["close"].to_numpy(dtype=float)
+    low = df["low"].to_numpy(dtype=float) if "low" in df.columns else close
     n = len(close)
     dates = pd.to_datetime(df["date"]) if use_regime else None
     out = []
     for i in range(MIN_HISTORY, n - max(HORIZONS), step):
         if use_regime and not _regime_ok(dates.iloc[i], idx_close_dt, idx_ma50):
             continue
-        fr = _forward_returns(close, i)
+        if use_stop:
+            fr = _stop_aware_returns(close, low, i, close[i] * (1 - stop_pct / 100))
+        else:
+            fr = _forward_returns(close, i)
         if all(fr[h] is not None for h in HORIZONS):
             out.append(fr)
     return out
@@ -233,6 +283,11 @@ def main():
                          "(áp cho CẢ signal lẫn baseline). No-lookahead.")
     ap.add_argument("--horizons", default="5,10,20,40,60",
                     help="CSV số phiên forward, vd '5,10,20,40,60'")
+    ap.add_argument("--stop", action="store_true",
+                    help="mô phỏng stop-loss: signal thoát tại vcp.stop_loss, "
+                         "baseline thoát tại -stop_pct%%. Phản ánh trade thật.")
+    ap.add_argument("--stop-pct", type=float, default=8.0,
+                    help="%% stop cho baseline (và fallback signal). Mặc định 8.")
     args = ap.parse_args()
 
     global CLIP_PCT, HORIZONS
@@ -266,15 +321,19 @@ def main():
         print(f"  (RS gate: RS score >= {args.min_rs} vs {args.index}, no-lookahead)")
     if args.regime:
         print(f"  (regime filter: {args.index} > MA50, áp cho signal + baseline)")
+    if args.stop:
+        print(f"  (stop-loss: signal=vcp.stop_loss, baseline=-{args.stop_pct:.0f}%)")
     print("-" * 60)
 
     sig_all, base_all = [], []
     for t in tickers:
         hits = backtest_ticker(t, signal_fn, config, args.step,
                                min_rs=args.min_rs, idx_close_dt=idx_close_dt,
-                               use_regime=args.regime, idx_ma50=idx_ma50)
+                               use_regime=args.regime, idx_ma50=idx_ma50,
+                               use_stop=args.stop, stop_pct=args.stop_pct)
         base = baseline_ticker(t, args.step, use_regime=args.regime,
-                               idx_close_dt=idx_close_dt, idx_ma50=idx_ma50)
+                               idx_close_dt=idx_close_dt, idx_ma50=idx_ma50,
+                               use_stop=args.stop, stop_pct=args.stop_pct)
         sig_all.extend(hits)
         base_all.extend(base)
         if hits:
