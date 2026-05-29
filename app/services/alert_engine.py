@@ -60,6 +60,40 @@ def _is_post_close() -> bool:
 def _today() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
+
+# ── Market regime (VNINDEX > MA50) ───────────────────────────────────────────
+# Backtest cho thấy lọc theo regime gần như GẤP ĐÔI edge dài hạn (+60p win-rate)
+# của tín hiệu VCP breakout. Dùng "soft": khi thị trường yếu vẫn cảnh báo nhưng
+# gắn nhãn. Cache 15 phút (regime đổi chậm, không cần tính mỗi lần).
+_REGIME_CACHE: Dict[str, object] = {"at": None, "ok": True, "vnindex": 0.0, "ma50": 0.0}
+REGIME_CACHE_MIN = 15
+
+
+async def _market_regime_ok() -> Tuple[bool, float, float]:
+    """(ok, vnindex, ma50): ok=True khi VNINDEX > MA50. Lỗi/thiếu data → (True,..)
+    (fail-open: không chặn cảnh báo khi không xác định được regime)."""
+    now = datetime.now()
+    at = _REGIME_CACHE["at"]
+    if at and (now - at).total_seconds() < REGIME_CACHE_MIN * 60:
+        return bool(_REGIME_CACHE["ok"]), float(_REGIME_CACHE["vnindex"]), float(_REGIME_CACHE["ma50"])
+    try:
+        from app.services.screener import screener_service
+        await screener_service._ensure_index_data()
+        idx = screener_service._index_data
+        if idx is None or len(idx) < 50:
+            return True, 0.0, 0.0
+        closes = idx["close"].astype(float)
+        ma50 = float(closes.tail(50).mean())
+        # Giá VNINDEX hiện tại: ưu tiên realtime quote, fallback close cuối
+        q = market_service.quotes.get("VNINDEX") or {}
+        vnindex = float(q.get("price") or 0) or float(closes.iloc[-1])
+        ok = vnindex > ma50 if ma50 > 0 else True
+        _REGIME_CACHE.update({"at": now, "ok": ok, "vnindex": vnindex, "ma50": ma50})
+        return ok, vnindex, ma50
+    except Exception as e:
+        print(f"⚠️  market regime: {type(e).__name__}: {e}")
+        return True, 0.0, 0.0
+
 # ── FIFO Holdings ─────────────────────────────────────────────────────────────
 
 def _fifo_holdings(trades: List[dict]) -> Dict[str, dict]:
@@ -171,6 +205,10 @@ class _UserState:
 
     def vcp_interval(self) -> int:
         return self._alert().get("buyPoint", {}).get("intervalMinutes", VCP_INTERVAL_MIN)
+
+    def regime_warn(self) -> bool:
+        """Gắn nhãn 'thị trường yếu' khi VNINDEX < MA50 (mặc định BẬT, soft)."""
+        return self._alert().get("buyPoint", {}).get("regimeWarn", True)
 
     def anchor_prices(self) -> Dict[str, float]:
         return self.settings.get("anchorPrices", {})
@@ -311,6 +349,16 @@ async def _check_3b(state: _UserState):
     interval   = state.vcp_interval()
     now        = datetime.now()
 
+    # Market regime (soft) — không chặn cảnh báo, chỉ gắn nhãn khi thị trường yếu
+    regime_line = ""
+    if state.regime_warn():
+        reg_ok, vnindex, ma50 = await _market_regime_ok()
+        if not reg_ok and ma50 > 0:
+            regime_line = (
+                f"\n⚠️ <b>Thị trường yếu</b>: VNINDEX {vnindex:,.0f} &lt; MA50 {ma50:,.0f} "
+                f"— breakout rủi ro cao, cân nhắc giảm size"
+            )
+
     for item in state.watchlist_items:
         ticker = item["ticker"]
         q = market_service.quotes.get(ticker)
@@ -393,7 +441,8 @@ async def _check_3b(state: _UserState):
             f"Lần cảnh báo: {count}/{vcp_max}\n"
             f"\n"
             f"📊 <b>SEPA Score: {score}/8</b>\n"
-            f"{crit_text}\n"
+            f"{crit_text}"
+            f"{regime_line}\n"
             f"\n"
             f"⏰ {now.strftime('%H:%M:%S %d/%m/%Y')}"
         )
