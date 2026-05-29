@@ -82,14 +82,27 @@ def _forward_returns(close: np.ndarray, i: int) -> dict:
     return out
 
 
+def _regime_ok(cur_date, idx_close_dt: pd.Series, idx_ma50: pd.Series) -> bool:
+    """Market regime: VNINDEX > MA50 tại (hoặc trước) cur_date — no-lookahead."""
+    ic = idx_close_dt.asof(cur_date)
+    im = idx_ma50.asof(cur_date)
+    if pd.isna(ic) or pd.isna(im):
+        return False
+    return bool(ic > im)
+
+
 def backtest_ticker(ticker: str, signal_fn, config, step: int,
                     min_rs: Optional[float] = None,
-                    idx_close_dt: Optional[pd.Series] = None) -> list:
+                    idx_close_dt: Optional[pd.Series] = None,
+                    use_regime: bool = False,
+                    idx_ma50: Optional[pd.Series] = None) -> list:
     """Trả về list forward-return dict cho mỗi phiên có tín hiệu.
 
     RS gate (min_rs): tính RS score TẠI từng phiên từ window TỚI phiên đó
     (cắt cả index theo ngày) → KHÔNG lookahead, khác hẳn việc đọc rs_ratings
     table (chỉ có RS hôm nay → dùng cho quá khứ = lookahead bias).
+
+    Regime filter (use_regime): chỉ tính tín hiệu khi VNINDEX > MA50 tại phiên đó.
     """
     df = ohlcv_store.get_ohlcv(ticker)
     if df is None or len(df) < MIN_HISTORY + max(HORIZONS) + 1:
@@ -98,17 +111,18 @@ def backtest_ticker(ticker: str, signal_fn, config, step: int,
     close = df["close"].to_numpy(dtype=float)
     n = len(close)
 
-    # Chuẩn bị series có DatetimeIndex cho RS gate (1 lần / ticker)
     use_rs = min_rs is not None and idx_close_dt is not None
-    stk_close_dt = None
-    dates = None
-    if use_rs:
-        dates = pd.to_datetime(df["date"])
-        stk_close_dt = pd.Series(close, index=dates)
+    need_dates = use_rs or use_regime
+    dates = pd.to_datetime(df["date"]) if need_dates else None
+    stk_close_dt = pd.Series(close, index=dates) if use_rs else None
 
     hits = []
     # Chạy từ MIN_HISTORY đến n - max_horizon (cần forward data để đo return)
     for i in range(MIN_HISTORY, n - max(HORIZONS), step):
+        cur_date = dates.iloc[i] if need_dates else None
+        # ── Regime filter (no-lookahead) — rẻ, check trước detect_vcp ──
+        if use_regime and not _regime_ok(cur_date, idx_close_dt, idx_ma50):
+            continue
         window = df.iloc[: i + 1]            # chỉ dữ liệu TỚI phiên i (no lookahead)
         try:
             vcp = detect_vcp(window, current_price=float(close[i]), config=config)
@@ -118,7 +132,6 @@ def backtest_ticker(ticker: str, signal_fn, config, step: int,
             continue
         # ── RS gate (no-lookahead) ──
         if use_rs:
-            cur_date = dates.iloc[i]
             stk_w = stk_close_dt.iloc[: i + 1]
             idx_w = idx_close_dt[idx_close_dt.index <= cur_date]   # cắt index TỚI ngày i
             try:
@@ -133,15 +146,26 @@ def backtest_ticker(ticker: str, signal_fn, config, step: int,
     return hits
 
 
-def baseline_ticker(ticker: str, step: int) -> list:
-    """Baseline: forward return của MỌI phiên (không lọc tín hiệu)."""
+def baseline_ticker(ticker: str, step: int,
+                    use_regime: bool = False,
+                    idx_close_dt: Optional[pd.Series] = None,
+                    idx_ma50: Optional[pd.Series] = None) -> list:
+    """Baseline: forward return của MỌI phiên (không lọc tín hiệu).
+
+    Nếu use_regime: baseline cũng chỉ lấy phiên VNINDEX > MA50 → so sánh CÔNG
+    BẰNG (cô lập edge của tín hiệu VCP trong cùng điều kiện up-regime, tránh
+    nhầm cải thiện do regime với cải thiện do detector).
+    """
     df = ohlcv_store.get_ohlcv(ticker)
     if df is None or len(df) < MIN_HISTORY + max(HORIZONS) + 1:
         return []
     close = df["close"].to_numpy(dtype=float)
     n = len(close)
+    dates = pd.to_datetime(df["date"]) if use_regime else None
     out = []
     for i in range(MIN_HISTORY, n - max(HORIZONS), step):
+        if use_regime and not _regime_ok(dates.iloc[i], idx_close_dt, idx_ma50):
+            continue
         fr = _forward_returns(close, i)
         if all(fr[h] is not None for h in HORIZONS):
             out.append(fr)
@@ -204,27 +228,35 @@ def main():
     ap.add_argument("--clip", type=float, default=0.0,
                     help="winsorize forward return ở ±N%% (chặn outlier corporate "
                          "action/penny pump). Vd --clip 50. 0 = tắt.")
+    ap.add_argument("--regime", action="store_true",
+                    help="market-regime filter: chỉ tính phiên VNINDEX > MA50 "
+                         "(áp cho CẢ signal lẫn baseline). No-lookahead.")
+    ap.add_argument("--horizons", default="5,10,20,40,60",
+                    help="CSV số phiên forward, vd '5,10,20,40,60'")
     args = ap.parse_args()
 
-    global CLIP_PCT
+    global CLIP_PCT, HORIZONS
     CLIP_PCT = max(0.0, args.clip)
+    HORIZONS = tuple(int(h) for h in args.horizons.split(",") if h.strip())
 
     config = replace(DEFAULT_VCP_CONFIG, use_atr_depth=True) if args.atr else DEFAULT_VCP_CONFIG
     signal_fn = SIGNALS[args.signal]
     tickers = _select_tickers(args)
 
-    # Index series (DatetimeIndex) cho RS gate — load 1 lần
-    idx_close_dt = None
-    if args.min_rs is not None:
+    # Index series (DatetimeIndex) — cần cho RS gate VÀ/HOẶC regime filter
+    idx_close_dt = idx_ma50 = None
+    if args.min_rs is not None or args.regime:
         idx_df = ohlcv_store.get_ohlcv(args.index)
         if idx_df is None or len(idx_df) < 63:
-            print(f"⚠️  Không có dữ liệu index '{args.index}' → tắt RS gate")
+            print(f"⚠️  Không có dữ liệu index '{args.index}' → tắt RS gate & regime")
             args.min_rs = None
+            args.regime = False
         else:
             idx_close_dt = pd.Series(
                 idx_df["close"].to_numpy(dtype=float),
                 index=pd.to_datetime(idx_df["date"]),
-            )
+            ).sort_index()
+            idx_ma50 = idx_close_dt.rolling(50).mean()
 
     print(f"Backtest VCP — signal='{args.signal}', ATR={'on' if args.atr else 'off'}, "
           f"{len(tickers)} mã, step={args.step}, horizons={HORIZONS}")
@@ -232,13 +264,17 @@ def main():
         print(f"  (lọc thanh khoản: min_avg_vol={args.min_avg_vol:,.0f}, xếp theo volume)")
     if args.min_rs is not None:
         print(f"  (RS gate: RS score >= {args.min_rs} vs {args.index}, no-lookahead)")
+    if args.regime:
+        print(f"  (regime filter: {args.index} > MA50, áp cho signal + baseline)")
     print("-" * 60)
 
     sig_all, base_all = [], []
     for t in tickers:
         hits = backtest_ticker(t, signal_fn, config, args.step,
-                               min_rs=args.min_rs, idx_close_dt=idx_close_dt)
-        base = baseline_ticker(t, args.step)
+                               min_rs=args.min_rs, idx_close_dt=idx_close_dt,
+                               use_regime=args.regime, idx_ma50=idx_ma50)
+        base = baseline_ticker(t, args.step, use_regime=args.regime,
+                               idx_close_dt=idx_close_dt, idx_ma50=idx_ma50)
         sig_all.extend(hits)
         base_all.extend(base)
         if hits:
