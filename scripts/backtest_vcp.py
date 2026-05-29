@@ -32,7 +32,21 @@ from app.services.screener import detect_vcp, DEFAULT_VCP_CONFIG  # noqa: E402
 
 SIGNALS = {
     # name → predicate(vcp_dict) -> bool
+    #
+    # ⚠️ 'breakout' (state) fire MỌI phiên giá còn trên pivot → gồm nhiều entry
+    #    trễ/extended đã mean-revert. Dùng để so sánh, KHÔNG phải tín hiệu entry.
     "breakout":    lambda v: v.get("stage") == "breakout" or (v.get("is_vcp") and v.get("above_pivot")),
+    # 'breakout_fresh' = ĐÚNG vùng vừa vượt pivot (0–3%) + volume xác nhận →
+    #    sát "ngày breakout" thực tế hơn, đây mới là tín hiệu entry Minervini.
+    "breakout_fresh": lambda v: (v.get("is_vcp") and v.get("above_pivot")
+                                 and 0 <= v.get("diff_pivot_pct", 99) <= 3
+                                 and v.get("vol_confirmed")),
+    # 'breakout_vol' = breakout (mọi mức) nhưng BẮT BUỘC volume xác nhận.
+    "breakout_vol": lambda v: (v.get("is_vcp") and v.get("above_pivot")
+                               and v.get("vol_confirmed")),
+    # 'breakout_strict' = VCP strict + breakout + volume mạnh (≥1.5× MA50).
+    "breakout_strict": lambda v: (v.get("is_vcp_strict") and v.get("above_pivot")
+                                  and v.get("vol_confirmed_strict")),
     "near_pivot":  lambda v: v.get("is_vcp") and v.get("near_pivot"),
     "vcp":         lambda v: bool(v.get("is_vcp")),
     "vdu":         lambda v: bool(v.get("vdu_today")) and bool(v.get("contracting")),
@@ -91,6 +105,31 @@ def baseline_ticker(ticker: str, step: int) -> list:
     return out
 
 
+def _avg_volume(ticker: str, window: int = 60) -> float:
+    """Volume trung bình `window` phiên gần nhất — dùng lọc thanh khoản."""
+    df = ohlcv_store.get_ohlcv(ticker)
+    if df is None or len(df) < window:
+        return 0.0
+    return float(df["volume"].tail(window).mean())
+
+
+def _select_tickers(args) -> list:
+    """Chọn mã: ưu tiên --tickers; nếu không, lọc theo thanh khoản rồi lấy top N.
+
+    Mặc định KHÔNG còn lấy 50 mã đầu bảng chữ cái (toàn penny A*) — thay vào
+    đó xếp theo volume TB giảm dần để mẫu phản ánh leader thanh khoản tốt.
+    """
+    if args.tickers.strip():
+        return [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
+    allt = ohlcv_store.list_tickers()
+    if args.min_avg_vol > 0 or args.sort_volume:
+        ranked = [(t, _avg_volume(t)) for t in allt]
+        ranked = [(t, v) for t, v in ranked if v >= args.min_avg_vol]
+        ranked.sort(key=lambda x: x[1], reverse=True)
+        return [t for t, _ in ranked[: args.max_tickers]]
+    return allt[: args.max_tickers]
+
+
 def _summarize(label: str, samples: list):
     if not samples:
         print(f"  {label:<14} (0 mẫu)")
@@ -110,18 +149,20 @@ def main():
     ap.add_argument("--max-tickers", type=int, default=30)
     ap.add_argument("--step", type=int, default=2, help="sample mỗi N phiên (giảm tải)")
     ap.add_argument("--atr", action="store_true", help="bật ATR normalization")
+    ap.add_argument("--min-avg-vol", type=float, default=0.0,
+                    help="lọc mã có volume TB 60 phiên >= ngưỡng (vd 500000)")
+    ap.add_argument("--sort-volume", action="store_true",
+                    help="xếp mã theo thanh khoản giảm dần (tránh mẫu penny A*)")
     args = ap.parse_args()
 
     config = replace(DEFAULT_VCP_CONFIG, use_atr_depth=True) if args.atr else DEFAULT_VCP_CONFIG
     signal_fn = SIGNALS[args.signal]
-
-    if args.tickers.strip():
-        tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
-    else:
-        tickers = ohlcv_store.list_tickers()[: args.max_tickers]
+    tickers = _select_tickers(args)
 
     print(f"Backtest VCP — signal='{args.signal}', ATR={'on' if args.atr else 'off'}, "
           f"{len(tickers)} mã, step={args.step}, horizons={HORIZONS}")
+    if args.min_avg_vol > 0 or args.sort_volume:
+        print(f"  (lọc thanh khoản: min_avg_vol={args.min_avg_vol:,.0f}, xếp theo volume)")
     print("-" * 60)
 
     sig_all, base_all = [], []
