@@ -32,6 +32,7 @@ env/
 # Scripts và docs
 scripts/
 !scripts/backtest_vcp.py
+!scripts/clean_corporate_actions.py
 deploy/
 *.md
 !README.md
