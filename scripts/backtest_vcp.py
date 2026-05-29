@@ -61,13 +61,24 @@ HORIZONS = (5, 10, 20)
 MIN_HISTORY = 120          # cần tối thiểu để detect_vcp chạy ổn
 
 
+# Clip forward return để chặn outlier (giá chưa điều chỉnh corporate action,
+# penny pump...) làm hỏng MEAN. 0 = tắt. Set qua --clip.
+CLIP_PCT = 0.0
+
+
 def _forward_returns(close: np.ndarray, i: int) -> dict:
     """% thay đổi giá từ phiên i đến i+h cho mỗi horizon. None nếu thiếu data."""
     out = {}
     base = close[i]
     for h in HORIZONS:
         j = i + h
-        out[h] = (close[j] / base - 1) * 100 if (j < len(close) and base > 0) else None
+        if j < len(close) and base > 0:
+            r = (close[j] / base - 1) * 100
+            if CLIP_PCT > 0:
+                r = max(-CLIP_PCT, min(CLIP_PCT, r))   # winsorize ±CLIP_PCT
+            out[h] = r
+        else:
+            out[h] = None
     return out
 
 
@@ -190,7 +201,13 @@ def main():
                          "vs VNINDEX) >= ngưỡng tại phiên đó. >0 = outperform index. "
                          "Tính per-bar, KHÔNG lookahead.")
     ap.add_argument("--index", default="VNINDEX", help="mã index cho RS gate")
+    ap.add_argument("--clip", type=float, default=0.0,
+                    help="winsorize forward return ở ±N%% (chặn outlier corporate "
+                         "action/penny pump). Vd --clip 50. 0 = tắt.")
     args = ap.parse_args()
+
+    global CLIP_PCT
+    CLIP_PCT = max(0.0, args.clip)
 
     config = replace(DEFAULT_VCP_CONFIG, use_atr_depth=True) if args.atr else DEFAULT_VCP_CONFIG
     signal_fn = SIGNALS[args.signal]
@@ -232,13 +249,24 @@ def main():
     _summarize(f"[{args.signal}]", sig_all)
     _summarize("[baseline]", base_all)
 
-    # Alpha = chênh lệch mean forward return tín hiệu vs baseline
+    # ALPHA — báo cáo cả MEAN và các thống kê KHÁNG OUTLIER (median, win-rate).
+    # MEAN dễ bị nhiễu bởi vài bar cực đoan (giá chưa điều chỉnh corporate action,
+    # penny pump) → median & win-rate phản ánh "edge" thực tế đáng tin hơn.
     if sig_all and base_all:
         print("\n  ALPHA (signal − baseline):")
+        print(f"      {'horizon':>8}  {'Δmean':>8}  {'Δmedian':>8}  {'Δwin%':>7}")
         for h in HORIZONS:
-            sa = np.mean([s[h] for s in sig_all])
-            ba = np.mean([s[h] for s in base_all])
-            print(f"      +{h:>2}p:  {sa - ba:+6.2f}%")
+            sv = np.array([s[h] for s in sig_all], dtype=float)
+            bv = np.array([s[h] for s in base_all], dtype=float)
+            d_mean = sv.mean() - bv.mean()
+            d_med  = np.median(sv) - np.median(bv)
+            d_win  = (sv > 0).mean() * 100 - (bv > 0).mean() * 100
+            print(f"      +{h:>2}p:    {d_mean:+7.2f}%  {d_med:+7.2f}%  {d_win:+6.1f}")
+        if CLIP_PCT > 0:
+            print(f"  (forward return winsorized ở ±{CLIP_PCT:.0f}%)")
+        else:
+            print("  Lưu ý: Δmean dễ bị outlier; ưu tiên Δmedian & Δwin%. "
+                  "Dùng --clip 50 để winsorize.")
 
 
 if __name__ == "__main__":
