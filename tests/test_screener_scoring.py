@@ -87,6 +87,22 @@ def test_buy_zone_covers_just_above_pivot():
         assert bd["near_pivot"] == 0, f"diff={diff} phải ngoài buy zone"
 
 
+def test_buy_zone_reads_config():
+    """Buy-zone đọc từ VCPConfig (buy_zone_low/high), không hardcode."""
+    trend = {"score": 5}
+    # Config nới rộng: -5 < diff < 10 → diff=8 giờ NẰM TRONG zone
+    wide = VCPConfig(buy_zone_low=-5.0, buy_zone_high=10.0)
+    bd_wide = compute_score(trend, 60.0, _vcp(diff_pivot_pct=8.0), config=wide)["score_breakdown"]
+    assert bd_wide["near_pivot"] == 10
+    # Config mặc định (-3, 5) → diff=8 NGOÀI zone
+    bd_def = compute_score(trend, 60.0, _vcp(diff_pivot_pct=8.0))["score_breakdown"]
+    assert bd_def["near_pivot"] == 0
+    # Config siết chặt: -1 < diff < 2 → diff=4 NGOÀI zone (mặc định thì trong)
+    tight = VCPConfig(buy_zone_low=-1.0, buy_zone_high=2.0)
+    bd_tight = compute_score(trend, 60.0, _vcp(diff_pivot_pct=4.0), config=tight)["score_breakdown"]
+    assert bd_tight["near_pivot"] == 0
+
+
 # ── ITEM 3: Gate bonuses sau cấu trúc VCP ───────────────────────────────────────
 def test_tightness_bonus_gated_by_structure():
     """tightness_bonus chỉ tính khi t_count >= 2."""

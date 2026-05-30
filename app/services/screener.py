@@ -956,6 +956,7 @@ def evaluate_contractions(contractions: list, t_count: int) -> Dict:
 def compute_score(
     trend: Dict, rs_rating: float, vcp: Dict,
     rs_line_breakout: bool = False, rs_line_breakout_pct: float = 0.0,
+    config: VCPConfig = DEFAULT_VCP_CONFIG,
 ) -> Dict:
     """Tính tổng điểm screener (pure, testable).
 
@@ -966,9 +967,11 @@ def compute_score(
     Sửa 2 lỗi thiết kế:
       1. Đảo ngược scoring: near_pivot=|diff|<3 khiến mã breakout +5%
          (above_pivot) bị 0 điểm — THẤP hơn mã chưa breakout. Nay dùng
-         "buy zone" (-3 < diff < 5) + breakout_bonus khi breakout có volume.
+         "buy zone" [buy_zone_low, buy_zone_high] + breakout_bonus.
       2. tightness_bonus / rs_line_bonus cộng bất kể cấu trúc → gate sau
          t_count≥2 (tightness) và contracting=True (rs_line).
+
+    Buy-zone đọc từ config (buy_zone_low/high) → tune được, không hardcode.
     """
     trend_pts = trend.get("score", 0) * 3.75            # max 30
     rs_pts    = min(rs_rating * 0.4, 40)                # max 40
@@ -976,9 +979,10 @@ def compute_score(
     contracting = bool(vcp.get("contracting"))
     vcp_pts   = 20 if is_vcp else (10 if contracting else 0)
 
-    # ── Buy zone: sát pivot HOẶC vừa vượt pivot (không quá 5%) ──
+    # ── Buy zone: sát pivot HOẶC vừa vượt pivot (theo config) ──
     diff = float(vcp.get("diff_pivot_pct", 0.0))
-    in_buy_zone = (-3 < diff < 5) if vcp.get("pivot_buy", 0) > 0 else False
+    in_buy_zone = (config.buy_zone_low < diff < config.buy_zone_high) \
+        if vcp.get("pivot_buy", 0) > 0 else False
     near_pts = 10 if in_buy_zone else 0
 
     # ── BONUS 1: Tightness — gate sau cấu trúc VCP tối thiểu (t_count≥2) ──

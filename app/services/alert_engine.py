@@ -191,6 +191,12 @@ class _UserState:
     def cutloss_repeat(self) -> int:
         return self._alert().get("cutloss", {}).get("repeatMinutes", COOLDOWN_CUTLOSS_MIN)
 
+    def cutloss_trailing(self) -> float:
+        """Trailing % khi ĐÃ LỜI (từ đỉnh). Backtest VCP: ~15-20% tránh whipsaw.
+        Fallback về thresholdPct nếu chưa cấu hình (giữ hành vi cũ)."""
+        cl = self._alert().get("cutloss", {})
+        return float(cl.get("trailingPct") or cl.get("thresholdPct", DEFAULT_CUTLOSS_PCT))
+
     def buy_enabled(self) -> bool:
         return self._alert().get("buyPoint", {}).get("enabled", False)
 
@@ -479,9 +485,18 @@ async def _check_cutloss(state: _UserState):
         per = hs.get(ticker, {})
         # Anchor: manual > auto trailing > avgCost
         anchor = float(per.get("anchor_price") or anchors.get(ticker) or avg_cost or 0)
-        cl_pct = float(per.get("cutloss_pct") or global_cl)
         if anchor <= 0:
             continue
+
+        # Stop thất bại ban đầu (từ giá vốn) vs trailing khi đã lời (từ đỉnh).
+        # Anchor đã trail lên trên giá vốn = vị thế đang lời → cho "thở" rộng
+        # hơn (tránh whipsaw — backtest VCP). Per-ticker override vẫn ưu tiên.
+        in_profit = avg_cost > 0 and anchor > avg_cost
+        if per.get("cutloss_pct"):
+            cl_pct = float(per["cutloss_pct"])
+        else:
+            cl_pct = state.cutloss_trailing() if in_profit else global_cl
+        mode = "trailing (đã lời)" if in_profit and not per.get("cutloss_pct") else "stop ban đầu"
 
         cl_price = anchor * (1 - cl_pct / 100)
         if price > cl_price:
@@ -493,7 +508,7 @@ async def _check_cutloss(state: _UserState):
         msg = (
             f"⚠️ <b>CẢNH BÁO CUTLOSS – {ticker}</b>\n"
             f"Giá hiện tại: <b>{_fp(price)}</b> ({q.get('change_pct', 0):+.2f}%)\n"
-            f"Giá neo: {_fp(anchor)} | Ngưỡng: -{cl_pct:.0f}%\n"
+            f"Giá neo: {_fp(anchor)} | Ngưỡng: -{cl_pct:.0f}% ({mode})\n"
             f"Giá Cutloss: {_fp(cl_price)} | Thủng: {gap_pct:.1f}%\n"
             f"Số lượng đang giữ: {qty:,.0f}\n"
             f"⏰ {now.strftime('%H:%M:%S %d/%m/%Y')}"
