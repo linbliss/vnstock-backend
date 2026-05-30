@@ -375,6 +375,14 @@ async def daily_update_scheduler():
                 if weekday == 0:
                     print("📊 Thứ Hai — chạy fundamental refresh", flush=True)
                     await refresh_fundamentals()
+                # Rebuild snapshot screener sau khi data EOD đã cập nhật
+                # → sáng hôm sau app mở lên có kết quả mới nhất ngay (instant)
+                try:
+                    from app.services.screener import screener_service
+                    for ex in ("hose", "hnx", "upcom"):
+                        await screener_service.build_snapshot(ex)
+                except BaseException as e:
+                    print(f"snapshot rebuild error: {type(e).__name__}: {e}")
             else:
                 print("⏭️  Weekend — skip daily_update")
         except asyncio.CancelledError:

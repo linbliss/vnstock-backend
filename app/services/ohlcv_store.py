@@ -92,6 +92,15 @@ def init_db() -> None:
                 exchange   TEXT,
                 updated_at TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS screener_snapshot (
+                exchange    TEXT PRIMARY KEY,   -- hose/hnx/upcom
+                scanned_at  TEXT,               -- thời điểm chạy screener
+                updated_at  TEXT,
+                total       INTEGER,            -- số mã trong universe (đã quét)
+                count       INTEGER,            -- số mã đạt (trong snapshot)
+                data_json   TEXT NOT NULL       -- list kết quả screener đầy đủ
+            );
             """
         )
     print(f"✅ OHLCV DB ready at {DB_PATH}")
@@ -441,4 +450,42 @@ def get_stock_list_stats() -> Dict[str, Any]:
         "total": total,
         "updated_at": updated,
         "by_exchange": {r["exchange"]: r["c"] for r in rows},
+    }
+
+
+# ── Screener snapshot (kết quả screener theo sàn, persist để load instant) ──────
+
+def upsert_screener_snapshot(exchange: str, results: List[Dict[str, Any]],
+                             scanned_at: str, total: int) -> None:
+    """Lưu/ghi đè snapshot screener cho 1 sàn (hose/hnx/upcom)."""
+    ex = exchange.lower()
+    now = datetime.now().isoformat()
+    payload = json.dumps(results, ensure_ascii=False, default=str)
+    with _lock, _connect() as conn:
+        conn.execute(
+            """INSERT INTO screener_snapshot(exchange, scanned_at, updated_at, total, count, data_json)
+               VALUES (?,?,?,?,?,?)
+               ON CONFLICT(exchange) DO UPDATE SET
+                 scanned_at=excluded.scanned_at, updated_at=excluded.updated_at,
+                 total=excluded.total, count=excluded.count, data_json=excluded.data_json""",
+            (ex, scanned_at, now, int(total), len(results), payload),
+        )
+
+
+def get_screener_snapshot(exchange: str) -> Optional[Dict[str, Any]]:
+    """Đọc snapshot screener của 1 sàn. None nếu chưa có."""
+    ex = exchange.lower()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT scanned_at, updated_at, total, count, data_json "
+            "FROM screener_snapshot WHERE exchange=?", (ex,),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "scanned_at": row["scanned_at"],
+        "updated_at": row["updated_at"],
+        "total":      row["total"],
+        "count":      row["count"],
+        "results":    json.loads(row["data_json"]),
     }

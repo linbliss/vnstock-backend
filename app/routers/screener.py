@@ -548,20 +548,50 @@ async def scan_market(
 
 @router.post("/scan")
 async def scan_market_post(body: dict):
-    """POST version — tránh URL length limit khi gửi nhiều mã."""
+    """POST version — tránh URL length limit khi gửi nhiều mã.
+
+    Nếu body có `store_exchange` (hose/hnx/upcom) → LƯU kết quả thành snapshot
+    server-side (để lần mở app sau load instant, không phải scan lại)."""
     tickers_str = body.get("tickers", "")
     min_score = int(body.get("min_score", 5))
     min_rs = float(body.get("min_rs", 0.0))
+    store_exchange = (body.get("store_exchange") or "").strip().lower()
     ticker_list = [t.strip().upper() for t in tickers_str.split(",") if t.strip()]
     results = await screener_service.run_screener(
         ticker_list, min_trend_score=min_score, min_rs=min_rs
     )
+    scanned_at = __import__('datetime').datetime.now().isoformat()
+    if store_exchange in ("hose", "hnx", "upcom"):
+        try:
+            ohlcv_store.upsert_screener_snapshot(
+                store_exchange, results, scanned_at, len(ticker_list)
+            )
+        except Exception as e:
+            print(f"⚠️  store snapshot {store_exchange}: {e}")
     return {
         "total":      len(ticker_list),
         "passed":     len(results),
         "results":    results,
-        "scanned_at": __import__('datetime').datetime.now().isoformat(),
+        "scanned_at": scanned_at,
     }
+
+
+@router.get("/snapshot/{exchange}")
+async def get_screener_snapshot(exchange: str):
+    """Trả về snapshot screener gần nhất của 1 sàn (instant, không tính lại).
+    App mở lên gọi endpoint này để hiển thị ngay; rỗng → frontend tự scan."""
+    ex = exchange.lower()
+    snap = ohlcv_store.get_screener_snapshot(ex)
+    if not snap:
+        return {"exchange": ex, "results": [], "total": 0, "count": 0,
+                "scanned_at": None, "updated_at": None}
+    return {"exchange": ex, **snap}
+
+
+@router.post("/snapshot/{exchange}/build")
+async def build_screener_snapshot(exchange: str, min_score: int = Query(default=5, ge=0, le=8)):
+    """Build + lưu snapshot cho 1 sàn ngay (bootstrap / thủ công)."""
+    return await screener_service.build_snapshot(exchange, min_score=min_score)
 
 
 @router.get("/analyze/{ticker}")

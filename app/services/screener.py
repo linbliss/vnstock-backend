@@ -1705,6 +1705,26 @@ class ScreenerService:
         results.sort(key=lambda x: x.get("total_score", 0), reverse=True)
         return results
 
+    async def build_snapshot(self, exchange: str, min_score: int = 5) -> dict:
+        """Chạy screener cho toàn sàn và LƯU snapshot vào SQLite (persist).
+
+        Dùng cho scheduler (sau EOD) và bootstrap. Universe lấy từ stock_list
+        (đã persist). min_score=5 khớp baseline frontend → filter client-side
+        giữ nguyên độ chính xác.
+        """
+        ex = exchange.upper()
+        stocks = ohlcv_store.get_stock_list()
+        tickers = [s["ticker"] for s in stocks if (s.get("exchange") or "").upper() == ex]
+        if not tickers:
+            print(f"⚠️  build_snapshot {ex}: stock_list rỗng — cần refresh stock-list")
+            return {"exchange": exchange.lower(), "count": 0, "total": 0, "ok": False}
+        results = await self.run_screener(tickers, min_trend_score=min_score, min_rs=0.0)
+        scanned_at = datetime.now().isoformat()
+        ohlcv_store.upsert_screener_snapshot(exchange.lower(), results, scanned_at, len(tickers))
+        print(f"📸 Snapshot {ex}: {len(results)}/{len(tickers)} mã @ {scanned_at}")
+        return {"exchange": exchange.lower(), "count": len(results),
+                "total": len(tickers), "scanned_at": scanned_at, "ok": True}
+
     async def _analyze_ticker(self, ticker: str) -> Optional[dict]:
         """Phân tích một mã: Trend Template + VCP + RS"""
         # Kiểm tra cache — TTL ngắn trong giờ giao dịch để bám sát volume intraday
