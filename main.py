@@ -157,13 +157,19 @@ async def get_tickers(exchange: str):
         raise HTTPException(status_code=502, detail=f"failed to fetch symbols for {ex}: {type(e).__name__}: {e}")
 
 
-# ── Phục vụ frontend web (SPA) — PHẢI đặt CUỐI cùng (sau mọi /api + /ws route) ──
-# Mount "/" là catch-all: chỉ các path KHÔNG khớp route nào ở trên (/, /assets/*,
-# favicon...) mới rơi xuống StaticFiles. HashRouter → server chỉ cần trả index.html.
-# Guard isdir để chạy local không có webdist không bị lỗi khởi động.
+# ── Phục vụ frontend web (SPA HashRouter) ──
+# KHÔNG mount catch-all "/" — nó nuốt mất redirect trailing-slash của FastAPI
+# (vd /api/watchlists → /api/watchlists/) khiến API trả 404. HashRouter chỉ cần
+# "/" (index.html) + "/assets/*"; mọi route nội bộ đi qua #/ phía client.
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 if os.path.isdir("webdist"):
-    app.mount("/", StaticFiles(directory="webdist", html=True), name="web")
+    app.mount("/assets", StaticFiles(directory="webdist/assets"), name="assets")
+
+    @app.get("/", include_in_schema=False)
+    async def _spa_index():
+        return FileResponse("webdist/index.html")
+
     print("🌐 Serving web frontend from ./webdist")
 else:
     print("ℹ️  webdist/ không có — chạy ở chế độ API-only")
