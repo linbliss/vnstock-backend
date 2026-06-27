@@ -8,6 +8,7 @@ __pycache__/
 dist/
 build/
 *.egg
+!webdist/          # frontend web SPA — luôn đưa vào image (phục vụ qua StaticFiles)
 
 # Virtual environment
 venv/

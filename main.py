@@ -84,13 +84,14 @@ app.include_router(portfolio.router,            prefix="/api/portfolio",   tags=
 app.include_router(watchlist_router.router,     prefix="/api/watchlists",  tags=["watchlists"])
 app.include_router(user_settings_router.router, prefix="/api/user",        tags=["user"])
 
-@app.get("/")
-async def root():
-    return {"status": "running", "version": "0.3.0"}
-
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+@app.get("/api/status")
+async def api_status():
+    # "/" giờ phục vụ frontend web (index.html), nên status chuyển sang /api/status
+    return {"status": "running", "version": "0.3.0"}
 
 
 @app.get("/tickers/{exchange}")
@@ -154,3 +155,15 @@ async def get_tickers(exchange: str):
     # BaseException để nuốt SystemExit từ vnai.beam.quota
     except BaseException as e:
         raise HTTPException(status_code=502, detail=f"failed to fetch symbols for {ex}: {type(e).__name__}: {e}")
+
+
+# ── Phục vụ frontend web (SPA) — PHẢI đặt CUỐI cùng (sau mọi /api + /ws route) ──
+# Mount "/" là catch-all: chỉ các path KHÔNG khớp route nào ở trên (/, /assets/*,
+# favicon...) mới rơi xuống StaticFiles. HashRouter → server chỉ cần trả index.html.
+# Guard isdir để chạy local không có webdist không bị lỗi khởi động.
+from fastapi.staticfiles import StaticFiles
+if os.path.isdir("webdist"):
+    app.mount("/", StaticFiles(directory="webdist", html=True), name="web")
+    print("🌐 Serving web frontend from ./webdist")
+else:
+    print("ℹ️  webdist/ không có — chạy ở chế độ API-only")
