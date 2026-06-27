@@ -10,7 +10,7 @@ from typing import Optional
 
 import bcrypt
 import jwt
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Header
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel
 
@@ -21,6 +21,10 @@ router = APIRouter()
 SECRET_KEY  = os.environ.get("JWT_SECRET_KEY", "change-me-in-production-please")
 ALGORITHM   = "HS256"
 TOKEN_EXPIRE_DAYS = 30
+
+if SECRET_KEY == "change-me-in-production-please":
+    print("🔴 BẢO MẬT: JWT_SECRET_KEY chưa đặt — token có thể BỊ GIẢ MẠO! "
+          "Đặt env JWT_SECRET_KEY = chuỗi ngẫu nhiên mạnh rồi restart.")
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
@@ -80,11 +84,25 @@ class AuthBody(BaseModel):
 
 # ── Routes ───────────────────────────────────────────────────────────────────
 
+def _registration_allowed(x_admin_token: Optional[str]) -> bool:
+    """Đăng ký chỉ mở khi ALLOW_REGISTRATION bật, HOẶC request có ADMIN_TOKEN
+    hợp lệ (cửa hậu cho quản trị tạo tài khoản). Mặc định: KHOÁ."""
+    flag = os.environ.get("ALLOW_REGISTRATION", "false").strip().lower() in ("1", "true", "yes", "on")
+    if flag:
+        return True
+    admin = os.environ.get("ADMIN_TOKEN", "").strip()
+    return bool(admin and x_admin_token and x_admin_token.strip() == admin)
+
+
 @router.post("/register", status_code=201)
-def register(body: AuthBody):
+def register(body: AuthBody, x_admin_token: Optional[str] = Header(default=None)):
     """Đăng ký tài khoản mới.
-    Hiện tại luôn cho phép đăng ký (không giới hạn số lượng user).
+    KHOÁ mặc định (app cá nhân). Mở bằng env ALLOW_REGISTRATION=true hoặc gửi
+    header X-Admin-Token hợp lệ.
     """
+    if not _registration_allowed(x_admin_token):
+        raise HTTPException(status_code=403, detail="Đăng ký đã bị khoá.")
+
     existing = user_store.get_user_by_email(body.email)
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
