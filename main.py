@@ -170,6 +170,10 @@ if os.path.isdir("webdist"):
     async def _spa_index():
         return FileResponse("webdist/index.html")
 
+    @app.get("/favicon.png", include_in_schema=False)
+    async def _favicon():
+        return FileResponse("webdist/favicon.png")
+
     print("🌐 Serving web frontend from ./webdist")
 else:
     print("ℹ️  webdist/ không có — chạy ở chế độ API-only")
