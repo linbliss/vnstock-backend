@@ -24,7 +24,12 @@ SEED_PAGE = 1000                   # lần đầu lấy nhiều tick để có b
 POLL_PAGE = 300                    # các lần sau chỉ lấy tick mới
 MAX_TICKS = 20000                  # giới hạn bộ nhớ mỗi mã
 
-_cache: Dict[str, dict] = {}       # ticker -> {ticks, last_id, last_fetch}
+# Nguồn intraday theo thứ tự ưu tiên — fallback khi nguồn trước lỗi/throttle.
+# Cả VCI và KBS đều trả [time, price, volume, match_type, id] (id VCI là số,
+# KBS là chuỗi → chuẩn hoá về chuỗi; time VCI có tz, KBS naive → bỏ tz khi so sánh).
+SOURCES = ["VCI", "KBS"]
+
+_cache: Dict[str, dict] = {}       # ticker -> {ticks, seen(set id), src, last_fetch, err?}
 _lock = threading.Lock()
 _fetch_sema = threading.Semaphore(2)   # tối đa 2 lệnh gọi API song song
 
@@ -37,9 +42,9 @@ def _is_trading_hours() -> bool:
     return (9 * 60 <= t <= 11 * 60 + 30) or (13 * 60 <= t <= 15 * 60 + 2)
 
 
-def _fetch_intraday(ticker: str, page_size: int) -> List[dict]:
+def _fetch_intraday_src(ticker: str, page_size: int, source: str) -> List[dict]:
     from vnstock import Quote
-    df = Quote(symbol=ticker.upper(), source="VCI").intraday(page_size=page_size)
+    df = Quote(symbol=ticker.upper(), source=source.lower()).intraday(page_size=page_size)
     rows: List[dict] = []
     for _, r in df.iterrows():
         mt = str(r.get("match_type", "")).lower()
@@ -47,11 +52,10 @@ def _fetch_intraday(ticker: str, page_size: int) -> List[dict]:
         try:
             price = float(r["price"])
             vol = int(r["volume"])
-            tid = int(r["id"])
         except (TypeError, ValueError):
             continue
         rows.append({
-            "id": tid,
+            "id": str(r.get("id", "")),      # chuẩn hoá về chuỗi (VCI:int, KBS:str)
             "ts": str(r["time"]),
             "price": price,
             "volume": vol,
@@ -59,6 +63,25 @@ def _fetch_intraday(ticker: str, page_size: int) -> List[dict]:
             "value": vol * price * 1000.0,   # VND
         })
     return rows
+
+
+def _fetch_with_fallback(ticker: str, page_size: int, prefer: Optional[str] = None):
+    """Thử lần lượt các nguồn (ưu tiên nguồn đang chạy tốt) → (rows, source, err)."""
+    order = [prefer] if prefer in SOURCES else []
+    order += [s for s in SOURCES if s not in order]
+    last_err = None
+    empty_src = order[0] if order else "VCI"
+    for src in order:
+        try:
+            with _fetch_sema:
+                rows = _fetch_intraday_src(ticker, page_size, src)
+            if rows:
+                return rows, src, None
+            empty_src = src            # nguồn OK nhưng rỗng → thử nguồn kế
+        except Exception as e:         # noqa: BLE001 — lỗi/throttle → fallback
+            last_err = str(e)
+            continue
+    return [], empty_src, last_err
 
 
 def _update(ticker: str) -> dict:
@@ -74,28 +97,29 @@ def _update(ticker: str) -> dict:
         return c
 
     seed = c is None
-    try:
-        with _fetch_sema:
-            rows = _fetch_intraday(tk, SEED_PAGE if seed else POLL_PAGE)
-    except Exception as e:  # noqa: BLE001
-        if c:
-            c["last_fetch"] = now
-            return c
-        return {"ticks": [], "last_id": 0, "last_fetch": now, "err": str(e)}
+    prefer = c.get("src") if c else None
+    rows, src, err = _fetch_with_fallback(tk, SEED_PAGE if seed else POLL_PAGE, prefer)
 
     with _lock:
         c = _cache.get(tk)
         if c is None:
-            c = {"ticks": [], "last_id": 0, "last_fetch": now}
+            c = {"ticks": [], "seen": set(), "src": src, "last_fetch": now}
             _cache[tk] = c
-        last_id = c["last_id"]
-        new = [r for r in rows if r["id"] > last_id]
-        if new:
-            new.sort(key=lambda r: r["id"])
-            c["ticks"].extend(new)
-            c["last_id"] = c["ticks"][-1]["id"]
-            if len(c["ticks"]) > MAX_TICKS:
-                c["ticks"] = c["ticks"][-MAX_TICKS:]
+        if rows:
+            seen = c["seen"]
+            new = [r for r in rows if r["id"] not in seen]
+            if new:
+                for r in new:
+                    seen.add(r["id"])
+                new.sort(key=lambda r: _parse_ts(r["ts"]) or datetime.min)
+                c["ticks"].extend(new)
+                if len(c["ticks"]) > MAX_TICKS:
+                    c["ticks"] = c["ticks"][-MAX_TICKS:]
+                    c["seen"] = {t["id"] for t in c["ticks"]}
+            c["src"] = src
+            c.pop("err", None)
+        elif err and not c["ticks"]:
+            c["err"] = err
         c["last_fetch"] = now
         return c
 
@@ -106,8 +130,9 @@ def _clamp(v: float, lo: float, hi: float) -> float:
 
 def _parse_ts(ts: str) -> Optional[datetime]:
     try:
-        return datetime.fromisoformat(ts)
-    except ValueError:
+        # bỏ tzinfo → naive, để so sánh nhất quán giữa VCI (có tz) và KBS (naive)
+        return datetime.fromisoformat(ts).replace(tzinfo=None)
+    except (ValueError, TypeError):
         return None
 
 
