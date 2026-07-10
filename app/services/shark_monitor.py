@@ -19,7 +19,7 @@ from typing import Dict, List, Optional
 # ── Tham số mặc định (có thể override qua query) ──
 BIG_VALUE_VND = 1_000_000_000      # ngưỡng "lệnh lớn": ≥ 1 tỷ đồng/lệnh
 WINDOW_MIN = 15                    # cửa sổ trượt (phút) cho tín hiệu "gần đây"
-MIN_FETCH_INTERVAL = 18.0          # giây — không refetch 1 mã dày hơn mức này
+MIN_FETCH_INTERVAL = 8.0           # giây — không refetch 1 mã dày hơn mức này (có fallback VCI↔KBS)
 SEED_PAGE = 1000                   # lần đầu lấy nhiều tick để có bối cảnh
 POLL_PAGE = 300                    # các lần sau chỉ lấy tick mới
 MAX_TICKS = 20000                  # giới hạn bộ nhớ mỗi mã
@@ -31,7 +31,7 @@ SOURCES = ["VCI", "KBS"]
 
 _cache: Dict[str, dict] = {}       # ticker -> {ticks, seen(set id), src, last_fetch, err?}
 _lock = threading.Lock()
-_fetch_sema = threading.Semaphore(2)   # tối đa 2 lệnh gọi API song song
+_fetch_sema = threading.Semaphore(3)   # tối đa 3 lệnh gọi API song song
 
 
 def _is_trading_hours() -> bool:
