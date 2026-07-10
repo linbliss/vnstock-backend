@@ -13,6 +13,7 @@ from app.services import ohlcv_store, user_store
 from app.services.backfill import daily_update_scheduler
 from app.routers import quotes, alerts, screener, admin, chart
 from app.routers import auth, portfolio, watchlist_router, user_settings_router
+from app.routers import shark
 
 alert_task = None
 daily_task = None
@@ -83,6 +84,7 @@ app.include_router(auth.router,                 prefix="/api/auth",        tags=
 app.include_router(portfolio.router,            prefix="/api/portfolio",   tags=["portfolio"])
 app.include_router(watchlist_router.router,     prefix="/api/watchlists",  tags=["watchlists"])
 app.include_router(user_settings_router.router, prefix="/api/user",        tags=["user"])
+app.include_router(shark.router)   # đã tự set prefix "/api/shark"
 
 @app.get("/health")
 async def health():
