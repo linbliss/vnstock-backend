@@ -87,6 +87,23 @@ def _fetch_with_fallback(ticker: str, page_size: int, prefer: Optional[str] = No
 def _update(ticker: str) -> dict:
     tk = ticker.upper()
     now = time.time()
+
+    # Ưu tiên DNSE stream nếu đang chạy → đăng ký nhu cầu, KHÔNG gọi vnstock.
+    # Cache được nuôi liên tục qua push_ticks (từ dnse_feed).
+    # TODO (Phase 1): seed đầu phiên bằng dnse_client.get_trades để đủ tổng Mua/Bán cả ngày.
+    try:
+        from app.services import dnse_feed
+        if dnse_feed.active():
+            dnse_feed.register_demand(tk)
+            with _lock:
+                c = _cache.get(tk)
+                if c is None:
+                    c = {"ticks": [], "seen": set(), "src": "DNSE", "last_fetch": now}
+                    _cache[tk] = c
+                return c
+    except Exception:  # noqa: BLE001
+        pass
+
     with _lock:
         c = _cache.get(tk)
     # Còn tươi → khỏi gọi lại
@@ -122,6 +139,31 @@ def _update(ticker: str) -> dict:
             c["err"] = err
         c["last_fetch"] = now
         return c
+
+
+def push_ticks(ticker: str, rows: List[dict], source: str = "DNSE") -> None:
+    """dnse_feed đẩy tick realtime vào cache (dedup theo id, sắp theo thời gian)."""
+    if not rows:
+        return
+    tk = ticker.upper()
+    now = time.time()
+    with _lock:
+        c = _cache.get(tk)
+        if c is None:
+            c = {"ticks": [], "seen": set(), "src": source, "last_fetch": now}
+            _cache[tk] = c
+        seen = c["seen"]
+        new = [r for r in rows if r["id"] not in seen]
+        if new:
+            for r in new:
+                seen.add(r["id"])
+            new.sort(key=lambda r: _parse_ts(r["ts"]) or datetime.min)
+            c["ticks"].extend(new)
+            if len(c["ticks"]) > MAX_TICKS:
+                c["ticks"] = c["ticks"][-MAX_TICKS:]
+                c["seen"] = {t["id"] for t in c["ticks"]}
+        c["src"] = source
+        c["last_fetch"] = now
 
 
 def _clamp(v: float, lo: float, hi: float) -> float:

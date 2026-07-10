@@ -25,6 +25,9 @@ async def lifespan(app: FastAPI):
     ohlcv_store.init_db()
     user_store.init_db()
     await market_service.start()
+    # DNSE feed (streaming market data) — chỉ bật khi có DNSE_API_KEY/SECRET; nếu không thì no-op
+    from app.services import dnse_feed
+    await dnse_feed.start()
     alert_task = asyncio.create_task(run_alert_engine())
     daily_task = asyncio.create_task(daily_update_scheduler())
     rs_task = asyncio.create_task(_rs_rating_scheduler())
@@ -37,6 +40,8 @@ async def lifespan(app: FastAPI):
         daily_task.cancel()
     if rs_task:
         rs_task.cancel()
+    from app.services import dnse_feed
+    await dnse_feed.stop()
     await market_service.stop()
 
 async def _warmup_vnindex():
