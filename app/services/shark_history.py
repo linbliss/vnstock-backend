@@ -45,6 +45,83 @@ def _num(d: dict, k: str) -> float:
     return float(v) if isinstance(v, (int, float)) else 0.0
 
 
+def _period_behavior(days: list) -> dict:
+    """Tín hiệu Wyckoff/VSA/OBV/CMF từ nến NGÀY (dòng tiền theo kỳ).
+    Trả thành phần [-1..1] (dương = gom) + cờ mô tả.
+      - cmf:      Chaikin Money Flow (đóng cửa trong biên × KL) → dòng tiền vào/ra
+      - clv_bias: vị trí đóng cửa trong biên (gần High = gom / nến rút đầu = xả)
+      - obv_div:  OBV phân kỳ so với giá (OBV lên mà giá đi ngang = gom)
+    """
+    flags: list = []
+    n = len(days)
+    if n < 5:
+        return {"cmf": 0.0, "clv_bias": 0.0, "obv_div": 0.0, "flags": flags}
+
+    closes = [d["close"] for d in days]
+    vols = [d["total_vol"] for d in days]
+    volsum = sum(vols) or 1.0
+
+    # CLV & CMF
+    mfv = 0.0
+    clvs = []
+    for d in days:
+        rng = d["high"] - d["low"]
+        clv = (((d["close"] - d["low"]) - (d["high"] - d["close"])) / rng) if rng > 0 else 0.0
+        clvs.append(clv)
+        mfv += clv * d["total_vol"]
+    cmf = _clamp(mfv / volsum, -1, 1)
+    clv_bias = _clamp(sum(clvs) / n, -1, 1)
+
+    # OBV vs giá — phân kỳ
+    obv = 0.0
+    for i in range(1, n):
+        if closes[i] > closes[i - 1]:
+            obv += vols[i]
+        elif closes[i] < closes[i - 1]:
+            obv -= vols[i]
+    price_trend = (closes[-1] - closes[0]) / (closes[0] or 1)   # tỉ lệ
+    obv_norm = _clamp(obv / volsum, -1, 1)
+    price_norm = _clamp(price_trend * 10, -1, 1)
+    obv_div = _clamp(obv_norm - price_norm, -1, 1)
+
+    # Xu hướng khối lượng (nửa sau vs nửa đầu)
+    half = n // 2
+    v1 = sum(vols[:half]) / max(1, half)
+    v2 = sum(vols[half:]) / max(1, n - half)
+    vol_trend = (v2 - v1) / (v1 or 1)
+
+    # Cờ mô tả
+    if cmf > 0.05:
+        flags.append("Dòng tiền vào (CMF+)")
+    elif cmf < -0.05:
+        flags.append("Dòng tiền ra (CMF−)")
+    if clv_bias > 0.2:
+        flags.append("Đóng cửa gần đỉnh (gom)")
+    elif clv_bias < -0.2:
+        flags.append("Nến rút đầu (xả)")
+    if obv_div > 0.2:
+        flags.append("OBV phân kỳ dương (gom)")
+    elif obv_div < -0.2:
+        flags.append("OBV phân kỳ âm (xả)")
+    if vol_trend > 0.25 and abs(price_trend) < 0.03:
+        flags.append("KL tăng, giá đi ngang (hấp thụ)")
+    elif price_trend > 0.03 and vol_trend < -0.25:
+        flags.append("Giá tăng, KL giảm (phân phối)")
+
+    # Khối ngoại gom nhiều phiên liên tiếp (cuối kỳ)
+    streak = 0
+    for d in reversed(days):
+        if d["foreign_net"] > 0:
+            streak += 1
+        else:
+            break
+    if streak >= 5:
+        flags.append(f"Khối ngoại gom {streak} phiên")
+
+    return {"cmf": round(cmf, 3), "clv_bias": round(clv_bias, 3),
+            "obv_div": round(obv_div, 3), "flags": flags}
+
+
 def _compute(ticker: str, start: str, end: str, raw: list) -> dict:
     days: List[dict] = []
     for d in raw or []:
@@ -55,6 +132,9 @@ def _compute(ticker: str, start: str, end: str, raw: list) -> dict:
         f_sell = _num(d, "sellForeignValue")
         days.append({
             "date": str(d.get("date", ""))[:10],
+            "open": _num(d, "priceOpen") or close,
+            "high": _num(d, "priceHigh") or close,
+            "low": _num(d, "priceLow") or close,
             "close": close,
             "change_pct": round(change / basic * 100, 2) if basic else 0.0,
             "total_vol": _num(d, "totalVolume"),
@@ -86,12 +166,25 @@ def _compute(ticker: str, start: str, end: str, raw: list) -> dict:
     foreign_dir = _clamp(tot_fnet / abs_fnet, -1, 1)                  # -1..1
     prop_dir = _clamp(tot_prop / abs_prop, -1, 1)                     # -1..1
 
-    # Shark Score kỳ: ưu tiên khối ngoại + tự doanh (dòng tiền tổ chức) + chủ động
-    score = 100.0 * (0.40 * foreign_dir + 0.25 * prop_dir + 0.35 * active_imb)
+    beh = _period_behavior(days)   # VSA / OBV / CMF
+
+    # Shark Score kỳ: dòng tiền tổ chức (ngoại/tự doanh/chủ động) + hành vi Wyckoff/VSA
+    score = 100.0 * (
+        0.22 * foreign_dir +      # khối ngoại
+        0.10 * prop_dir +         # tự doanh
+        0.13 * active_imb +       # chủ động mua/bán
+        0.20 * beh["cmf"] +       # CMF (dòng tiền)
+        0.15 * beh["clv_bias"] +  # vị trí đóng cửa (VSA)
+        0.20 * beh["obv_div"]     # OBV phân kỳ
+    )
     score = round(_clamp(score, -100, 100))
     label = "Gom hàng" if score >= 25 else ("Xả hàng" if score <= -25 else "Trung tính")
 
     return {
+        "cmf": beh["cmf"],
+        "clv_bias": beh["clv_bias"],
+        "obv_div": beh["obv_div"],
+        "patterns": beh["flags"],
         "ticker": ticker.upper(),
         "start": start,
         "end": end,
