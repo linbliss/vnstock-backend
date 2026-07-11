@@ -178,6 +178,83 @@ def _parse_ts(ts: str) -> Optional[datetime]:
         return None
 
 
+def _behavior(ticks: List[dict], big_value: float) -> dict:
+    """Phát hiện HÀNH VI thao túng của cá mập từ chuỗi khớp lệnh (order-flow / tape reading).
+    Trả các thành phần [-1..1] (dương = gom, âm = xả) + cờ mô tả để hiển thị.
+
+    - absorption: bán chủ động nhiều mà giá KHÔNG giảm → gom (có tay to đỡ); ngược lại = xả
+    - manip:      mánh sau lệnh lớn (rũ hàng gom / kéo giá xả) + động lượng nối tiếp
+    - reversal:   spring (phá đáy rồi hồi = gom) / upthrust (vượt đỉnh rồi rớt = xả)
+    """
+    n = len(ticks)
+    flags: List[str] = []
+    if n < 8:
+        return {"absorption": 0.0, "manip": 0.0, "reversal": 0.0, "flags": flags}
+
+    prices = [t["price"] for t in ticks]
+    first_p, last_p = prices[0], prices[-1]
+    hi, lo = max(prices), min(prices)
+    rng = (hi - lo) or 1e-9
+    total_buy = sum(t["volume"] for t in ticks if t["side"] == "B")
+    total_sell = sum(t["volume"] for t in ticks if t["side"] == "S")
+    total = (total_buy + total_sell) or 1
+    net = (total_buy - total_sell) / total                       # -1..1
+    price_chg = (last_p - first_p) / (first_p or 1)              # tỉ lệ
+
+    # 1) HẤP THỤ — nghịch pha giữa dòng lệnh chủ động và giá
+    absorption = 0.0
+    if net < -0.08 and price_chg >= 0:      # bán trội nhưng giá giữ/tăng → GOM
+        absorption = min(1.0, (-net) + max(0.0, price_chg) * 8)
+        flags.append("Hấp thụ lực bán (gom)")
+    elif net > 0.08 and price_chg <= 0:     # mua trội nhưng giá giữ/giảm → XẢ
+        absorption = -min(1.0, net + max(0.0, -price_chg) * 8)
+        flags.append("Hấp thụ lực mua (xả)")
+
+    # 2) MÁNH quanh LỆNH LỚN — rũ hàng gom / kéo giá xả + động lượng nối tiếp
+    big_idx = [i for i, t in enumerate(ticks) if t["value"] >= big_value]
+    manip_raw = 0.0
+    shakeout = uptrap = 0
+    for i in big_idx:
+        b = ticks[i]
+        wnd = ticks[i + 1:i + 9]            # 8 khớp ngay sau
+        if not wnd:
+            continue
+        follow_same = sum(1 for w in wnd if w["side"] == b["side"])
+        if b["side"] == "B":
+            # sau MUA lớn có BÁN nhỏ giá THẤP hơn → đạp giá để gom tiếp (rũ hàng)
+            if any(w["side"] == "S" and w["price"] < b["price"] and w["volume"] < b["volume"] for w in wnd):
+                manip_raw += 1.0; shakeout += 1
+            if follow_same >= len(wnd) * 0.6:      # nối tiếp mua → động lượng gom
+                manip_raw += 0.4
+        elif b["side"] == "S":
+            # sau BÁN lớn có MUA nhỏ giá CAO hơn → kéo giá để xả tiếp
+            if any(w["side"] == "B" and w["price"] > b["price"] and w["volume"] < b["volume"] for w in wnd):
+                manip_raw -= 1.0; uptrap += 1
+            if follow_same >= len(wnd) * 0.6:
+                manip_raw -= 0.4
+    manip = _clamp(manip_raw / max(3.0, len(big_idx)), -1, 1)
+    if shakeout:
+        flags.append(f"Rũ hàng gom ×{shakeout}")
+    if uptrap:
+        flags.append(f"Kéo giá xả ×{uptrap}")
+
+    # 3) SPRING / UPTHRUST — đảo chiều ở biên
+    reversal = 0.0
+    tail = max(1, n // 3)
+    low_idx = min(range(n), key=lambda i: prices[i])
+    high_idx = max(range(n), key=lambda i: prices[i])
+    pos = (last_p - lo) / rng                                    # 0=đáy, 1=đỉnh
+    if low_idx >= n - tail and pos >= 0.55:                      # đáy mới gần đây rồi hồi lên
+        reversal = min(1.0, pos)
+        flags.append("Spring (phá đáy rồi hồi → gom)")
+    elif high_idx >= n - tail and pos <= 0.45:                   # đỉnh mới gần đây rồi rớt
+        reversal = -min(1.0, 1 - pos)
+        flags.append("Upthrust (vượt đỉnh rồi rớt → xả)")
+
+    return {"absorption": round(absorption, 3), "manip": round(manip, 3),
+            "reversal": round(reversal, 3), "flags": flags}
+
+
 def _metrics(ticker: str, ticks: List[dict], big_value: float, window_min: int) -> dict:
     tk = ticker.upper()
     if not ticks:
@@ -220,9 +297,18 @@ def _metrics(ticker: str, ticks: List[dict], big_value: float, window_min: int) 
     w_total = w_buy + w_sell
     w_imbalance = (w_buy - w_sell) / w_total if w_total else 0.0
 
-    # Shark Score: ưu tiên tiền LỚN (cá mập), có tham chiếu mất cân bằng toàn phiên
-    # + động lượng cửa sổ gần đây.
-    score = 100.0 * (0.55 * big_dir + 0.30 * imbalance + 0.15 * w_imbalance)
+    # Hành vi thao túng (tape reading): hấp thụ / rũ hàng-kéo giá / spring-upthrust
+    beh = _behavior(ticks, big_value)
+
+    # Shark Score: kết hợp tiền LỚN + mất cân bằng chủ động + HÀNH VI cá mập.
+    score = 100.0 * (
+        0.28 * big_dir +          # hướng tiền lớn
+        0.18 * imbalance +        # mất cân bằng toàn phiên
+        0.10 * w_imbalance +      # động lượng cửa sổ gần đây
+        0.22 * beh["absorption"] +  # hấp thụ
+        0.16 * beh["manip"] +       # mánh quanh lệnh lớn (rũ/kéo)
+        0.06 * beh["reversal"]      # spring / upthrust
+    )
     score = round(_clamp(score, -100, 100))
 
     if score >= 25:
@@ -261,6 +347,11 @@ def _metrics(ticker: str, ticks: List[dict], big_value: float, window_min: int) 
         "big_sell_val": big_sell_val,
         "big_net": big_net,
         "big_orders": big_orders,
+        # Thành phần hành vi (tape reading) — để minh bạch & hiển thị
+        "absorption": beh["absorption"],
+        "manip": beh["manip"],
+        "reversal": beh["reversal"],
+        "patterns": beh["flags"],
         "last_price": last_price,
         "last_ts": ticks[-1]["ts"],
         "n_ticks": len(ticks),
