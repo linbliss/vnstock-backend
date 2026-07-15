@@ -131,6 +131,18 @@ async def refresh_stock_list():
     Chạy 1 lần sau khi deploy, hoặc khi cần cập nhật mã mới lên/xuống sàn."""
     loop = asyncio.get_event_loop()
 
+    # DNSE trước (nếu có key)
+    try:
+        from app.services import dnse_client
+        if dnse_client.enabled():
+            stocks_dnse = await loop.run_in_executor(None, dnse_client.get_stock_list)
+            if stocks_dnse:
+                n = ohlcv_store.upsert_stock_list(stocks_dnse)
+                return {"ok": True, "count": n, "source": "DNSE",
+                        "stats": ohlcv_store.get_stock_list_stats()}
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️  stock-list DNSE: {type(e).__name__}: {e}", flush=True)
+
     def _fetch() -> list:
         from vnstock import Listing
         df = Listing().symbols_by_exchange()

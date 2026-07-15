@@ -29,8 +29,15 @@ _cancel_flags: Dict[str, bool] = {}
 
 
 def _listing_for(exchange: str) -> List[str]:
-    """Lấy ticker list từ vnstock Listing. Không rate-limit ở đây —
-    caller nên acquire limiter trước."""
+    """Lấy ticker list 1 sàn. Ưu tiên DNSE (nếu có key) → fallback vnstock Listing."""
+    try:
+        from app.services import dnse_client
+        if dnse_client.enabled():
+            tks = dnse_client.get_tickers_by_exchange(exchange)
+            if tks:
+                return tks
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️  listing {exchange} DNSE: {type(e).__name__}: {e}")
     try:
         from vnstock import Listing
         df = Listing().symbols_by_exchange()
@@ -85,8 +92,18 @@ async def get_tickers_for_scope(scope: str) -> List[str]:
 
 
 def _fetch_history_sync(ticker: str, start: str, end: str) -> Optional[pd.DataFrame]:
-    """Gọi vnstock Quote.history cho 1 ticker. Thử kbs → vci. Trả df normalized
-    với cột date/open/high/low/close/volume hoặc None."""
+    """Lịch sử OHLCV 1 ticker → df date/open/high/low/close/volume.
+    Ưu tiên DNSE (nếu có key) → fallback vnstock (kbs → vci)."""
+    # DNSE trước
+    try:
+        from app.services import dnse_client
+        if dnse_client.enabled():
+            rows = dnse_client.get_ohlc_history(ticker, start, end)
+            if rows:
+                return pd.DataFrame(rows)
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️  {ticker} DNSE ohlc: {type(e).__name__}: {e}", flush=True)
+
     from vnstock import Quote
     for source in ("kbs", "vci"):
         try:

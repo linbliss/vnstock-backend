@@ -407,6 +407,18 @@ async def get_tickers_by_exchange(exchange: str) -> List[str]:
     if cached and (now - cached["ts"]) < _TICKER_CACHE_TTL:
         return cached["tickers"]
 
+    # DNSE trước (nếu có key)
+    try:
+        from app.services import dnse_client
+        if dnse_client.enabled():
+            tks = await asyncio.get_event_loop().run_in_executor(
+                None, dnse_client.get_tickers_by_exchange, ex)
+            if tks:
+                _ticker_list_cache[ex] = {"ts": now, "tickers": tks}
+                return tks
+    except Exception as _e:  # noqa: BLE001
+        print(f"⚠️  ticker list {ex} DNSE: {type(_e).__name__}: {_e}", flush=True)
+
     try:
         loop = asyncio.get_event_loop()
         def fetch():

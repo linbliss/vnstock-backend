@@ -117,6 +117,18 @@ async def get_tickers(exchange: str):
         ]
         return {"exchange": ex, "tickers": tickers, "count": len(tickers)}
 
+    # DNSE trước (nếu có key)
+    try:
+        from app.services import dnse_client
+        if dnse_client.enabled():
+            import asyncio as _a0
+            tks = await _a0.get_event_loop().run_in_executor(
+                None, dnse_client.get_tickers_by_exchange, ex)
+            if tks:
+                return {"exchange": ex, "tickers": tks, "count": len(tks)}
+    except Exception as _e:  # noqa: BLE001
+        print(f"⚠️  tickers {ex} DNSE: {type(_e).__name__}: {_e}", flush=True)
+
     try:
         def fetch():
             from vnstock import Listing

@@ -83,6 +83,32 @@ def get_ohlc(symbol: str, resolution: str = "1D", from_ts: int = 0, to_ts: int =
     })
 
 
+def get_ohlc_history(symbol: str, start_date: str, end_date: str, resolution: str = "1D"):
+    """Nến ngày lịch sử → list {date, open, high, low, close, volume} (giá kVND).
+    start_date/end_date = 'YYYY-MM-DD'. Thay vnstock Quote.history."""
+    if not enabled():
+        return None
+    from datetime import datetime
+    try:
+        frm = int(datetime.strptime(start_date, "%Y-%m-%d").timestamp())
+        to = int(datetime.strptime(end_date, "%Y-%m-%d").timestamp()) + 86400
+    except (ValueError, TypeError):
+        return None
+    r = get_ohlc(symbol, resolution=resolution, from_ts=frm, to_ts=to)
+    if not r or not r.get("t"):
+        return None
+    t, o, h, low, c, v = (r.get(k) or [] for k in ("t", "o", "h", "l", "c", "v"))
+    out = []
+    for i in range(len(t)):
+        if t[i] is None:
+            continue
+        out.append({
+            "date": datetime.fromtimestamp(t[i]).strftime("%Y-%m-%d"),
+            "open": o[i], "high": h[i], "low": low[i], "close": c[i], "volume": v[i],
+        })
+    return out or None
+
+
 def get_trades(symbol: str, board_id: Optional[str] = None, from_date: int = 0,
                to_date: int = 0, limit: int = 500, order: str = "DESC",
                next_page_token: Optional[str] = None):
@@ -189,6 +215,56 @@ def get_instruments(symbol: str = "", market_id: str = "", security_group_id: st
         "symbol": symbol or None, "marketId": market_id or None,
         "securityGroupId": security_group_id or None, "limit": limit, "page": page,
     })
+
+
+# marketId DNSE → sàn
+_EXCH_MAP = {"STO": "HOSE", "STX": "HNX", "UPX": "UPCOM"}
+
+
+_stocklist_cache = None
+_stocklist_ts = 0.0
+_STOCKLIST_TTL = 86400.0   # danh sách mã đổi rất chậm → cache 1 ngày
+
+
+def get_stock_list():
+    """Danh sách cổ phiếu HOSE/HNX/UPCOM → [{ticker, name, exchange}] (thay vnstock Listing)."""
+    global _stocklist_cache, _stocklist_ts
+    if not enabled():
+        return None
+    if _stocklist_cache and time.time() - _stocklist_ts < _STOCKLIST_TTL:
+        return _stocklist_cache
+    out: list = []
+    seen: set = set()
+    for pg in range(1, 8):
+        r = get_instruments(limit=1000, page=pg)
+        data = r.get("data", []) if r else []
+        if not data:
+            break
+        for x in data:
+            if x.get("securityGroupId") != "ST":
+                continue
+            exch = _EXCH_MAP.get(x.get("marketId"))
+            tk = str(x.get("symbol", "")).strip().upper()
+            if not exch or not tk or tk in seen:
+                continue
+            seen.add(tk)
+            out.append({"ticker": tk, "exchange": exch,
+                        "name": str(x.get("name") or x.get("shortName") or "").strip()})
+        if len(data) < 1000:
+            break
+    if out:
+        _stocklist_cache = out
+        _stocklist_ts = time.time()
+    return out or None
+
+
+def get_tickers_by_exchange(exchange: str):
+    """Danh sách mã của 1 sàn (HOSE/HNX/UPCOM) → [ticker]. Thay Listing().symbols_by_exchange()."""
+    lst = get_stock_list()
+    if not lst:
+        return None
+    ex = exchange.upper()
+    return [x["ticker"] for x in lst if x["exchange"] == ex]
 
 
 _ob_cache: dict = {}   # ticker -> (ts, orderbook)

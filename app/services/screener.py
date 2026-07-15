@@ -1869,6 +1869,21 @@ class ScreenerService:
         if df_store is not None and len(df_store) >= 60:
             return df_store
 
+        # ── DNSE (ưu tiên nếu có key; không dùng cho index) ──
+        try:
+            from app.services import dnse_client
+            if dnse_client.enabled() and not is_index:
+                loop0 = asyncio.get_event_loop()
+                rows = await loop0.run_in_executor(None, dnse_client.get_ohlc_history, ticker, start, end)
+                if rows:
+                    df_dnse = pd.DataFrame(rows)
+                    if len(df_dnse) >= 60:
+                        ohlcv_store.upsert_ohlcv(ticker.upper(), df_dnse)
+                        print(f"✅ {ticker} via DNSE: {len(df_dnse)} rows → store", flush=True)
+                        return df_dnse
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️  {ticker} DNSE ohlc: {type(e).__name__}: {e}", flush=True)
+
         # ── FireAnt historical prices (index + stocks) ──
         sym_fa = "VNINDEX" if is_index else ticker.upper()
         df_fa = await self._fetch_fireant_ohlcv(sym_fa, start, end)
