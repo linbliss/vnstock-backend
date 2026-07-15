@@ -24,6 +24,15 @@ async def lifespan(app: FastAPI):
     global alert_task, daily_task, rs_task
     ohlcv_store.init_db()
     user_store.init_db()
+    # Cache tape trong phiên (bền vững) — init + dọn tape cũ > 5 ngày
+    from app.services import tape_store
+    tape_store.init_db()
+    try:
+        n = tape_store.cleanup(keep_days=5)
+        if n:
+            print(f"🧹 tape_store: dọn {n} tape cũ (>5 ngày)")
+    except Exception as e:
+        print(f"⚠️  tape_store.cleanup: {e}")
     await market_service.start()
     # DNSE feed (streaming market data) — chỉ bật khi có DNSE_API_KEY/SECRET; nếu không thì no-op
     from app.services import dnse_feed
