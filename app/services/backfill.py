@@ -9,6 +9,7 @@ API:
   get_tickers_for_scope(scope) -> List[str]
 """
 import asyncio
+import os
 import uuid
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict
@@ -174,6 +175,44 @@ async def _run_job(job_id: str, tickers: List[str], start: str, end: str) -> Non
     except Exception:
         cutoff = end
     try:
+        from app.services import dnse_client
+        total = len(tickers)
+
+        # ── DNSE: chạy SONG SONG (OHLC 50k/giờ nên thoải mái) ──
+        if dnse_client.enabled():
+            conc = int(os.environ.get("DNSE_BACKFILL_CONCURRENCY", "8"))
+            sem = asyncio.Semaphore(conc)
+            cnt = {"completed": 0, "failed": 0, "skipped": 0, "done": 0}
+
+            async def _worker(t: str):
+                if _cancel_flags.get(job_id):
+                    return
+                last = ohlcv_store.get_last_date(t)
+                if last and last >= cutoff:
+                    cnt["skipped"] += 1; cnt["completed"] += 1; cnt["done"] += 1
+                    return
+                async with sem:
+                    if _cancel_flags.get(job_id):
+                        return
+                    try:
+                        n = await _backfill_one(t, start, end)
+                        cnt["completed" if n > 0 else "failed"] += 1
+                    except BaseException as e:  # noqa: BLE001
+                        cnt["failed"] += 1
+                        print(f"❌ backfill {t}: {type(e).__name__}: {e}", flush=True)
+                cnt["done"] += 1
+                if cnt["done"] % 20 == 0:
+                    ohlcv_store.update_job(job_id, completed=cnt["completed"], failed=cnt["failed"],
+                                           message=f"{cnt['done']}/{total} (song song {conc})")
+
+            await asyncio.gather(*[_worker(t) for t in tickers])
+            status = "cancelled" if _cancel_flags.get(job_id) else "done"
+            ohlcv_store.update_job(job_id, completed=cnt["completed"], failed=cnt["failed"], status=status,
+                                   message=f"{status} {cnt['completed']}/{total} ok ({cnt['skipped']} skipped), {cnt['failed']} failed")
+            print(f"✅ Backfill job {job_id} {status}: {cnt['completed']}/{total} ok ({cnt['skipped']} skipped), {cnt['failed']} failed", flush=True)
+            return
+
+        # ── vnstock: tuần tự (giữ phanh limiter) ──
         for i, t in enumerate(tickers):
             if _cancel_flags.get(job_id):
                 ohlcv_store.update_job(job_id, completed=completed, failed=failed,
