@@ -59,7 +59,9 @@ async def get_tickers_for_scope(scope: str) -> List[str]:
     loop = asyncio.get_event_loop()
 
     async def listing(ex: str) -> List[str]:
-        await market_service._limiter.acquire()
+        from app.services import dnse_client
+        if not dnse_client.enabled():        # DNSE có danh sách mã sẵn, không cần phanh
+            await market_service._limiter.acquire()
         return await loop.run_in_executor(None, _listing_for, ex)
 
     if s == "VN30":
@@ -135,8 +137,10 @@ def _fetch_history_sync(ticker: str, start: str, end: str) -> Optional[pd.DataFr
 
 
 async def _backfill_one(ticker: str, start: str, end: str, timeout: float = 45.0) -> int:
-    """Fetch + upsert 1 ticker. Trả số rows. Timeout để tránh vnstock hang vô hạn."""
-    await market_service._limiter.acquire()
+    """Fetch + upsert 1 ticker. Trả số rows."""
+    from app.services import dnse_client
+    if not dnse_client.enabled():           # DNSE không cần phanh 35/60 của vnstock
+        await market_service._limiter.acquire()
     loop = asyncio.get_event_loop()
     print(f"→ backfill {ticker} [{start}..{end}]", flush=True)
     try:

@@ -92,8 +92,9 @@ def _update(ticker: str) -> dict:
 
     with _lock:
         c = _cache.get(tk)
-    # Còn tươi → khỏi gọi lại
-    if c and now - c["last_fetch"] < MIN_FETCH_INTERVAL:
+    # DNSE không bị giới hạn tần suất như vnstock → refetch tươi hơn (3s vs 8s)
+    fetch_interval = 3.0 if dnse_client.enabled() else MIN_FETCH_INTERVAL
+    if c and now - c["last_fetch"] < fetch_interval:
         return c
     # Ngoài giờ giao dịch mà đã có cache → không gọi API nữa
     if c and not _is_trading_hours():
