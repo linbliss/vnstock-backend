@@ -155,7 +155,9 @@ async def _backfill_one(ticker: str, start: str, end: str, timeout: float = 45.0
     if df is None or df.empty:
         print(f"∅ {ticker}: no data", flush=True)
         return 0
-    n = ohlcv_store.upsert_ohlcv(ticker, df)
+    # Upsert chạy TRONG executor để KHÔNG block event loop (iterrows + ghi DB nặng,
+    # nhất là 15 năm ~3500 dòng/mã) → progress cập nhật + fetch song song thật sự.
+    n = await loop.run_in_executor(None, ohlcv_store.upsert_ohlcv, ticker, df)
     print(f"✅ {ticker}: {n} rows saved", flush=True)
     return n
 

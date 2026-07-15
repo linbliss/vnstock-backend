@@ -129,16 +129,13 @@ def upsert_ohlcv(ticker: str, df: pd.DataFrame) -> int:
     if "volume" not in d.columns:
         d["volume"] = 0
 
+    def _f(v):
+        return float(v) if pd.notna(v) else None
     rows = [
-        (
-            t, r["date"],
-            float(r["open"]) if pd.notna(r["open"]) else None,
-            float(r["high"]) if pd.notna(r["high"]) else None,
-            float(r["low"])  if pd.notna(r["low"])  else None,
-            float(r["close"]) if pd.notna(r["close"]) else None,
-            int(r["volume"])  if pd.notna(r["volume"]) else 0,
-        )
-        for _, r in d.iterrows()
+        (t, date, _f(o), _f(h), _f(lo), _f(cl), int(vo) if pd.notna(vo) else 0)
+        # itertuples nhanh hơn iterrows ~10× (quan trọng khi backfill 15 năm × 1500+ mã)
+        for date, o, h, lo, cl, vo in d[["date", "open", "high", "low", "close", "volume"]]
+            .itertuples(index=False, name=None)
     ]
     with _lock, _connect() as conn:
         conn.executemany(
