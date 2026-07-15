@@ -27,6 +27,11 @@ VN30 = [
 
 # Job cancellation flags
 _cancel_flags: Dict[str, bool] = {}
+_live: Dict[str, dict] = {}   # tiến độ realtime trong bộ nhớ (không phụ thuộc ghi DB)
+
+
+def get_live(job_id: str) -> Optional[dict]:
+    return _live.get(job_id)
 
 
 def _listing_for(exchange: str) -> List[str]:
@@ -204,10 +209,11 @@ async def _run_job(job_id: str, tickers: List[str], start: str, end: str) -> Non
         if dnse_client.enabled():
             import functools
             from concurrent.futures import ThreadPoolExecutor
-            conc = int(os.environ.get("DNSE_BACKFILL_CONCURRENCY", "8"))
+            conc = int(os.environ.get("DNSE_BACKFILL_CONCURRENCY", "6"))
             executor = ThreadPoolExecutor(max_workers=conc + 2)
             sem = asyncio.Semaphore(conc)
-            cnt = {"completed": 0, "failed": 0, "skipped": 0, "done": 0}
+            cnt = {"completed": 0, "failed": 0, "skipped": 0, "done": 0, "total": total}
+            _live[job_id] = cnt        # tiến độ realtime (endpoint đọc thẳng, không cần ghi DB)
             loop = asyncio.get_event_loop()
 
             async def _update(**kw):
@@ -227,7 +233,8 @@ async def _run_job(job_id: str, tickers: List[str], start: str, end: str) -> Non
                 else:
                     cnt["failed"] += 1
                 cnt["done"] += 1
-                if cnt["done"] % 25 == 0:
+                # Ghi DB thưa (100 mã/lần) để đỡ tranh write-lock; tiến độ realtime đã có trong _live
+                if cnt["done"] % 100 == 0:
                     await _update(completed=cnt["completed"], failed=cnt["failed"],
                                   message=f"{cnt['done']}/{total} (song song {conc})")
 
@@ -236,6 +243,7 @@ async def _run_job(job_id: str, tickers: List[str], start: str, end: str) -> Non
             finally:
                 executor.shutdown(wait=False)
             status = "cancelled" if _cancel_flags.get(job_id) else "done"
+            cnt["status"] = status
             await _update(completed=cnt["completed"], failed=cnt["failed"], status=status,
                           message=f"{status} {cnt['completed']}/{total} ok ({cnt['skipped']} skipped), {cnt['failed']} failed")
             print(f"✅ Backfill job {job_id} {status}: {cnt['completed']}/{total} ok ({cnt['skipped']} skipped), {cnt['failed']} failed", flush=True)

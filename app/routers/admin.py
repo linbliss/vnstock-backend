@@ -43,17 +43,30 @@ async def start_backfill(
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 
+def _merge_live(job: dict) -> dict:
+    """Ghép tiến độ realtime (bộ nhớ) vào job đọc từ DB — cập nhật tức thì, không lag."""
+    if not job:
+        return job
+    live = backfill.get_live(job.get("job_id") or job.get("id"))
+    if live:
+        job = {**job, "completed": live.get("completed", job.get("completed")),
+               "failed": live.get("failed", job.get("failed"))}
+        if live.get("status"):
+            job["status"] = live["status"]
+    return job
+
+
 @router.get("/backfill/status/{job_id}")
 async def backfill_status(job_id: str):
     job = ohlcv_store.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
-    return job
+    return _merge_live(job)
 
 
 @router.get("/backfill/jobs")
 async def backfill_jobs(limit: int = Query(default=20, ge=1, le=100)):
-    return {"jobs": ohlcv_store.list_jobs(limit)}
+    return {"jobs": [_merge_live(j) for j in ohlcv_store.list_jobs(limit)]}
 
 
 @router.post("/backfill/cancel/{job_id}")
