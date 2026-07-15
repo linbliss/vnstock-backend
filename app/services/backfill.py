@@ -162,6 +162,23 @@ async def _backfill_one(ticker: str, start: str, end: str, timeout: float = 45.0
     return n
 
 
+def _fetch_and_store(ticker: str, start: str, end: str, cutoff: str) -> str:
+    """Chạy HOÀN TOÀN trong thread (không đụng event loop): check-skip → fetch → upsert.
+    Trả 'skipped' | 'ok' | 'empty' | 'fail'."""
+    try:
+        last = ohlcv_store.get_last_date(ticker)
+        if last and last >= cutoff:
+            return "skipped"
+        df = _fetch_history_sync(ticker, start, end)
+        if df is None or df.empty:
+            return "empty"
+        ohlcv_store.upsert_ohlcv(ticker, df)
+        return "ok"
+    except BaseException as e:  # noqa: BLE001
+        print(f"❌ backfill {ticker}: {type(e).__name__}: {e}", flush=True)
+        return "fail"
+
+
 async def _run_job(job_id: str, tickers: List[str], start: str, end: str) -> None:
     """Background task chạy backfill tuần tự. Mỗi ticker = 1 acquire.
 
@@ -181,36 +198,46 @@ async def _run_job(job_id: str, tickers: List[str], start: str, end: str) -> Non
         total = len(tickers)
 
         # ── DNSE: chạy SONG SONG (OHLC 50k/giờ nên thoải mái) ──
+        # QUAN TRỌNG: MỌI thao tác DB (get_last_date/upsert/update_job) chạy trong
+        # THREAD (executor), KHÔNG trên event loop — vì DB dùng threading _lock; nếu
+        # gọi trên loop khi thread đang giữ _lock để ghi → cả loop đứng (job/progress/cancel treo).
         if dnse_client.enabled():
+            import functools
+            from concurrent.futures import ThreadPoolExecutor
             conc = int(os.environ.get("DNSE_BACKFILL_CONCURRENCY", "8"))
+            executor = ThreadPoolExecutor(max_workers=conc + 2)
             sem = asyncio.Semaphore(conc)
             cnt = {"completed": 0, "failed": 0, "skipped": 0, "done": 0}
+            loop = asyncio.get_event_loop()
+
+            async def _update(**kw):
+                await loop.run_in_executor(executor, functools.partial(ohlcv_store.update_job, job_id, **kw))
 
             async def _worker(t: str):
                 if _cancel_flags.get(job_id):
                     return
-                last = ohlcv_store.get_last_date(t)
-                if last and last >= cutoff:
-                    cnt["skipped"] += 1; cnt["completed"] += 1; cnt["done"] += 1
-                    return
                 async with sem:
                     if _cancel_flags.get(job_id):
                         return
-                    try:
-                        n = await _backfill_one(t, start, end)
-                        cnt["completed" if n > 0 else "failed"] += 1
-                    except BaseException as e:  # noqa: BLE001
-                        cnt["failed"] += 1
-                        print(f"❌ backfill {t}: {type(e).__name__}: {e}", flush=True)
+                    r = await loop.run_in_executor(executor, _fetch_and_store, t, start, end, cutoff)
+                if r == "skipped":
+                    cnt["skipped"] += 1; cnt["completed"] += 1
+                elif r == "ok":
+                    cnt["completed"] += 1
+                else:
+                    cnt["failed"] += 1
                 cnt["done"] += 1
-                if cnt["done"] % 20 == 0:
-                    ohlcv_store.update_job(job_id, completed=cnt["completed"], failed=cnt["failed"],
-                                           message=f"{cnt['done']}/{total} (song song {conc})")
+                if cnt["done"] % 25 == 0:
+                    await _update(completed=cnt["completed"], failed=cnt["failed"],
+                                  message=f"{cnt['done']}/{total} (song song {conc})")
 
-            await asyncio.gather(*[_worker(t) for t in tickers])
+            try:
+                await asyncio.gather(*[_worker(t) for t in tickers])
+            finally:
+                executor.shutdown(wait=False)
             status = "cancelled" if _cancel_flags.get(job_id) else "done"
-            ohlcv_store.update_job(job_id, completed=cnt["completed"], failed=cnt["failed"], status=status,
-                                   message=f"{status} {cnt['completed']}/{total} ok ({cnt['skipped']} skipped), {cnt['failed']} failed")
+            await _update(completed=cnt["completed"], failed=cnt["failed"], status=status,
+                          message=f"{status} {cnt['completed']}/{total} ok ({cnt['skipped']} skipped), {cnt['failed']} failed")
             print(f"✅ Backfill job {job_id} {status}: {cnt['completed']}/{total} ok ({cnt['skipped']} skipped), {cnt['failed']} failed", flush=True)
             return
 
