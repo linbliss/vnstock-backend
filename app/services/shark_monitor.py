@@ -107,7 +107,16 @@ def _update(ticker: str) -> dict:
     if dnse_on:
         rows = dnse_client.get_intraday_ticks(tk, max_pages=(4 if seed else 1)) or []
         src = "DNSE"
-        err = None if rows else "DNSE: chưa có khớp lệnh"
+        err = None
+        # DNSE rỗng cho mã này (IP chặn 1 phần / mã chưa khớp qua DNSE) → thử vnstock
+        # để không hiện "Không đủ dữ liệu" khi vnstock vẫn có tick.
+        if not rows:
+            prefer = c.get("src") if c and c.get("src") in SOURCES else None
+            rows, vsrc, verr = _fetch_with_fallback(tk, SEED_PAGE if seed else POLL_PAGE, prefer)
+            if rows:
+                src = vsrc
+            else:
+                err = verr or "Chưa có khớp lệnh"
     else:
         prefer = c.get("src") if c else None
         rows, src, err = _fetch_with_fallback(tk, SEED_PAGE if seed else POLL_PAGE, prefer)
