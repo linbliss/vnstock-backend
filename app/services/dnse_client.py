@@ -81,6 +81,13 @@ def _sign(method: str, path: str) -> dict:
             "version": API_VERSION, "Accept": "application/json"}
 
 
+def _proxies():
+    # Định tuyến DNSE qua proxy VN nếu server bị chặn IP (đặt DNSE_PROXY trong .env,
+    # vd http://user:pass@ip:port hoặc socks5://ip:port — socks cần cài PySocks).
+    p = os.environ.get("DNSE_PROXY", "").strip()
+    return {"http": p, "https": p} if p else None
+
+
 def _get(path: str, params: Optional[dict] = None):
     """GET có ký. Ký theo request-target = PATH (không gồm query) — đúng như SDK."""
     if not enabled():
@@ -89,7 +96,7 @@ def _get(path: str, params: Optional[dict] = None):
     full = f"{REST_BASE}{path}" + (f"?{qs}" if qs else "")
     sign_path = urlparse(full).path
     try:
-        r = requests.get(full, headers=_sign("GET", sign_path), timeout=(5, 15))
+        r = requests.get(full, headers=_sign("GET", sign_path), timeout=(5, 15), proxies=_proxies())
         if r.status_code == 200:
             _record_ok()
             return r.json()
