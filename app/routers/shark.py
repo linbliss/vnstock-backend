@@ -20,7 +20,7 @@ def shark_signals(
 @router.get("/tape/{ticker}")
 def shark_tape(
     ticker: str,
-    limit: int = Query(60, ge=1, le=300),
+    limit: int = Query(2000, ge=1, le=5000),
     big_value: float = Query(shark_monitor.BIG_VALUE_VND, ge=0),
     window_min: int = Query(shark_monitor.WINDOW_MIN, ge=1, le=120),
 ):

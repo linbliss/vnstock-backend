@@ -102,7 +102,7 @@ def _update(ticker: str) -> dict:
     seed = c is None
     # Nguồn tick: DNSE REST (nếu có key) → fallback vnstock (VCI/KBS)
     if dnse_client.enabled():
-        rows = dnse_client.get_intraday_ticks(tk, max_pages=(8 if seed else 1)) or []
+        rows = dnse_client.get_intraday_ticks(tk, max_pages=(4 if seed else 1)) or []
         src = "DNSE"
         err = None if rows else "DNSE: chưa có khớp lệnh"
     else:
@@ -361,15 +361,24 @@ def get_signal(ticker: str, big_value: float = BIG_VALUE_VND, window_min: int = 
     return m
 
 
-def get_tape(ticker: str, limit: int = 60, big_value: float = BIG_VALUE_VND,
+def get_tape(ticker: str, limit: int = 2000, big_value: float = BIG_VALUE_VND,
              window_min: int = WINDOW_MIN) -> dict:
-    """Tape (khớp lệnh gần nhất) + đầy đủ metrics — cho màn chi tiết 1 mã."""
-    c = _update(ticker)
+    """Tape (log khớp lệnh cả phiên) + metrics + sổ lệnh — cho màn chi tiết 1 mã."""
+    tk = ticker.upper()
+    c = _update(tk)
+    # Nạp SÂU cả phiên 1 lần cho màn chi tiết (list chỉ seed nông để nhanh)
+    if dnse_client.enabled() and not c.get("deep"):
+        deep = dnse_client.get_intraday_ticks(tk, max_pages=25) or []
+        if deep:
+            push_ticks(tk, deep, "DNSE")
+        with _lock:
+            c = _cache.get(tk, c)
+            c["deep"] = True
     ticks = c.get("ticks", [])
-    m = _metrics(ticker, ticks, big_value, window_min)
-    recent = ticks[-limit:]
-    recent = list(reversed(recent))
+    m = _metrics(tk, ticks, big_value, window_min)
+    recent = list(reversed(ticks[-limit:]))
     m["tape"] = recent
+    m["orderbook"] = dnse_client.get_orderbook(tk)   # sổ lệnh (bid/offer), None nếu không có DNSE
     if "err" in c and m.get("empty"):
         m["error"] = c["err"]
     return m

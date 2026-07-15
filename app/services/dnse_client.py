@@ -10,6 +10,7 @@ LƯU Ý cần kiểm chứng khi có key: tham số get_ohlc (bar_type/resolutio
 """
 from __future__ import annotations
 import os
+import time
 import hmac
 import hashlib
 import base64
@@ -172,6 +173,15 @@ def get_foreign_trading(symbol: str, board_id: Optional[str] = None, from_date: 
     })
 
 
+def get_quotes(symbol: str, board_id: Optional[str] = None, from_date: int = 0,
+               to_date: int = 0, limit: int = 1, order: str = "DESC"):
+    """Sổ lệnh (bid/ask top price) — snapshot gần nhất."""
+    return _get(f"/price/{symbol.upper()}/quotes", {
+        "boardId": board_id, "from": from_date or None, "to": to_date or None,
+        "limit": limit, "order": order,
+    })
+
+
 def get_instruments(symbol: str = "", market_id: str = "", security_group_id: str = "",
                     limit: int = 1000, page: int = 1):
     """Danh sách mã (thay vnstock Listing)."""
@@ -179,3 +189,26 @@ def get_instruments(symbol: str = "", market_id: str = "", security_group_id: st
         "symbol": symbol or None, "marketId": market_id or None,
         "securityGroupId": security_group_id or None, "limit": limit, "page": page,
     })
+
+
+_ob_cache: dict = {}   # ticker -> (ts, orderbook)
+_OB_TTL = 4.0
+
+
+def get_orderbook(symbol: str):
+    """Sổ lệnh mới nhất: {bid:[{price,quantity}], offer:[...], time}. Cache ~4s."""
+    if not enabled():
+        return None
+    tk = symbol.upper()
+    now = time.time()
+    hit = _ob_cache.get(tk)
+    if hit and now - hit[0] < _OB_TTL:
+        return hit[1]
+    n = int(now)
+    r = get_quotes(symbol, from_date=n - 20 * 3600, to_date=n, limit=1, order="DESC")
+    ob = None
+    if r and r.get("quotes"):
+        q = r["quotes"][0]
+        ob = {"bid": q.get("bid") or [], "offer": q.get("offer") or [], "time": q.get("time")}
+        _ob_cache[tk] = (now, ob)
+    return ob
