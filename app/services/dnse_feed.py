@@ -137,8 +137,12 @@ async def _run():
 
 async def start():
     global _running
+    # WS streaming còn thử nghiệm → chỉ bật khi DNSE_WS_ENABLED=true.
+    # Mặc định tắt: shark dùng DNSE REST get_trades (đã kiểm chứng) trong shark_monitor.
+    if os.environ.get("DNSE_WS_ENABLED", "").lower() not in ("1", "true", "yes"):
+        return
     if not dnse_client.enabled():
-        print("ℹ️  DNSE feed OFF (chưa có DNSE_API_KEY/SECRET) — dùng vnstock cho shark intraday", flush=True)
+        print("ℹ️  DNSE feed OFF (chưa có DNSE_API_KEY/SECRET)", flush=True)
         return
     _running = True
     asyncio.create_task(_run())

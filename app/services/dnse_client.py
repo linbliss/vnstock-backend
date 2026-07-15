@@ -22,6 +22,7 @@ import requests
 
 REST_BASE = os.environ.get("DNSE_REST_URL", "https://openapi.dnse.com.vn").rstrip("/")
 API_VERSION = os.environ.get("DNSE_API_VERSION", "2026-05-07")
+AGG_WINDOW_MS = 150   # gộp khớp cùng chiều trong cửa sổ này thành 1 "lệnh" (sweep)
 
 
 def _key() -> str:
@@ -50,8 +51,8 @@ def _sign(method: str, path: str) -> dict:
         f'Signature keyId="{_key()}",algorithm="hmac-sha256",'
         f'headers="(request-target) date",signature="{sig}",nonce="{nonce}"'
     )
-    return {"Date": date_value, "X-Signature": xsig, "version": API_VERSION,
-            "Accept": "application/json"}
+    return {"Date": date_value, "X-Signature": xsig, "x-api-key": _key(),
+            "version": API_VERSION, "Accept": "application/json"}
 
 
 def _get(path: str, params: Optional[dict] = None):
@@ -76,18 +77,90 @@ def get_ohlc(symbol: str, resolution: str = "1D", from_ts: int = 0, to_ts: int =
              bar_type: str = "STOCK"):
     """Nến lịch sử. from_ts/to_ts = unix seconds. resolution: '1','5','15','60','1D','1W'."""
     return _get("/price/ohlc", {
-        "bar_type": bar_type, "symbol": symbol.upper(),
+        "type": bar_type, "symbol": symbol.upper(),
         "resolution": resolution, "from": int(from_ts), "to": int(to_ts),
     })
 
 
 def get_trades(symbol: str, board_id: Optional[str] = None, from_date: int = 0,
-               to_date: int = 0, limit: int = 500, order: str = "DESC"):
-    """Khớp lệnh lịch sử (seed đầu phiên cho shark)."""
+               to_date: int = 0, limit: int = 500, order: str = "DESC",
+               next_page_token: Optional[str] = None):
+    """Khớp lệnh (tick) trong khoảng thời gian. Range tick tối đa ~1 phiên."""
     return _get(f"/price/{symbol.upper()}/trades", {
         "boardId": board_id, "from": from_date or None, "to": to_date or None,
-        "limit": limit, "order": order,
+        "limit": limit, "order": order, "nextPageToken": next_page_token,
     })
+
+
+def _norm_side(s) -> str:
+    s = str(s).upper()
+    return "B" if s.startswith("B") else ("S" if s.startswith("S") else "U")
+
+
+def get_intraday_ticks(symbol: str, max_ticks: int = 3000, max_pages: int = 8):
+    """Lấy tick khớp lệnh phiên hôm nay, chuẩn hoá cho shark_monitor.
+    Trả list {id, ts, price(kVND), volume, side('B'/'S'), value(VND)} tăng dần theo thời gian.
+    """
+    if not enabled():
+        return None
+    import time as _t
+    from datetime import datetime
+    now = int(_t.time())
+    start = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    rows: list = []
+    token = None
+    for _ in range(max_pages):
+        r = get_trades(symbol, from_date=start, to_date=now, limit=500, order="DESC",
+                       next_page_token=token)
+        if not r:
+            break
+        trades = r.get("trades") or []
+        for t in trades:
+            try:
+                price = float(t["matchPrice"])
+                vol = int(t["matchQtty"])
+            except (TypeError, KeyError, ValueError):
+                continue
+            tvt = t.get("totalVolumeTraded")
+            rows.append({
+                "id": str(tvt) if tvt is not None else f"{t.get('time')}_{price}_{vol}",
+                "ts": str(t.get("time", "")),
+                "price": price,                 # kVND (giống vnstock)
+                "volume": vol,
+                "side": _norm_side(t.get("side")),
+                "value": vol * price * 1000.0,  # VND
+            })
+        token = r.get("nextPageToken")
+        if not token or not trades or len(rows) >= max_ticks:
+            break
+    rows.sort(key=lambda x: x["ts"])
+
+    # DNSE trả TỪNG khớp lẻ → gộp các khớp CÙNG chiều trong cửa sổ ngắn (một lệnh chủ
+    # động quét sổ thường khớp thành chuỗi fill cách nhau <150ms) thành 1 "lệnh" để
+    # nhận diện lệnh lớn cho đúng (giống tape FireAnt).
+    from datetime import datetime as _dt
+
+    def _p(ts):
+        try:
+            return _dt.fromisoformat(ts)
+        except (ValueError, TypeError):
+            return None
+
+    agg: list = []
+    last_dt = None
+    for r in rows:
+        rdt = _p(r["ts"])
+        if (agg and agg[-1]["side"] == r["side"] and last_dt and rdt
+                and 0 <= (rdt - last_dt).total_seconds() * 1000 <= AGG_WINDOW_MS):
+            a = agg[-1]
+            a["volume"] += r["volume"]
+            a["value"] += r["value"]
+            a["price"] = a["value"] / (a["volume"] * 1000.0) if a["volume"] else r["price"]
+            a["ts"] = r["ts"]
+        else:
+            agg.append(dict(r))
+        last_dt = rdt
+    return agg
 
 
 def get_foreign_trading(symbol: str, board_id: Optional[str] = None, from_date: int = 0,

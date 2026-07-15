@@ -29,6 +29,8 @@ MAX_TICKS = 20000                  # giới hạn bộ nhớ mỗi mã
 # KBS là chuỗi → chuẩn hoá về chuỗi; time VCI có tz, KBS naive → bỏ tz khi so sánh).
 SOURCES = ["VCI", "KBS"]
 
+from app.services import dnse_client   # nguồn tick DNSE (nếu có key), fallback vnstock
+
 _cache: Dict[str, dict] = {}       # ticker -> {ticks, seen(set id), src, last_fetch, err?}
 _lock = threading.Lock()
 _fetch_sema = threading.Semaphore(3)   # tối đa 3 lệnh gọi API song song
@@ -88,22 +90,6 @@ def _update(ticker: str) -> dict:
     tk = ticker.upper()
     now = time.time()
 
-    # Ưu tiên DNSE stream nếu đang chạy → đăng ký nhu cầu, KHÔNG gọi vnstock.
-    # Cache được nuôi liên tục qua push_ticks (từ dnse_feed).
-    # TODO (Phase 1): seed đầu phiên bằng dnse_client.get_trades để đủ tổng Mua/Bán cả ngày.
-    try:
-        from app.services import dnse_feed
-        if dnse_feed.active():
-            dnse_feed.register_demand(tk)
-            with _lock:
-                c = _cache.get(tk)
-                if c is None:
-                    c = {"ticks": [], "seen": set(), "src": "DNSE", "last_fetch": now}
-                    _cache[tk] = c
-                return c
-    except Exception:  # noqa: BLE001
-        pass
-
     with _lock:
         c = _cache.get(tk)
     # Còn tươi → khỏi gọi lại
@@ -114,8 +100,14 @@ def _update(ticker: str) -> dict:
         return c
 
     seed = c is None
-    prefer = c.get("src") if c else None
-    rows, src, err = _fetch_with_fallback(tk, SEED_PAGE if seed else POLL_PAGE, prefer)
+    # Nguồn tick: DNSE REST (nếu có key) → fallback vnstock (VCI/KBS)
+    if dnse_client.enabled():
+        rows = dnse_client.get_intraday_ticks(tk, max_pages=(8 if seed else 1)) or []
+        src = "DNSE"
+        err = None if rows else "DNSE: chưa có khớp lệnh"
+    else:
+        prefer = c.get("src") if c else None
+        rows, src, err = _fetch_with_fallback(tk, SEED_PAGE if seed else POLL_PAGE, prefer)
 
     with _lock:
         c = _cache.get(tk)
