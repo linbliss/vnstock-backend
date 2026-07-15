@@ -34,8 +34,33 @@ def _secret() -> str:
     return os.environ.get("DNSE_API_SECRET", "").strip()
 
 
+# ── Circuit breaker: nếu DNSE unreachable (timeout) nhiều lần → tạm ngắt, dùng fallback ──
+_fail_count = 0
+_disabled_until = 0.0
+_BREAKER_THRESHOLD = 3
+_BREAKER_COOLDOWN = 300.0   # giây
+
+
 def enabled() -> bool:
-    return bool(_key() and _secret())
+    if not (_key() and _secret()):
+        return False
+    if time.time() < _disabled_until:   # đang trong thời gian ngắt tạm
+        return False
+    return True
+
+
+def _record_fail():
+    global _fail_count, _disabled_until
+    _fail_count += 1
+    if _fail_count >= _BREAKER_THRESHOLD:
+        _disabled_until = time.time() + _BREAKER_COOLDOWN
+        _fail_count = 0
+        print(f"⚠️  DNSE tạm NGẮT {int(_BREAKER_COOLDOWN)}s (nhiều timeout) — chuyển vnstock/FireAnt", flush=True)
+
+
+def _record_ok():
+    global _fail_count
+    _fail_count = 0
 
 
 def _sign(method: str, path: str) -> dict:
@@ -64,11 +89,15 @@ def _get(path: str, params: Optional[dict] = None):
     full = f"{REST_BASE}{path}" + (f"?{qs}" if qs else "")
     sign_path = urlparse(full).path
     try:
-        r = requests.get(full, headers=_sign("GET", sign_path), timeout=20)
+        r = requests.get(full, headers=_sign("GET", sign_path), timeout=(5, 15))
         if r.status_code == 200:
+            _record_ok()
             return r.json()
+        if r.status_code == 429 or r.status_code >= 500:
+            _record_fail()   # rate-limit / lỗi server → tính vào breaker
         print(f"⚠️  DNSE GET {path} → {r.status_code}: {r.text[:140]}", flush=True)
-    except Exception as e:  # noqa: BLE001
+    except requests.exceptions.RequestException as e:
+        _record_fail()       # timeout / không kết nối được → tính vào breaker
         print(f"⚠️  DNSE GET {path} err: {type(e).__name__}: {e}", flush=True)
     return None
 
