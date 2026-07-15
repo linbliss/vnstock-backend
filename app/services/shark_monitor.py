@@ -30,6 +30,7 @@ MAX_TICKS = 20000                  # giới hạn bộ nhớ mỗi mã
 SOURCES = ["VCI", "KBS"]
 
 from app.services import dnse_client   # nguồn tick DNSE (nếu có key), fallback vnstock
+from app.services import data_source   # cấu hình chọn nguồn theo module (Admin)
 
 _cache: Dict[str, dict] = {}       # ticker -> {ticks, seen(set id), src, last_fetch, err?}
 _lock = threading.Lock()
@@ -93,7 +94,8 @@ def _update(ticker: str) -> dict:
     with _lock:
         c = _cache.get(tk)
     # DNSE không bị giới hạn tần suất như vnstock → refetch tươi hơn (3s vs 8s)
-    fetch_interval = 3.0 if dnse_client.enabled() else MIN_FETCH_INTERVAL
+    dnse_on = data_source.use_dnse("shark")
+    fetch_interval = 3.0 if dnse_on else MIN_FETCH_INTERVAL
     if c and now - c["last_fetch"] < fetch_interval:
         return c
     # Ngoài giờ giao dịch mà đã có cache → không gọi API nữa
@@ -101,8 +103,8 @@ def _update(ticker: str) -> dict:
         return c
 
     seed = c is None
-    # Nguồn tick: DNSE REST (nếu có key) → fallback vnstock (VCI/KBS)
-    if dnse_client.enabled():
+    # Nguồn tick: DNSE REST (nếu bật cho shark) → fallback vnstock (VCI/KBS)
+    if dnse_on:
         rows = dnse_client.get_intraday_ticks(tk, max_pages=(4 if seed else 1)) or []
         src = "DNSE"
         err = None if rows else "DNSE: chưa có khớp lệnh"
@@ -368,7 +370,7 @@ def get_tape(ticker: str, limit: int = 2000, big_value: float = BIG_VALUE_VND,
     tk = ticker.upper()
     c = _update(tk)
     # Nạp SÂU cả phiên 1 lần cho màn chi tiết (list chỉ seed nông để nhanh)
-    if dnse_client.enabled() and not c.get("deep"):
+    if data_source.use_dnse("shark") and not c.get("deep"):
         deep = dnse_client.get_intraday_ticks(tk, max_pages=25) or []
         if deep:
             push_ticks(tk, deep, "DNSE")
@@ -379,7 +381,7 @@ def get_tape(ticker: str, limit: int = 2000, big_value: float = BIG_VALUE_VND,
     m = _metrics(tk, ticks, big_value, window_min)
     recent = list(reversed(ticks[-limit:]))
     m["tape"] = recent
-    m["orderbook"] = dnse_client.get_orderbook(tk)   # sổ lệnh (bid/offer), None nếu không có DNSE
+    m["orderbook"] = dnse_client.get_orderbook(tk) if data_source.use_dnse("shark") else None
     if "err" in c and m.get("empty"):
         m["error"] = c["err"]
     return m

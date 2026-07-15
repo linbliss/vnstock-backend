@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Query, Header, Depends
 
-from app.services import ohlcv_store, backfill
+from app.services import ohlcv_store, backfill, data_source, dnse_client
 
 
 def _require_admin(x_admin_token: Optional[str] = Header(default=None)) -> None:
@@ -24,6 +24,27 @@ def _require_admin(x_admin_token: Optional[str] = Header(default=None)) -> None:
 
 
 router = APIRouter(dependencies=[Depends(_require_admin)])
+
+
+@router.get("/data-source")
+async def get_data_source():
+    """Cấu hình nguồn dữ liệu theo module + trạng thái DNSE hiện tại."""
+    return {
+        "modules": data_source.MODULES,          # key → nhãn
+        "values": list(data_source.VALUES),      # ["dnse","vnstock"]
+        "current": data_source.get_all(),        # key → giá trị đang chọn
+        "dnse_configured": bool(dnse_client._key() and dnse_client._secret()),
+        "dnse_available": dnse_client.enabled(),  # False nếu chưa key hoặc đang bị breaker ngắt
+    }
+
+
+@router.post("/data-source")
+async def set_data_source(module: str = Query(...), value: str = Query(...)):
+    """Đặt nguồn cho 1 module. value: 'dnse' | 'vnstock'."""
+    if not data_source.set_source(module, value):
+        raise HTTPException(status_code=400,
+                            detail=f"module/value không hợp lệ (module∈{list(data_source.MODULES)}, value∈{list(data_source.VALUES)})")
+    return {"ok": True, "current": data_source.get_all()}
 
 
 @router.post("/backfill")
@@ -146,8 +167,8 @@ async def refresh_stock_list():
 
     # DNSE trước (nếu có key)
     try:
-        from app.services import dnse_client
-        if dnse_client.enabled():
+        from app.services import dnse_client, data_source
+        if data_source.use_dnse("ticker_list"):
             stocks_dnse = await loop.run_in_executor(None, dnse_client.get_stock_list)
             if stocks_dnse:
                 n = ohlcv_store.upsert_stock_list(stocks_dnse)

@@ -409,8 +409,8 @@ async def get_tickers_by_exchange(exchange: str) -> List[str]:
 
     # DNSE trước (nếu có key)
     try:
-        from app.services import dnse_client
-        if dnse_client.enabled():
+        from app.services import dnse_client, data_source
+        if data_source.use_dnse("ticker_list"):
             tks = await asyncio.get_event_loop().run_in_executor(
                 None, dnse_client.get_tickers_by_exchange, ex)
             if tks:

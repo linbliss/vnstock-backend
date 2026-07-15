@@ -37,8 +37,8 @@ def get_live(job_id: str) -> Optional[dict]:
 def _listing_for(exchange: str) -> List[str]:
     """Lấy ticker list 1 sàn. Ưu tiên DNSE (nếu có key) → fallback vnstock Listing."""
     try:
-        from app.services import dnse_client
-        if dnse_client.enabled():
+        from app.services import dnse_client, data_source
+        if data_source.use_dnse("ticker_list"):
             tks = dnse_client.get_tickers_by_exchange(exchange)
             if tks:
                 return tks
@@ -65,8 +65,8 @@ async def get_tickers_for_scope(scope: str) -> List[str]:
     loop = asyncio.get_event_loop()
 
     async def listing(ex: str) -> List[str]:
-        from app.services import dnse_client
-        if not dnse_client.enabled():        # DNSE có danh sách mã sẵn, không cần phanh
+        from app.services import data_source
+        if not data_source.use_dnse("ticker_list"):   # DNSE có danh sách mã sẵn, không cần phanh
             await market_service._limiter.acquire()
         return await loop.run_in_executor(None, _listing_for, ex)
 
@@ -104,8 +104,8 @@ def _fetch_history_sync(ticker: str, start: str, end: str) -> Optional[pd.DataFr
     Ưu tiên DNSE (nếu có key) → fallback vnstock (kbs → vci)."""
     # DNSE trước
     try:
-        from app.services import dnse_client
-        if dnse_client.enabled():
+        from app.services import dnse_client, data_source
+        if data_source.use_dnse("ohlcv"):
             rows = dnse_client.get_ohlc_history(ticker, start, end)
             if rows:
                 return pd.DataFrame(rows)
@@ -144,8 +144,8 @@ def _fetch_history_sync(ticker: str, start: str, end: str) -> Optional[pd.DataFr
 
 async def _backfill_one(ticker: str, start: str, end: str, timeout: float = 45.0) -> int:
     """Fetch + upsert 1 ticker. Trả số rows."""
-    from app.services import dnse_client
-    if not dnse_client.enabled():           # DNSE không cần phanh 35/60 của vnstock
+    from app.services import data_source
+    if not data_source.use_dnse("ohlcv"):   # DNSE không cần phanh 35/60 của vnstock
         await market_service._limiter.acquire()
     loop = asyncio.get_event_loop()
     print(f"→ backfill {ticker} [{start}..{end}]", flush=True)
@@ -199,14 +199,14 @@ async def _run_job(job_id: str, tickers: List[str], start: str, end: str) -> Non
     except Exception:
         cutoff = end
     try:
-        from app.services import dnse_client
+        from app.services import data_source
         total = len(tickers)
 
         # ── DNSE: chạy SONG SONG (OHLC 50k/giờ nên thoải mái) ──
         # QUAN TRỌNG: MỌI thao tác DB (get_last_date/upsert/update_job) chạy trong
         # THREAD (executor), KHÔNG trên event loop — vì DB dùng threading _lock; nếu
         # gọi trên loop khi thread đang giữ _lock để ghi → cả loop đứng (job/progress/cancel treo).
-        if dnse_client.enabled():
+        if data_source.use_dnse("ohlcv"):
             import functools
             from concurrent.futures import ThreadPoolExecutor
             conc = int(os.environ.get("DNSE_BACKFILL_CONCURRENCY", "6"))

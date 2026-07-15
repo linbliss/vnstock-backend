@@ -1871,8 +1871,8 @@ class ScreenerService:
 
         # ── DNSE (ưu tiên nếu có key; không dùng cho index) ──
         try:
-            from app.services import dnse_client
-            if dnse_client.enabled() and not is_index:
+            from app.services import dnse_client, data_source
+            if data_source.use_dnse("ohlcv") and not is_index:
                 loop0 = asyncio.get_event_loop()
                 rows = await loop0.run_in_executor(None, dnse_client.get_ohlc_history, ticker, start, end)
                 if rows:
