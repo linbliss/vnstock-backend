@@ -337,11 +337,25 @@ def get_stock_list():
 
 
 def get_tickers_by_exchange(exchange: str):
-    """Danh sách mã của 1 sàn (HOSE/HNX/UPCOM) → [ticker]. Thay Listing().symbols_by_exchange()."""
+    """Danh sách mã của 1 sàn (HOSE/HNX/UPCOM) → [ticker]. Thay Listing().symbols_by_exchange().
+
+    Ưu tiên bảng stock_list đã lưu SQLite: danh sách mã đổi rất chậm (vài lần/năm) nên
+    không đáng tốn quota "Get Instruments" mỗi lần khởi động lại container.
+    Cập nhật lại qua Admin → "Danh sách mã CK".
+    """
+    ex = exchange.upper()
+    try:
+        from app.services import ohlcv_store
+        saved = ohlcv_store.get_stock_list()
+        tks = [x["ticker"] for x in saved if str(x.get("exchange", "")).upper() == ex]
+        if tks:
+            return tks
+    except Exception:  # noqa: BLE001
+        pass          # chưa có bảng/dữ liệu → lấy từ API
+
     lst = get_stock_list()
     if not lst:
         return None
-    ex = exchange.upper()
     return [x["ticker"] for x in lst if x["exchange"] == ex]
 
 

@@ -11,6 +11,7 @@ Cache tick theo từng mã (dữ liệu công khai, dùng chung mọi user), pol
 theo `id` để không tải lại. Chỉ gọi API trong giờ giao dịch (ngoài giờ dùng cache).
 """
 from __future__ import annotations
+import os
 import time
 import threading
 from datetime import datetime, timedelta
@@ -24,6 +25,10 @@ SEED_PAGE = 1000                   # lần đầu lấy nhiều tick để có b
 POLL_PAGE = 300                    # các lần sau chỉ lấy tick mới
 MAX_TICKS = 20000                  # giới hạn bộ nhớ mỗi mã
 SAVE_INTERVAL = 45.0               # giây — ghi tape ra store bền vững thưa (giảm I/O)
+# Cột Shark ở LIST chỉ cần điểm tổng phiên → không cần tươi từng giây. Rate limit DNSE
+# "Get Trades" = 10.000 req/GIỜ: list poll 12s/mã ⇒ 300 req/giờ/mã ⇒ >34 mã là vượt trần.
+# Giãn nhịp làm mới cho list (mặc định 45s ⇒ 80 req/giờ/mã) — màn CHI TIẾT vẫn tươi 3s.
+SIGNAL_MAX_AGE = float(os.environ.get("SHARK_SIGNAL_MAX_AGE", "45"))
 
 # Nguồn intraday theo thứ tự ưu tiên — fallback khi nguồn trước lỗi/throttle.
 # Cả VCI và KBS đều trả [time, price, volume, match_type, id] (id VCI là số,
@@ -101,7 +106,9 @@ def _save_tape(tk: str, trade_date: str, ticks: list, complete: bool) -> None:
         print(f"⚠️  tape_store.save {tk}: {type(e).__name__}: {e}", flush=True)
 
 
-def _update(ticker: str) -> dict:
+def _update(ticker: str, max_age: Optional[float] = None) -> dict:
+    """max_age: tuổi tối đa chấp nhận của cache (giây). List truyền giá trị lớn để đỡ
+    tốn rate limit; màn chi tiết để mặc định (tươi nhất có thể)."""
     tk = ticker.upper()
     now = time.time()
     today = _today()
@@ -125,6 +132,8 @@ def _update(ticker: str) -> dict:
 
     dnse_on = data_source.use_dnse("shark")
     fetch_interval = 3.0 if dnse_on else MIN_FETCH_INTERVAL
+    if max_age is not None:
+        fetch_interval = max(fetch_interval, max_age)
     if dnse_on:
         # Báo cho WS feed biết mã đang được quan tâm → feed subscribe & push tick.
         # (import trong hàm: dnse_feed import ngược shark_monitor)
@@ -470,8 +479,9 @@ def _metrics(ticker: str, ticks: List[dict], big_value: float, window_min: int) 
 
 
 def get_signal(ticker: str, big_value: float = BIG_VALUE_VND, window_min: int = WINDOW_MIN) -> dict:
-    """Tín hiệu gọn (không kèm tape) — cho danh sách nhiều mã."""
-    c = _update(ticker)
+    """Tín hiệu gọn (không kèm tape) — cho danh sách nhiều mã.
+    Dùng cache tới SIGNAL_MAX_AGE giây để không đốt rate limit khi danh mục nhiều mã."""
+    c = _update(ticker, max_age=SIGNAL_MAX_AGE)
     m = _metrics(ticker, c.get("ticks", []), big_value, window_min)
     m.pop("big_orders", None)   # list view không cần chi tiết lệnh lớn
     if "err" in c and m.get("empty"):
