@@ -1,16 +1,25 @@
-"""dnse_feed — luồng market data realtime của DNSE qua WebSocket (streaming push).
+"""dnse_feed — Market Data WebSocket của DNSE (theo ĐÚNG tài liệu chính thức).
 
-Giao thức (theo dnse-tech/openapi-sdk):
-  - Kết nối wss://ws-openapi.dnse.com.vn
-  - Gửi auth: {action:auth, api_key, signature=HMAC-SHA256("{key}:{ts}:{nonce}"), timestamp, nonce}
-    → chờ {action: auth_success}
-  - Subscribe: {action:subscribe, channels:[{name:"tick_extra.{board}.json", symbols:[...]}]}
-  - Nhận tick khớp lệnh (có side Mua/Bán) → đẩy vào cache shark_monitor.
+Vì sao dùng WS: DNSE thiết kế dữ liệu realtime để PUSH qua WebSocket. Poll REST liên
+tục cho từng mã là sai thiết kế, tốn quota và dễ bị firewall chặn IP. WS = 1 kết nối,
+không tiêu rate-limit REST.
 
-Bật khi có DNSE_API_KEY/SECRET; thiếu → OFF (giữ vnstock). Chỉ subscribe mã ĐANG CẦN
-(shark_monitor.register_demand) để không vượt giới hạn.
+Giao thức (developers.dnse.com.vn/docs/sdk/build_websocket) — đã kiểm chứng thực tế:
+  1. Kết nối wss://ws-openapi.dnse.com.vn/v1/stream?encoding={json|msgpack}
+     → `encoding` quyết định ĐỊNH DẠNG FRAME (msgpack ⇒ cả frame điều khiển là binary).
+  2. Server gửi {"action":"welcome"} → client phải auth trong 30s.
+  3. Auth: signature = HMAC-SHA256(secret, "{api_key}:{timestamp}:{nonce}").hexdigest()
+     timestamp = giây (±5'), nonce = micro-giây (không lặp trong 10').
+  4. {"action":"auth_success"} kèm rate_limit {messages_per_second, subscriptions_max}.
+  5. Subscribe {"action":"subscribe","channels":[{"name":"tick_extra.G1.json","symbols":[...]}]}
+     tick_extra = khớp lệnh CÓ chiều Mua/Bán (đúng thứ Shark cần).
+  6. Server PING mỗi 3' → client PHẢI PONG trong 60s (không PONG ⇒ bị ngắt).
+     Vì vậy TẮT ping protocol của thư viện (ping_interval=None) — DNSE ping ở tầng
+     ứng dụng (JSON), không phải WS control frame.
+  7. Kết nối tối đa 8h → server ngắt (connection_expired) → tự kết nối lại.
 
-CẦN KIỂM CHỨNG khi có key: envelope message dữ liệu, mapping `side`, và ĐƠN VỊ GIÁ.
+Bật bằng DNSE_WS_ENABLED=true (mặc định OFF cho tới khi kiểm chứng frame dữ liệu
+TRONG PHIÊN — ngoài giờ không có tick nào để xác nhận schema).
 """
 from __future__ import annotations
 import os
@@ -22,25 +31,41 @@ import hashlib
 
 from app.services import dnse_client, shark_monitor
 
-WS_URL = os.environ.get("DNSE_WS_URL", "wss://ws-openapi.dnse.com.vn")
-# Board cổ phiếu — TODO xác nhận mapping sàn khi có key (SDK default gồm G1,G3,G4,G7,T1..T6)
-STOCK_BOARDS = [b.strip() for b in os.environ.get("DNSE_STOCK_BOARDS", "G1,G4,G7").split(",") if b.strip()]
-DEMAND_TTL = 300.0        # giây — mã không được hỏi 5' thì ngừng quan tâm
+WS_BASE = os.environ.get("DNSE_WS_URL", "wss://ws-openapi.dnse.com.vn/v1/stream")
+ENCODING = os.environ.get("DNSE_WS_ENCODING", "json").lower()   # json | msgpack
+
+# Board hợp lệ theo enum chính thức (KHÔNG có G7 — cấu hình cũ sai).
+VALID_BOARDS = {"G1", "G3", "G4", "T1", "T3", "T4", "T6"}
+# G1 = lô chẵn (giao dịch thường) — đủ cho Shark. G3 = PLO, G4 = lô lẻ.
+_boards_env = [b.strip().upper() for b in os.environ.get("DNSE_STOCK_BOARDS", "G1").split(",")]
+STOCK_BOARDS = [b for b in _boards_env if b in VALID_BOARDS] or ["G1"]
+
+DEMAND_TTL = 300.0        # giây — mã không được hỏi 5' thì ngừng subscribe
+CONTROL = {"welcome", "auth_success", "subscribed", "unsubscribed",
+           "ping", "pong", "connection_expired", "error"}
 
 _demand: dict[str, float] = {}
 _running = False
 _ws = None
 _subscribed: set[str] = set()
+_subs_max = 100           # cập nhật từ auth_success.rate_limit.subscriptions_max
+_last_tick_at: dict[str, float] = {}   # mã → lần cuối nhận tick qua WS
 
 
 def register_demand(ticker: str) -> None:
-    """shark_monitor gọi khi cần dữ liệu 1 mã → feed sẽ subscribe."""
+    """shark_monitor gọi khi cần dữ liệu 1 mã → feed sẽ subscribe mã đó."""
     if dnse_client.enabled():
         _demand[ticker.upper()] = time.time()
 
 
 def active() -> bool:
-    return _running and dnse_client.enabled()
+    return _running and _ws is not None and dnse_client.enabled()
+
+
+def streaming(ticker: str) -> bool:
+    """True nếu WS đang thực sự đẩy tick cho mã này (trong 60s gần đây)
+    → shark_monitor giãn poll REST cho mã đó."""
+    return active() and (time.time() - _last_tick_at.get(ticker.upper(), 0.0) < 60.0)
 
 
 def _wanted() -> set[str]:
@@ -50,95 +75,168 @@ def _wanted() -> set[str]:
 
 def _auth_message() -> dict:
     ts = int(time.time())
-    nonce = str(int(time.time() * 1_000_000))
+    nonce = str(int(time.time() * 1_000_000))     # micro-giây, duy nhất
     msg = f"{dnse_client._key()}:{ts}:{nonce}"
-    sig = hmac.new(dnse_client._secret().encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
-    return {"action": "auth", "api_key": dnse_client._key(), "signature": sig,
-            "timestamp": ts, "nonce": nonce}
+    sig = hmac.new(dnse_client._secret().encode("utf-8"),
+                   msg.encode("utf-8"), hashlib.sha256).hexdigest()
+    return {"action": "auth", "api_key": dnse_client._key(),
+            "signature": sig, "timestamp": ts, "nonce": nonce}
 
 
-def _side_char(side) -> str:
-    # TODO xác nhận: DNSE side 1 = mua chủ động, 2 = bán chủ động?
-    if side in (1, "1", "B", "BUY", "b"):
-        return "B"
-    if side in (2, "2", "S", "SELL", "s"):
-        return "S"
-    return "U"
+def _encode(obj: dict):
+    """Frame gửi đi phải cùng encoding với kết nối."""
+    if ENCODING == "msgpack":
+        import msgpack
+        return msgpack.packb(obj, use_bin_type=True)
+    return json.dumps(obj)
 
 
-def _extract_tick(data: dict):
-    d = data.get("data") or data.get("d") or data
-    sym = d.get("symbol") or d.get("s")
-    price = d.get("matchPrice", d.get("price", d.get("mp")))
-    vol = d.get("matchQtty", d.get("quantity", d.get("mq")))
-    if sym is None or price is None or vol is None:
+def _decode(raw):
+    """Frame nhận: bytes ⇒ msgpack, str ⇒ json (server có thể trả binary dù xin json)."""
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            import msgpack
+            return msgpack.unpackb(raw, raw=False)
+        except Exception:  # noqa: BLE001
+            return None
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
         return None
-    return (str(sym).upper(), float(price), int(vol), d.get("side"), str(d.get("time") or d.get("t") or ""))
+
+
+def _extract(d: dict):
+    """tick_extra → row chuẩn của shark_monitor. Giá DNSE là kVND (vd HPG 22.2),
+    giống hệt REST get_trades nên KHÔNG quy đổi."""
+    sym = d.get("symbol")
+    price = d.get("matchPrice")
+    vol = d.get("matchQtty")
+    if not sym or price is None or vol is None:
+        return None
+    try:
+        price = float(price)
+        vol = int(vol)
+    except (TypeError, ValueError):
+        return None
+    if vol <= 0 or price <= 0:
+        return None
+    ts = str(d.get("time") or "")
+    tvt = d.get("totalVolumeTraded")
+    return str(sym).upper(), {
+        "id": str(tvt) if tvt is not None else f"{ts}_{price}_{vol}",
+        "ts": ts,
+        "price": price,
+        "volume": vol,
+        "side": dnse_client._norm_side(d.get("side")),
+        "value": vol * price * 1000.0,
+    }
+
+
+def _on_data(d: dict) -> None:
+    got = _extract(d)
+    if not got:
+        return
+    sym, row = got
+    _last_tick_at[sym] = time.time()
+    # aggregate=True: WS đẩy TỪNG khớp lẻ → gộp cùng chiều trong 150ms thành 1 "lệnh"
+    # (giống REST get_intraday_ticks) để nhận diện lệnh lớn cho đúng.
+    shark_monitor.push_ticks(sym, [row], source="DNSE", aggregate=True)
+
+
+async def _pong_loop(ws):
+    """Chủ động PONG mỗi 25s (tài liệu cho phép) — giữ kết nối qua NAT."""
+    while _running:
+        await asyncio.sleep(25)
+        try:
+            await ws.send(_encode({"action": "pong", "timestamp": int(time.time() * 1000)}))
+        except Exception:  # noqa: BLE001
+            return
 
 
 async def _sub_loop(ws, authed: asyncio.Event):
-    """Đồng bộ subscription theo nhu cầu (subscribe mã mới xuất hiện)."""
+    """Đồng bộ subscription theo nhu cầu; tôn trọng subscriptions_max."""
     global _subscribed
     await authed.wait()
     while _running:
-        wanted = _wanted()
-        new = wanted - _subscribed
-        if new:
-            syms = sorted(wanted)
+        # Mỗi (channel, symbol) tính 1 subscription → chia đều cho số board.
+        cap = max(1, _subs_max // max(1, len(STOCK_BOARDS)))
+        wanted = set(sorted(_wanted())[:cap])
+        add, rm = wanted - _subscribed, _subscribed - wanted
+        try:
             for board in STOCK_BOARDS:
-                msg = {"action": "subscribe",
-                       "channels": [{"name": f"tick_extra.{board}.json", "symbols": syms}]}
-                try:
-                    await ws.send(json.dumps(msg))
-                except Exception:  # noqa: BLE001
-                    return
-            _subscribed = set(wanted)
+                name = f"tick_extra.{board}.{ENCODING}"
+                if add:
+                    await ws.send(_encode({"action": "subscribe",
+                                           "channels": [{"name": name, "symbols": sorted(add)}]}))
+                if rm:
+                    await ws.send(_encode({"action": "unsubscribe",
+                                           "channels": [{"name": name, "symbols": sorted(rm)}]}))
+        except Exception:  # noqa: BLE001
+            return
+        _subscribed = wanted
         await asyncio.sleep(8)
 
 
 async def _run():
-    global _ws, _subscribed
+    global _ws, _subscribed, _subs_max
     import websockets
+    url = f"{WS_BASE}?encoding={ENCODING}"
+    backoff = 5
     while _running:
         _subscribed = set()
         try:
-            async with websockets.connect(WS_URL, ping_interval=20, max_size=2 ** 22) as ws:
+            # ping_interval=None: DNSE ping ở tầng ứng dụng (JSON) và KHÔNG trả lời
+            # WS control ping → để thư viện tự ping sẽ bị đóng kết nối oan.
+            async with websockets.connect(url, max_size=2 ** 22, ping_interval=None) as ws:
                 _ws = ws
+                backoff = 5
                 authed = asyncio.Event()
-                await ws.send(json.dumps(_auth_message()))
                 sub_task = asyncio.create_task(_sub_loop(ws, authed))
-                async for raw in ws:
-                    try:
-                        data = json.loads(raw)
-                    except (ValueError, TypeError):
-                        continue
-                    action = data.get("action") or data.get("a")
-                    if action == "auth_success":
-                        authed.set()
-                        print("🌊 DNSE WS authenticated", flush=True)
-                        continue
-                    if action in ("auth_error", "error"):
-                        print(f"⚠️  DNSE WS error: {data}", flush=True)
-                        break
-                    if action == "te" or "tick_extra" in str(data.get("channel", "")):
-                        tk = _extract_tick(data)
-                        if tk:
-                            sym, price, vol, side, ts = tk
-                            px_k = price / 1000.0 if price > 1000 else price   # TODO đơn vị giá
-                            row = {"id": f"{sym}_{ts}_{price}_{vol}", "ts": ts, "price": px_k,
-                                   "volume": vol, "side": _side_char(side), "value": vol * px_k * 1000.0}
-                            shark_monitor.push_ticks(sym, [row], source="DNSE")
-                sub_task.cancel()
+                pong_task = asyncio.create_task(_pong_loop(ws))
+                try:
+                    async for raw in ws:
+                        d = _decode(raw)
+                        if not isinstance(d, dict):
+                            continue
+                        action = d.get("action")
+                        if action == "welcome":
+                            await ws.send(_encode(_auth_message()))
+                        elif action == "auth_success":
+                            rl = d.get("rate_limit") or {}
+                            _subs_max = int(rl.get("subscriptions_max") or 100)
+                            authed.set()
+                            print(f"🌊 DNSE WS authenticated (subs_max={_subs_max}, "
+                                  f"boards={','.join(STOCK_BOARDS)}, enc={ENCODING})", flush=True)
+                        elif action == "ping":
+                            await ws.send(_encode({"action": "pong",
+                                                   "timestamp": d.get("timestamp")}))
+                        elif action == "connection_expired":
+                            print("ℹ️  DNSE WS hết hạn (8h) — kết nối lại", flush=True)
+                            break
+                        elif action == "error":
+                            print(f"⚠️  DNSE WS error: {d}", flush=True)
+                            if str(d.get("code")) == "AUTH_FAILED":
+                                print("⛔ DNSE WS: sai API key/secret — dừng feed", flush=True)
+                                return
+                        elif action in CONTROL:
+                            pass          # subscribed / unsubscribed / pong
+                        else:
+                            _on_data(d)   # frame dữ liệu (có field "T")
+                finally:
+                    sub_task.cancel()
+                    pong_task.cancel()
+                    _ws = None
         except Exception as e:  # noqa: BLE001
-            print(f"⚠️  DNSE WS mất kết nối ({type(e).__name__}: {e}) — thử lại sau 5s", flush=True)
+            print(f"⚠️  DNSE WS mất kết nối ({type(e).__name__}: {e}) — thử lại sau {backoff}s",
+                  flush=True)
         if _running:
-            await asyncio.sleep(5)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)   # lùi dần, không dội server
 
 
 async def start():
     global _running
-    # WS streaming còn thử nghiệm → chỉ bật khi DNSE_WS_ENABLED=true.
-    # Mặc định tắt: shark dùng DNSE REST get_trades (đã kiểm chứng) trong shark_monitor.
+    # Mặc định OFF: cần kiểm chứng schema frame dữ liệu trong phiên trước khi bật.
     if os.environ.get("DNSE_WS_ENABLED", "").lower() not in ("1", "true", "yes"):
         return
     if not dnse_client.enabled():

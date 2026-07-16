@@ -125,6 +125,17 @@ def _update(ticker: str) -> dict:
 
     dnse_on = data_source.use_dnse("shark")
     fetch_interval = 3.0 if dnse_on else MIN_FETCH_INTERVAL
+    if dnse_on:
+        # Báo cho WS feed biết mã đang được quan tâm → feed subscribe & push tick.
+        # (import trong hàm: dnse_feed import ngược shark_monitor)
+        try:
+            from app.services import dnse_feed
+            dnse_feed.register_demand(tk)
+            # WS đang đẩy tick cho mã này → khỏi poll REST (đúng thiết kế DNSE)
+            if dnse_feed.streaming(tk) and c["ticks"]:
+                return c
+        except Exception:  # noqa: BLE001
+            pass
 
     # ── Ngoài giờ giao dịch mà đã có tape → dùng cache, KHÔNG gọi API ──
     if not trading and c["ticks"]:
@@ -202,16 +213,42 @@ def _update(ticker: str) -> dict:
     return result
 
 
-def push_ticks(ticker: str, rows: List[dict], source: str = "DNSE") -> None:
-    """dnse_feed đẩy tick realtime vào cache (dedup theo id, sắp theo thời gian)."""
+def _append_agg(ticks: List[dict], r: dict) -> None:
+    """Gộp khớp CÙNG CHIỀU cách nhau ≤ AGG_WINDOW_MS vào lệnh cuối (một lệnh quét sổ
+    thường khớp thành chuỗi fill) — để nhận diện "lệnh lớn" cho đúng, giống REST."""
+    last = ticks[-1] if ticks else None
+    if last and last["side"] == r["side"]:
+        a, b = _parse_ts(last["ts"]), _parse_ts(r["ts"])
+        if a and b:
+            dt_ms = (b - a).total_seconds() * 1000.0
+            if 0 <= dt_ms <= dnse_client.AGG_WINDOW_MS:
+                last["volume"] += r["volume"]
+                last["value"] += r["value"]
+                last["price"] = (last["value"] / (last["volume"] * 1000.0)
+                                 if last["volume"] else r["price"])
+                last["ts"] = r["ts"]
+                return
+    ticks.append(r)
+
+
+def push_ticks(ticker: str, rows: List[dict], source: str = "DNSE",
+               aggregate: bool = False) -> None:
+    """dnse_feed đẩy tick realtime vào cache (dedup theo id, sắp theo thời gian).
+    aggregate=True khi nguồn đẩy TỪNG khớp lẻ (WS) → gộp sweep như REST."""
     if not rows:
         return
     tk = ticker.upper()
     now = time.time()
+    today = _today()
+    snapshot = None
+    complete_flag = False
     with _lock:
         c = _cache.get(tk)
-        if c is None:
-            c = {"ticks": [], "seen": set(), "src": source, "last_fetch": now}
+        # Giữ ĐÚNG shape cache của _update (date/complete/deep/last_saved) — nếu thiếu,
+        # _update sẽ tưởng là cache ngày cũ và vứt sạch tick vừa nhận từ WS.
+        if c is None or c.get("date") != today:
+            c = {"ticks": [], "seen": set(), "src": source, "last_fetch": now,
+                 "date": today, "last_saved": now, "complete": False, "deep": False}
             _cache[tk] = c
         seen = c["seen"]
         new = [r for r in rows if r["id"] not in seen]
@@ -219,12 +256,24 @@ def push_ticks(ticker: str, rows: List[dict], source: str = "DNSE") -> None:
             for r in new:
                 seen.add(r["id"])
             new.sort(key=lambda r: _parse_ts(r["ts"]) or datetime.min)
-            c["ticks"].extend(new)
+            if aggregate:
+                for r in new:
+                    _append_agg(c["ticks"], r)
+            else:
+                c["ticks"].extend(new)
             if len(c["ticks"]) > MAX_TICKS:
                 c["ticks"] = c["ticks"][-MAX_TICKS:]
                 c["seen"] = {t["id"] for t in c["ticks"]}
+            # WS đẩy tick → _update bị throttle nên sẽ không tự lưu; lưu ở đây (thưa).
+            if now - c.get("last_saved", 0) >= SAVE_INTERVAL:
+                c["last_saved"] = now
+                snapshot = list(c["ticks"])
+                complete_flag = c["complete"]
         c["src"] = source
         c["last_fetch"] = now
+
+    if snapshot is not None:
+        _save_tape(tk, today, snapshot, complete=complete_flag)
 
 
 def _clamp(v: float, lo: float, hi: float) -> float:

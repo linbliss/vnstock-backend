@@ -63,6 +63,41 @@ def _record_ok():
     _fail_count = 0
 
 
+def _backoff_429(headers) -> None:
+    """429 = vượt rate limit (tài liệu: Rate/giờ + Quota/ngày, theo APIKey & endpoint).
+    Nghỉ đúng theo Retry-After / X-RateLimit-Reset thay vì thử lại ngay."""
+    global _disabled_until
+    wait = 0.0
+    ra = headers.get("Retry-After")
+    if ra:
+        try:
+            wait = float(ra)
+        except (TypeError, ValueError):
+            wait = 0.0
+    if wait <= 0:
+        reset = headers.get("X-RateLimit-Reset") or headers.get("X-Ratelimit-Reset")
+        try:
+            wait = max(0.0, float(reset) - time.time()) if reset else 0.0
+        except (TypeError, ValueError):
+            wait = 0.0
+    wait = min(max(wait, 60.0), 3600.0)      # kẹp 1' … 1h
+    _disabled_until = max(_disabled_until, time.time() + wait)
+    print(f"⚠️  DNSE rate limit — nghỉ {int(wait)}s (dùng vnstock trong lúc đó)", flush=True)
+
+
+def _note_quota(path: str, headers) -> None:
+    """Cảnh báo sớm khi quota sắp cạn (tài liệu khuyên chủ động điều tiết)."""
+    rem = headers.get("X-RateLimit-Remaining") or headers.get("X-Ratelimit-Remaining")
+    if rem is None:
+        return
+    try:
+        rem_i = int(rem)
+    except (TypeError, ValueError):
+        return
+    if rem_i and rem_i < 500:
+        print(f"⚠️  DNSE quota sắp hết: còn {rem_i} request ({path})", flush=True)
+
+
 def _sign(method: str, path: str) -> dict:
     date_value = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S %z")
     nonce = uuid4().hex
@@ -99,9 +134,16 @@ def _get(path: str, params: Optional[dict] = None):
         r = requests.get(full, headers=_sign("GET", sign_path), timeout=(5, 15), proxies=_proxies())
         if r.status_code == 200:
             _record_ok()
+            _note_quota(path, r.headers)
             return r.json()
-        if r.status_code == 429 or r.status_code >= 500:
-            _record_fail()   # rate-limit / lỗi server → tính vào breaker
+        if r.status_code == 429:
+            # Đúng theo tài liệu: vượt rate limit → 429. TÔN TRỌNG Retry-After thay vì
+            # cứ thử lại (thử lại dồn dập chính là thứ khiến IP bị firewall chặn).
+            _backoff_429(r.headers)
+            print(f"⚠️  DNSE 429 {path}: {r.text[:120]}", flush=True)
+            return None
+        if r.status_code >= 500:
+            _record_fail()
         print(f"⚠️  DNSE GET {path} → {r.status_code}: {r.text[:140]}", flush=True)
     except requests.exceptions.RequestException as e:
         _record_fail()       # timeout / không kết nối được → tính vào breaker
