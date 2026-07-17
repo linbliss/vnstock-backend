@@ -51,6 +51,22 @@ _ws = None
 _subscribed: set[str] = set()
 _subs_max = 100           # cập nhật từ auth_success.rate_limit.subscriptions_max
 _last_tick_at: dict[str, float] = {}   # mã → lần cuối nhận tick qua WS
+_tick_count = 0           # tổng tick nhận được (để kiểm chứng qua /api/status)
+_authed = False
+
+
+def stats() -> dict:
+    """Tóm tắt trạng thái feed — cho /api/status kiểm chứng WS có chạy/nhận tick không.
+    Chỉ trả SỐ LƯỢNG, không lộ danh sách mã đang theo dõi."""
+    return {
+        "enabled": _running,
+        "connected": _ws is not None,
+        "authenticated": _authed,
+        "subscribed": len(_subscribed),
+        "streaming": sum(1 for t in _last_tick_at
+                         if time.time() - _last_tick_at[t] < 60),
+        "ticks": _tick_count,
+    }
 
 
 def register_demand(ticker: str) -> None:
@@ -159,11 +175,16 @@ def _extract(d: dict):
 
 
 def _on_data(d: dict) -> None:
+    global _tick_count
     got = _extract(d)
     if not got:
         return
     sym, row = got
     _last_tick_at[sym] = time.time()
+    _tick_count += 1
+    if _tick_count == 1:      # xác nhận 1 lần: tick ĐẦU TIÊN thật sự về tới nơi
+        print(f"🌊 DNSE WS: tick đầu tiên OK ({sym} {row['side']} "
+              f"{row['volume']} @ {row['price']} — {row['ts']})", flush=True)
     # aggregate=True: WS đẩy TỪNG khớp lẻ → gộp cùng chiều trong 150ms thành 1 "lệnh"
     # (giống REST get_intraday_ticks) để nhận diện lệnh lớn cho đúng.
     shark_monitor.push_ticks(sym, [row], source="DNSE", aggregate=True)
@@ -204,12 +225,13 @@ async def _sub_loop(ws, authed: asyncio.Event):
 
 
 async def _run():
-    global _ws, _subscribed, _subs_max
+    global _ws, _subscribed, _subs_max, _authed
     import websockets
     url = f"{WS_BASE}?encoding={ENCODING}"
     backoff = 5
     while _running:
         _subscribed = set()
+        _authed = False
         try:
             # ping_interval=None: DNSE ping ở tầng ứng dụng (JSON) và KHÔNG trả lời
             # WS control ping → để thư viện tự ping sẽ bị đóng kết nối oan.
@@ -230,6 +252,7 @@ async def _run():
                         elif action == "auth_success":
                             rl = d.get("rate_limit") or {}
                             _subs_max = int(rl.get("subscriptions_max") or 100)
+                            _authed = True
                             authed.set()
                             print(f"🌊 DNSE WS authenticated (subs_max={_subs_max}, "
                                   f"boards={','.join(STOCK_BOARDS)}, enc={ENCODING})", flush=True)

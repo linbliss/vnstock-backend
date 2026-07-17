@@ -107,9 +107,10 @@ async def health():
 @app.get("/api/status")
 async def api_status():
     # "/" giờ phục vụ frontend web (index.html), nên status chuyển sang /api/status
-    from app.services import dnse_client
+    from app.services import dnse_client, dnse_feed
     return {"status": "running", "version": "0.3.0",
             "dnse": dnse_client.enabled(),   # True = đã cấu hình key DNSE → dùng DNSE
+            "dnse_ws": dnse_feed.stats(),    # kiểm chứng WS: connected/authenticated/ticks
             "fireant": bool(__import__("os").environ.get("FIREANT_TOKEN", "").strip())}
 
 
