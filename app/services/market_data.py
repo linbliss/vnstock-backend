@@ -74,6 +74,55 @@ class MarketDataService:
     def subscribe(self, tickers: List[str]):
         for t in tickers:
             self.subscribed.add(t.upper())
+        self._register_ws(tickers)
+
+    @staticmethod
+    def _register_ws(tickers: List[str]) -> None:
+        """Báo DNSE WS subscribe các mã của bảng giá → có giá realtime dạng push."""
+        try:
+            from app.services import dnse_feed, data_source
+            if data_source.get_source("priceboard") != "dnse":
+                return
+            for t in tickers:
+                dnse_feed.register_demand(t.upper())
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _apply_ws(self, q: dict) -> dict:
+        """Phủ giá realtime từ DNSE WS lên quote KBS.
+
+        KBS vẫn là nguồn DUY NHẤT của trần/sàn/tham chiếu: các giá này nằm ở kênh
+        security_definition mà DNSE chỉ phát BATCH lúc ~08:00 (BOD) — kết nối sau 8h
+        sẽ không bao giờ nhận được (đã kiểm chứng thật). WS chỉ phủ phần realtime.
+        """
+        try:
+            from app.services import dnse_feed, data_source
+            if data_source.get_source("priceboard") != "dnse":
+                return q
+            w = dnse_feed.get_quote(q["ticker"])
+        except Exception:  # noqa: BLE001
+            return q
+        if not w or not w.get("price"):
+            return q
+        price = w["price"]
+        ref = float(q.get("reference_price") or 0)
+        out = {**q, "price": price, "source": "DNSE_WS",
+               "timestamp": datetime.now().isoformat()}
+        # KL luỹ kế/OHLC: lấy giá trị "tiến" hơn giữa KBS và WS (tránh lùi số khi
+        # một trong hai nguồn trễ nhịp).
+        if w.get("volume"):
+            out["volume"] = max(int(q.get("volume") or 0), int(w["volume"]))
+        if w.get("high"):
+            out["high"] = max(float(q.get("high") or 0), float(w["high"]))
+        if w.get("low"):
+            lo = float(q.get("low") or 0)
+            out["low"] = min(lo, float(w["low"])) if lo > 0 else float(w["low"])
+        if w.get("open") and not q.get("open"):
+            out["open"] = float(w["open"])
+        if ref > 0:
+            out["change"] = round(price - ref, 2)
+            out["change_pct"] = round((price - ref) / ref * 100, 2)
+        return out
 
     def add_listener(self, fn: Callable):
         self.listeners.append(fn)
@@ -159,8 +208,20 @@ class MarketDataService:
             print(f"_hist_sync error: {type(e).__name__}: {e}")
             return []
 
+    def _ws_covers(self, tickers: List[str]) -> bool:
+        """DNSE WS có đang đẩy tick cho phần lớn mã đang xem không?"""
+        try:
+            from app.services import dnse_feed, data_source
+            if data_source.get_source("priceboard") != "dnse" or not dnse_feed.active():
+                return False
+            live = sum(1 for t in tickers if dnse_feed.get_quote(t))
+            return live >= max(1, len(tickers) // 2)
+        except Exception:  # noqa: BLE001
+            return False
+
     async def _polling_loop(self):
         BATCH_SIZE = 20
+        last_kbs = 0.0
         while self._running:
             try:
                 if not self.is_trading_hours():
@@ -170,21 +231,36 @@ class MarketDataService:
 
                 tickers = list(self.subscribed)
                 if tickers:
-                    batches = [tickers[i:i+BATCH_SIZE]
-                               for i in range(0, len(tickers), BATCH_SIZE)]
-                    all_updated = []
-                    for batch in batches:
-                        updated = await self.fetch_quotes(batch)
-                        all_updated.extend(updated)
-                        if len(batches) > 1:
-                            await asyncio.sleep(1)
-                    if all_updated:
+                    self._register_ws(tickers)
+                    # WS đẩy realtime rồi → KBS chỉ còn nhiệm vụ cấp trần/sàn/TC
+                    # (tĩnh cả ngày) nên gọi thưa hẳn: 30s thay vì 5s.
+                    ws_on = self._ws_covers(tickers)
+                    kbs_every = 30.0 if ws_on else 5.0
+                    now = time.time()
+
+                    updated: List[dict] = []
+                    if now - last_kbs >= kbs_every or not self.quotes:
+                        last_kbs = now
+                        batches = [tickers[i:i+BATCH_SIZE]
+                                   for i in range(0, len(tickers), BATCH_SIZE)]
+                        for batch in batches:
+                            updated.extend(await self.fetch_quotes(batch))
+                            if len(batches) > 1:
+                                await asyncio.sleep(1)
+                    elif ws_on:
+                        # Giữa 2 nhịp KBS: phát bản đã phủ WS → bảng giá vẫn realtime
+                        updated = [q for q in (self.quotes.get(t) for t in tickers) if q]
+
+                    if updated:
+                        payload = [self._apply_ws(q) for q in updated]
+                        for q in payload:            # cache bản mới nhất đã phủ WS
+                            self.quotes[q["ticker"]] = q
                         for fn in self.listeners:
                             try:
-                                await fn(all_updated)
+                                await fn(payload)
                             except Exception as e:
                                 print(f"Listener error: {e}")
-                await asyncio.sleep(5)
+                await asyncio.sleep(2 if self.subscribed else 5)
             except asyncio.CancelledError:
                 break
             except Exception as e:

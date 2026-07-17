@@ -18,6 +18,7 @@ MODULES = {
     "shark": "Shark Action (tape + sổ lệnh trong phiên)",
     "ohlcv": "Lịch sử OHLCV (screener / chart / backfill)",
     "ticker_list": "Danh sách mã CK",
+    "priceboard": "Bảng giá realtime (giá khớp qua WS)",
 }
 VALUES = ("dnse", "vnstock")
 DEFAULT = "dnse"

@@ -49,6 +49,7 @@ CONTROL = {"welcome", "auth_success", "subscribed", "unsubscribed",
 _demand: dict[str, float] = {}          # mã cần TICK (cả danh mục)
 _book_demand: dict[str, float] = {}     # mã cần SỔ LỆNH (chỉ mã đang xem chi tiết)
 _orderbook: dict[str, dict] = {}        # mã → sổ lệnh mới nhất từ WS
+_quote: dict[str, dict] = {}            # mã → giá realtime mới nhất (cho bảng giá)
 _running = False
 _ws = None
 _subscribed: set[str] = set()
@@ -93,6 +94,20 @@ def get_orderbook(ticker: str):
     """Sổ lệnh mới nhất nhận qua WS (top_price) — thay REST get_quotes.
     Cùng shape với dnse_client.get_orderbook để frontend không phải đổi."""
     return _orderbook.get(ticker.upper())
+
+
+def get_quote(ticker: str, max_age: float = 90.0):
+    """Giá realtime mới nhất từ tick_extra (cho BẢNG GIÁ).
+
+    KHÔNG có trần/sàn/tham chiếu: các giá đó nằm ở kênh security_definition mà DNSE
+    chỉ phát BATCH lúc ~08:00 (BOD) — đã kiểm chứng: subscribe lúc 09:55 không nhận
+    được gì. Vì vậy bảng giá vẫn phải lấy trần/sàn/TC từ nguồn khác (KBS), WS chỉ
+    phủ phần realtime.
+    """
+    q = _quote.get(ticker.upper())
+    if not q:
+        return None
+    return q if (time.time() - q["at"]) < max_age else None
 
 
 def active() -> bool:
@@ -229,6 +244,19 @@ def _on_data(d: dict) -> None:
     sym, row = got
     _last_tick_at[sym] = time.time()
     _tick_count += 1
+    # tick_extra đã kèm sẵn giá/KL luỹ kế/OHLC → dùng luôn cho BẢNG GIÁ,
+    # không tốn thêm subscription nào (khỏi cần kênh "tick" riêng).
+    try:
+        _quote[sym] = {
+            "price": row["price"],
+            "volume": int(d.get("totalVolumeTraded") or 0),
+            "open": float(d.get("openPrice") or 0),
+            "high": float(d.get("highestPrice") or 0),
+            "low": float(d.get("lowestPrice") or 0),
+            "at": time.time(),
+        }
+    except (TypeError, ValueError):
+        pass
     if _tick_count == 1:      # xác nhận 1 lần: tick ĐẦU TIÊN thật sự về tới nơi
         print(f"🌊 DNSE WS: tick đầu tiên OK ({sym} {row['side']} "
               f"{row['volume']} @ {row['price']} — {row['ts']})", flush=True)
