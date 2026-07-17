@@ -191,7 +191,7 @@ def _extract(d: dict):
         return None
     try:
         price = float(price)
-        vol = int(vol)
+        vol = int(vol) * dnse_client.VOL_LOT   # DNSE trả lô 10 CP → quy về cổ phiếu
     except (TypeError, ValueError):
         return None
     if vol <= 0 or price <= 0:
@@ -217,12 +217,17 @@ def _on_book(d: dict) -> None:
     if not sym:
         return
     def _levels(rows):
+        # qtty CŨNG theo lô 10 như matchQtty → quy về cổ phiếu.
+        # Chứng minh: HOSE/HNX chỉ nhận lô chẵn 100 CP nên hàng chờ phải là bội số
+        # của 100 CP. Quan sát thật: 17.810 / 9.660 / 560 KHÔNG chia hết 100 (⇒ không
+        # thể là cổ phiếu) nhưng đều chia hết 10 ⇒ ×10 ra 178.100 / 96.600 / 5.600
+        # = đúng bội số 100.
         out = []
         for r in (rows or []):
             p, q = r.get("price"), r.get("qtty")
             if p is None or q is None:
                 continue
-            out.append({"price": float(p), "quantity": int(q)})
+            out.append({"price": float(p), "quantity": int(q) * dnse_client.VOL_LOT})
         return out
     bid, offer = _levels(d.get("bid")), _levels(d.get("offer"))
     if not bid and not offer:
@@ -246,13 +251,17 @@ def _on_data(d: dict) -> None:
     _tick_count += 1
     # tick_extra đã kèm sẵn giá/KL luỹ kế/OHLC → dùng luôn cho BẢNG GIÁ,
     # không tốn thêm subscription nào (khỏi cần kênh "tick" riêng).
+    #
+    # ĐƠN VỊ: _quote quy về ĐÚNG hệ của bảng giá = VND thô + cổ phiếu
+    # (khác tape của Shark dùng kVND). Frontend fmtPrice() chia 1000, nên nếu để
+    # kVND thì giá hiển thị nhỏ đi 1000 lần và nhấp nháy mỗi khi KBS ghi đè.
     try:
         _quote[sym] = {
-            "price": row["price"],
-            "volume": int(d.get("totalVolumeTraded") or 0),
-            "open": float(d.get("openPrice") or 0),
-            "high": float(d.get("highestPrice") or 0),
-            "low": float(d.get("lowestPrice") or 0),
+            "price": row["price"] * 1000.0,                    # kVND → VND
+            "volume": int(d.get("totalVolumeTraded") or 0) * dnse_client.VOL_LOT,
+            "open": float(d.get("openPrice") or 0) * 1000.0,
+            "high": float(d.get("highestPrice") or 0) * 1000.0,
+            "low": float(d.get("lowestPrice") or 0) * 1000.0,
             "at": time.time(),
         }
     except (TypeError, ValueError):

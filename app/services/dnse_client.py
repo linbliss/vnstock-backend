@@ -25,6 +25,15 @@ REST_BASE = os.environ.get("DNSE_REST_URL", "https://openapi.dnse.com.vn").rstri
 API_VERSION = os.environ.get("DNSE_API_VERSION", "2026-05-07")
 AGG_WINDOW_MS = 150   # gộp khớp cùng chiều trong cửa sổ này thành 1 "lệnh" (sweep)
 
+# ĐƠN VỊ KHỐI LƯỢNG: DNSE trả matchQtty/totalVolumeTraded theo LÔ 10 CỔ PHIẾU,
+# trong khi OHLC (v) trả theo CỔ PHIẾU. Đã kiểm chứng 2 cách độc lập (17/07/2026):
+#   1) HPG 16/07: OHLC volume = 22.880.600 / totalVolumeTraded cuối phiên 2.288.060
+#      = ĐÚNG 10.00
+#   2) grossTradeAmount (tỷ đồng) / (totalVolumeTraded × avgPrice × 1000) = 10.0
+#      với cả HPG lẫn SHS
+# Không nhân 10 ⇒ giá trị lệnh nhỏ đi 10 lần ⇒ ngưỡng "lệnh lớn" của Shark bỏ sót.
+VOL_LOT = 10
+
 
 def _key() -> str:
     return os.environ.get("DNSE_API_KEY", "").strip()
@@ -297,7 +306,7 @@ def get_intraday_ticks(symbol: str, max_ticks: int = 3000, max_pages: int = 8):
         for t in trades:
             try:
                 price = float(t["matchPrice"])
-                vol = int(t["matchQtty"])
+                vol = int(t["matchQtty"]) * VOL_LOT   # lô 10 → cổ phiếu
             except (TypeError, KeyError, ValueError):
                 continue
             tvt = t.get("totalVolumeTraded")
@@ -451,6 +460,19 @@ def get_orderbook(symbol: str):
     ob = None
     if r and r.get("quotes"):
         q = r["quotes"][0]
-        ob = {"bid": q.get("bid") or [], "offer": q.get("offer") or [], "time": q.get("time")}
+
+        def _lv(rows):
+            # quantity cũng theo LÔ 10 như matchQtty (quan sát: 10.590/37.160/17.720
+            # không chia hết 100 — bất khả thi nếu là cổ phiếu vì sàn chỉ nhận lô 100
+            # — nhưng đều chia hết 10) → quy về cổ phiếu.
+            out = []
+            for l in (rows or []):
+                p, v = l.get("price"), l.get("quantity", l.get("qtty"))
+                if p is None or v is None:
+                    continue
+                out.append({"price": float(p), "quantity": int(v) * VOL_LOT})
+            return out
+
+        ob = {"bid": _lv(q.get("bid")), "offer": _lv(q.get("offer")), "time": q.get("time")}
         _ob_cache[tk] = (now, ob)
     return ob
