@@ -42,13 +42,17 @@ _boards_env = [b.strip().upper() for b in os.environ.get("DNSE_STOCK_BOARDS", "G
 STOCK_BOARDS = [b for b in _boards_env if b in VALID_BOARDS] or ["G1"]
 
 DEMAND_TTL = 300.0        # giây — mã không được hỏi 5' thì ngừng subscribe
+BOOK_CAP = 5              # số mã tối đa lấy SỔ LỆNH (chỉ mã đang xem chi tiết)
 CONTROL = {"welcome", "auth_success", "subscribed", "unsubscribed",
            "ping", "pong", "connection_expired", "error"}
 
-_demand: dict[str, float] = {}
+_demand: dict[str, float] = {}          # mã cần TICK (cả danh mục)
+_book_demand: dict[str, float] = {}     # mã cần SỔ LỆNH (chỉ mã đang xem chi tiết)
+_orderbook: dict[str, dict] = {}        # mã → sổ lệnh mới nhất từ WS
 _running = False
 _ws = None
 _subscribed: set[str] = set()
+_book_subscribed: set[str] = set()
 _subs_max = 100           # cập nhật từ auth_success.rate_limit.subscriptions_max
 _last_tick_at: dict[str, float] = {}   # mã → lần cuối nhận tick qua WS
 _tick_count = 0           # tổng tick nhận được (để kiểm chứng qua /api/status)
@@ -66,15 +70,29 @@ def stats() -> dict:
         "streaming": sum(1 for t in _last_tick_at
                          if time.time() - _last_tick_at[t] < 60),
         "ticks": _tick_count,
+        "orderbooks": len(_orderbook),
     }
 
 
-def register_demand(ticker: str) -> None:
+def register_demand(ticker: str, book: bool = False) -> None:
     """shark_monitor gọi khi cần dữ liệu 1 mã → feed sẽ subscribe mã đó.
+    book=True: cần thêm SỔ LỆNH (top_price) — chỉ dùng cho mã đang xem chi tiết,
+    vì mỗi (kênh, mã) tính 1 subscription mà trần chỉ 100.
+
     Dùng configured() (chỉ xét key) chứ KHÔNG dùng enabled(): REST bị chặn/breaker
     ngắt không được phép làm WS ngừng đăng ký mã — hai host độc lập nhau."""
-    if dnse_client.configured():
-        _demand[ticker.upper()] = time.time()
+    if not dnse_client.configured():
+        return
+    tk = ticker.upper()
+    _demand[tk] = time.time()
+    if book:
+        _book_demand[tk] = time.time()
+
+
+def get_orderbook(ticker: str):
+    """Sổ lệnh mới nhất nhận qua WS (top_price) — thay REST get_quotes.
+    Cùng shape với dnse_client.get_orderbook để frontend không phải đổi."""
+    return _orderbook.get(ticker.upper())
 
 
 def active() -> bool:
@@ -87,9 +105,10 @@ def streaming(ticker: str) -> bool:
     return active() and (time.time() - _last_tick_at.get(ticker.upper(), 0.0) < 60.0)
 
 
-def _wanted() -> set[str]:
+def _wanted(src: dict | None = None) -> set[str]:
     now = time.time()
-    return {t for t, ts in _demand.items() if now - ts < DEMAND_TTL}
+    d = _demand if src is None else src
+    return {t for t, ts in d.items() if now - ts < DEMAND_TTL}
 
 
 def _auth_message() -> dict:
@@ -176,8 +195,34 @@ def _extract(d: dict):
     }
 
 
+def _on_book(d: dict) -> None:
+    """top_price (T='q') → sổ lệnh 10 mức. REST get_quotes chỉ cho 3 mức và tốn
+    hạn mức 10k/giờ; WS cho realtime + miễn phí hạn mức."""
+    sym = d.get("symbol")
+    if not sym:
+        return
+    def _levels(rows):
+        out = []
+        for r in (rows or []):
+            p, q = r.get("price"), r.get("qtty")
+            if p is None or q is None:
+                continue
+            out.append({"price": float(p), "quantity": int(q)})
+        return out
+    bid, offer = _levels(d.get("bid")), _levels(d.get("offer"))
+    if not bid and not offer:
+        return
+    _orderbook[str(sym).upper()] = {
+        "bid": bid, "offer": offer, "time": _ts_str(d.get("time")),
+        "total_bid": d.get("totalBidQtty"), "total_offer": d.get("totalOfferQtty"),
+    }
+
+
 def _on_data(d: dict) -> None:
     global _tick_count
+    if d.get("T") == "q":          # sổ lệnh
+        _on_book(d)
+        return
     got = _extract(d)
     if not got:
         return
@@ -202,37 +247,48 @@ async def _pong_loop(ws):
             return
 
 
+async def _sync(ws, channel: str, wanted: set, current: set) -> set:
+    """Gửi subscribe/unsubscribe cho phần chênh lệch của 1 loại kênh."""
+    add, rm = wanted - current, current - wanted
+    for board in STOCK_BOARDS:
+        name = f"{channel}.{board}.{ENCODING}"
+        if add:
+            await ws.send(_encode({"action": "subscribe",
+                                   "channels": [{"name": name, "symbols": sorted(add)}]}))
+        if rm:
+            await ws.send(_encode({"action": "unsubscribe",
+                                   "channels": [{"name": name, "symbols": sorted(rm)}]}))
+    return wanted
+
+
 async def _sub_loop(ws, authed: asyncio.Event):
-    """Đồng bộ subscription theo nhu cầu; tôn trọng subscriptions_max."""
-    global _subscribed
+    """Đồng bộ subscription theo nhu cầu; tôn trọng subscriptions_max.
+    Mỗi (kênh, mã, board) tính 1 subscription → chia ngân sách cho tick_extra
+    (cả danh mục) và top_price (chỉ mã đang xem chi tiết)."""
+    global _subscribed, _book_subscribed
     await authed.wait()
     while _running:
-        # Mỗi (channel, symbol) tính 1 subscription → chia đều cho số board.
-        cap = max(1, _subs_max // max(1, len(STOCK_BOARDS)))
-        wanted = set(sorted(_wanted())[:cap])
-        add, rm = wanted - _subscribed, _subscribed - wanted
+        nb = max(1, len(STOCK_BOARDS))
+        # Sổ lệnh chỉ cho mã đang xem → dành ngân sách nhỏ, phần còn lại cho tick.
+        book = set(sorted(_wanted(_book_demand))[:max(1, BOOK_CAP)])
+        tick_cap = max(1, (_subs_max - len(book) * nb) // nb)
+        tick = set(sorted(_wanted(_demand))[:tick_cap])
         try:
-            for board in STOCK_BOARDS:
-                name = f"tick_extra.{board}.{ENCODING}"
-                if add:
-                    await ws.send(_encode({"action": "subscribe",
-                                           "channels": [{"name": name, "symbols": sorted(add)}]}))
-                if rm:
-                    await ws.send(_encode({"action": "unsubscribe",
-                                           "channels": [{"name": name, "symbols": sorted(rm)}]}))
+            _subscribed = await _sync(ws, "tick_extra", tick, _subscribed)
+            _book_subscribed = await _sync(ws, "top_price", book, _book_subscribed)
         except Exception:  # noqa: BLE001
             return
-        _subscribed = wanted
         await asyncio.sleep(8)
 
 
 async def _run():
-    global _ws, _subscribed, _subs_max, _authed
+    global _ws, _subscribed, _book_subscribed, _subs_max, _authed
     import websockets
     url = f"{WS_BASE}?encoding={ENCODING}"
     backoff = 5
     while _running:
         _subscribed = set()
+        _book_subscribed = set()
         _authed = False
         try:
             # ping_interval=None: DNSE ping ở tầng ứng dụng (JSON) và KHÔNG trả lời

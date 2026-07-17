@@ -522,7 +522,19 @@ def get_tape(ticker: str, limit: int = 2000, big_value: float = BIG_VALUE_VND,
     m = _metrics(tk, ticks, big_value, window_min)
     recent = list(reversed(ticks[-limit:]))
     m["tape"] = recent
-    m["orderbook"] = dnse_client.get_orderbook(tk) if data_source.use_dnse("shark") else None
+    # Sổ lệnh: ưu tiên WS top_price (realtime, 10 mức, không tốn hạn mức REST) →
+    # lùi về REST get_quotes (3 mức, 10k/giờ) nếu WS chưa có.
+    ob = None
+    if data_source.get_source("shark") == "dnse" and dnse_client.configured():
+        try:
+            from app.services import dnse_feed
+            dnse_feed.register_demand(tk, book=True)   # màn chi tiết → cần sổ lệnh
+            ob = dnse_feed.get_orderbook(tk)
+        except Exception:  # noqa: BLE001
+            ob = None
+    if ob is None and data_source.use_dnse("shark"):
+        ob = dnse_client.get_orderbook(tk)
+    m["orderbook"] = ob
     if "err" in c and m.get("empty"):
         m["error"] = c["err"]
     return m
