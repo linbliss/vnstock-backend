@@ -195,6 +195,10 @@ def _update(ticker: str, max_age: Optional[float] = None) -> dict:
     with _lock:
         c = _cache.get(tk) or c
         added = False
+        if rows and not _units_consistent(c["ticks"], rows):
+            print(f"⛔ {tk}: lệch ĐƠN VỊ giá giữa nguồn cũ ({c['ticks'][-1]['price']}) và "
+                  f"{src} ({rows[0]['price']}) — bỏ lô này để không hỏng tape", flush=True)
+            rows = []
         if rows:
             seen = c["seen"]
             new = [r for r in rows if r["id"] not in seen]
@@ -230,6 +234,25 @@ def _update(ticker: str, max_age: Optional[float] = None) -> dict:
     if snapshot is not None:
         _save_tape(tk, today, snapshot, complete=complete_flag)
     return result
+
+
+def _units_consistent(ticks: List[dict], rows: List[dict]) -> bool:
+    """Chốt chặn TRỘN NHẦM ĐƠN VỊ giữa 2 nguồn trong cùng 1 tape.
+
+    Tape của Shark có thể vừa nạp đầu phiên bằng vnstock vừa nhận realtime từ DNSE WS.
+    Cả hai ĐANG cùng hệ (giá kVND, KL cổ phiếu), nhưng nếu một nguồn đổi đơn vị (hoặc
+    ta lùi về nguồn khác) thì tape sẽ hỏng ÂM THẦM: sai giá 1000 lần, sai điểm Shark.
+    Giá cổ phiếu VN không bao giờ nhảy 100 lần trong một phiên → lệch cỡ đó chắc chắn
+    là sai đơn vị, KHÔNG phải biến động thật → bỏ lô đó và báo động thay vì ghi vào.
+    """
+    if not ticks or not rows:
+        return True
+    a = ticks[-1].get("price") or 0
+    b = rows[0].get("price") or 0
+    if a <= 0 or b <= 0:
+        return True
+    ratio = max(a, b) / min(a, b)
+    return ratio < 100
 
 
 def _append_agg(ticks: List[dict], r: dict) -> None:
@@ -270,6 +293,10 @@ def push_ticks(ticker: str, rows: List[dict], source: str = "DNSE",
                  "date": today, "last_saved": now, "complete": False, "deep": False,
                  "seeded": False}   # WS đẩy tick KHÔNG tính là đã seed cả phiên
             _cache[tk] = c
+        if not _units_consistent(c["ticks"], rows):
+            print(f"⛔ {tk}: lệch ĐƠN VỊ giá giữa tape ({c['ticks'][-1]['price']}) và "
+                  f"{source} ({rows[0]['price']}) — bỏ tick này", flush=True)
+            return
         seen = c["seen"]
         new = [r for r in rows if r["id"] not in seen]
         if new:
