@@ -121,13 +121,15 @@ def _update(ticker: str, max_age: Optional[float] = None) -> dict:
             c = None
         if c is None:
             c = {"ticks": [], "seen": set(), "src": "STORE", "last_fetch": 0.0,
-                 "date": today, "last_saved": now, "complete": False, "deep": False}
+                 "date": today, "last_saved": now, "complete": False, "deep": False,
+                 "seeded": False}
             stored = tape_store.load(tk, today)
             if stored and stored["ticks"]:
                 c["ticks"] = stored["ticks"]
                 c["seen"] = {t["id"] for t in stored["ticks"]}
                 c["complete"] = stored["complete"]
                 c["deep"] = stored["complete"]   # phiên đã đóng = đã đủ cả phiên
+                c["seeded"] = True               # store đã có tape phiên → khỏi seed lại
             _cache[tk] = c
 
     dnse_on = data_source.use_dnse("shark")
@@ -140,8 +142,10 @@ def _update(ticker: str, max_age: Optional[float] = None) -> dict:
         try:
             from app.services import dnse_feed
             dnse_feed.register_demand(tk)
-            # WS đang đẩy tick cho mã này → khỏi poll REST (đúng thiết kế DNSE)
-            if dnse_feed.streaming(tk) and c["ticks"]:
+            # WS đang đẩy tick cho mã này → khỏi poll REST (đúng thiết kế DNSE).
+            # BẮT BUỘC đã seed REST trước: WS chỉ có tick TỪ LÚC KẾT NỐI, nếu tin ngay
+            # WS thì tape mất phần đầu phiên → điểm Shark (luỹ kế cả phiên) sai.
+            if c.get("seeded") and dnse_feed.streaming(tk):
                 return c
         except Exception:  # noqa: BLE001
             pass
@@ -158,8 +162,9 @@ def _update(ticker: str, max_age: Optional[float] = None) -> dict:
     if now - c["last_fetch"] < fetch_interval:
         return c
 
-    # seed = chưa có tick nào (RAM lẫn store) → nạp sâu; đã có → poll trang gần nhất + dedup
-    seed = not c["ticks"]
+    # seed = chưa từng nạp REST cho phiên này → nạp sâu; đã có → poll trang gần nhất + dedup
+    # (không dựa vào c["ticks"] vì WS có thể đã đẩy tick vào trước khi REST kịp seed)
+    seed = not c.get("seeded")
 
     # ── Fetch: DNSE (nếu bật) → fallback vnstock ──
     # Poll chỉ lấy 1 trang gần nhất (~500 khớp) rồi dedup theo id — không tải lại cả phiên.
@@ -200,6 +205,7 @@ def _update(ticker: str, max_age: Optional[float] = None) -> dict:
                 added = True
             if src != "STORE":
                 c["src"] = src
+            c["seeded"] = True     # đã nạp được từ REST → lần sau chỉ poll/để WS lo
             c.pop("err", None)
         elif err and not c["ticks"]:
             c["err"] = err
@@ -257,7 +263,8 @@ def push_ticks(ticker: str, rows: List[dict], source: str = "DNSE",
         # _update sẽ tưởng là cache ngày cũ và vứt sạch tick vừa nhận từ WS.
         if c is None or c.get("date") != today:
             c = {"ticks": [], "seen": set(), "src": source, "last_fetch": now,
-                 "date": today, "last_saved": now, "complete": False, "deep": False}
+                 "date": today, "last_saved": now, "complete": False, "deep": False,
+                 "seeded": False}   # WS đẩy tick KHÔNG tính là đã seed cả phiên
             _cache[tk] = c
         seen = c["seen"]
         new = [r for r in rows if r["id"] not in seen]

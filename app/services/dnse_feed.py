@@ -28,6 +28,7 @@ import time
 import asyncio
 import hmac
 import hashlib
+from datetime import datetime, timezone, timedelta
 
 from app.services import dnse_client, shark_monitor
 
@@ -105,6 +106,29 @@ def _decode(raw):
         return None
 
 
+_VN_TZ = timezone(timedelta(hours=7))   # giờ sàn HOSE/HNX
+
+
+def _ts_str(t) -> str:
+    """WS trả time = {"Seconds": epoch, "Nanos": n} (KHÔNG phải chuỗi như REST).
+    Quy về ĐÚNG định dạng REST 'YYYY-MM-DD HH:MM:SS.mmm' theo giờ sàn (VN) để tape
+    trộn chung REST+WS vẫn sắp xếp/gộp/tính cửa sổ được.
+
+    Dùng offset +07 tường minh, không phụ thuộc TZ của container.
+    """
+    if isinstance(t, dict):
+        secs = t.get("Seconds", t.get("seconds"))
+        nanos = t.get("Nanos", t.get("nanos")) or 0
+        if secs is None:
+            return ""
+        try:
+            dt = datetime.fromtimestamp(int(secs), _VN_TZ).replace(tzinfo=None)
+        except (TypeError, ValueError, OSError):
+            return ""
+        return dt.strftime("%Y-%m-%d %H:%M:%S") + f".{int(nanos) // 1_000_000:03d}"
+    return str(t or "")
+
+
 def _extract(d: dict):
     """tick_extra → row chuẩn của shark_monitor. Giá DNSE là kVND (vd HPG 22.2),
     giống hệt REST get_trades nên KHÔNG quy đổi."""
@@ -120,7 +144,9 @@ def _extract(d: dict):
         return None
     if vol <= 0 or price <= 0:
         return None
-    ts = str(d.get("time") or "")
+    ts = _ts_str(d.get("time"))
+    if not ts:
+        return None
     tvt = d.get("totalVolumeTraded")
     return str(sym).upper(), {
         "id": str(tvt) if tvt is not None else f"{ts}_{price}_{vol}",
@@ -236,8 +262,10 @@ async def _run():
 
 async def start():
     global _running
-    # Mặc định OFF: cần kiểm chứng schema frame dữ liệu trong phiên trước khi bật.
-    if os.environ.get("DNSE_WS_ENABLED", "").lower() not in ("1", "true", "yes"):
+    # Đã kiểm chứng với dữ liệu thật trong phiên (2026-07-17) → mặc định BẬT.
+    # Tắt bằng DNSE_WS_ENABLED=false nếu cần (shark tự quay lại poll REST).
+    if os.environ.get("DNSE_WS_ENABLED", "true").lower() in ("0", "false", "no"):
+        print("ℹ️  DNSE feed OFF (DNSE_WS_ENABLED=false)", flush=True)
         return
     if not dnse_client.enabled():
         print("ℹ️  DNSE feed OFF (chưa có DNSE_API_KEY/SECRET)", flush=True)
