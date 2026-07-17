@@ -71,6 +71,10 @@ def stats() -> dict:
         "streaming": sum(1 for t in _last_tick_at
                          if time.time() - _last_tick_at[t] < 60),
         "ticks": _tick_count,
+        # Tách "đã đăng ký sổ lệnh" khỏi "đã nhận sổ lệnh" để phân biệt được
+        # "chưa mở màn chi tiết" (book_subscribed=0) với "đăng ký rồi mà không có
+        # dữ liệu về" (book_subscribed>0 nhưng orderbooks=0 ⇒ lỗi thật).
+        "book_subscribed": len(_book_subscribed),
         "orderbooks": len(_orderbook),
     }
 
