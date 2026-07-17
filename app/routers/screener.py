@@ -407,7 +407,21 @@ async def get_tickers_by_exchange(exchange: str) -> List[str]:
     if cached and (now - cached["ts"]) < _TICKER_CACHE_TTL:
         return cached["tickers"]
 
-    # DNSE trước (nếu có key)
+    # 1) Bảng stock_list trong SQLite — dữ liệu CỤC BỘ, không phụ thuộc DNSE/vnstock.
+    #    KHÔNG đặt sau cổng use_dnse(): trước đây khi REST DNSE bị chặn (breaker ngắt)
+    #    thì nhánh này bị bỏ qua → rơi xuống vnstock Listing() chậm/lỗi → danh sách mã
+    #    RỖNG → screener quét 0 mã → trả 0 kết quả → xoá trắng kết quả cũ.
+    try:
+        from app.services import ohlcv_store
+        saved = [x["ticker"] for x in ohlcv_store.get_stock_list()
+                 if str(x.get("exchange", "")).upper() == ex]
+        if saved:
+            _ticker_list_cache[ex] = {"ts": now, "tickers": saved}
+            return saved
+    except Exception as _e:  # noqa: BLE001
+        print(f"⚠️  ticker list {ex} store: {type(_e).__name__}: {_e}", flush=True)
+
+    # 2) DNSE (nếu có key và REST dùng được)
     try:
         from app.services import dnse_client, data_source
         if data_source.use_dnse("ticker_list"):
