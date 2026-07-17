@@ -116,6 +116,66 @@ def _sign(method: str, path: str) -> dict:
             "version": API_VERSION, "Accept": "application/json"}
 
 
+def health_check() -> dict:
+    """Dò TRỰC TIẾP xem DNSE có gọi được không & PHÂN BIỆT nguyên nhân.
+    Cố ý KHÔNG qua enabled() để vẫn dò được khi circuit breaker đang ngắt.
+
+    state:
+      ok           – gọi được (kèm latency + quota còn lại)
+      no_key       – chưa cấu hình key
+      blocked      – TCP không thiết lập được (chữ ký của IP bị firewall chặn)
+      unreachable  – lỗi mạng/DNS
+      timeout      – kết nối được nhưng không trả lời kịp
+      rate_limited – 429 (vượt hạn mức)
+      auth_failed  – 401/403 (sai key/chữ ký/lệch giờ)
+      http_error   – mã lỗi khác
+    """
+    if not (_key() and _secret()):
+        return {"ok": False, "state": "no_key",
+                "message": "Chưa cấu hình DNSE_API_KEY / DNSE_API_SECRET"}
+
+    now = int(time.time())
+    path = "/price/ohlc"      # hạn mức cao nhất (50k/giờ) → dò cho rẻ
+    params = {"type": "STOCK", "symbol": "HPG", "resolution": "1D",
+              "from": now - 5 * 86400, "to": now}
+    full = f"{REST_BASE}{path}?{urlencode(params)}"
+    t0 = time.time()
+    try:
+        r = requests.get(full, headers=_sign("GET", path), timeout=(4, 8), proxies=_proxies())
+        ms = int((time.time() - t0) * 1000)
+        rem = r.headers.get("X-RateLimit-Remaining") or r.headers.get("X-Ratelimit-Remaining")
+        if r.status_code == 200:
+            return {"ok": True, "state": "ok", "latency_ms": ms,
+                    "quota_remaining": int(rem) if rem and rem.isdigit() else None,
+                    "message": f"DNSE phản hồi bình thường ({ms} ms)"}
+        if r.status_code == 429:
+            return {"ok": False, "state": "rate_limited", "latency_ms": ms,
+                    "message": "Vượt hạn mức (429) — cần giãn nhịp gọi"}
+        if r.status_code in (401, 403):
+            return {"ok": False, "state": "auth_failed", "latency_ms": ms,
+                    "message": f"Xác thực thất bại ({r.status_code}) — sai key/chữ ký "
+                               f"hoặc đồng hồ server lệch >1 phút"}
+        return {"ok": False, "state": "http_error", "latency_ms": ms,
+                "message": f"HTTP {r.status_code}: {r.text[:100]}"}
+    except requests.exceptions.ConnectTimeout:
+        # DNS ra IP nhưng TCP handshake bị nuốt → đúng chữ ký của việc bị chặn IP
+        return {"ok": False, "state": "blocked",
+                "message": "Không thiết lập được kết nối (ConnectTimeout) — nhiều khả năng "
+                           "IP server đang bị DNSE chặn"}
+    except requests.exceptions.ReadTimeout:
+        return {"ok": False, "state": "timeout",
+                "message": "Kết nối được nhưng DNSE không trả lời kịp"}
+    except requests.exceptions.RequestException as e:
+        return {"ok": False, "state": "unreachable",
+                "message": f"Lỗi mạng: {type(e).__name__}"}
+
+
+def breaker_state() -> dict:
+    """Circuit breaker đang ngắt hay không (ngắt ⇒ tạm dùng vnstock)."""
+    left = max(0.0, _disabled_until - time.time())
+    return {"open": left > 0, "seconds_left": int(left)}
+
+
 def _proxies():
     # Định tuyến DNSE qua proxy VN nếu server bị chặn IP (đặt DNSE_PROXY trong .env,
     # vd http://user:pass@ip:port hoặc socks5://ip:port — socks cần cài PySocks).

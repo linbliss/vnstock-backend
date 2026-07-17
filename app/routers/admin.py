@@ -38,6 +38,36 @@ async def get_data_source():
     }
 
 
+@router.get("/dnse/health")
+async def dnse_health():
+    """Chẩn đoán DNSE: REST có bị chặn không + WS có nhận tick không + vì sao.
+    Dò thật (1 request tới endpoint hạn mức cao) nên chỉ gọi khi người dùng bấm."""
+    from app.services import dnse_feed
+    loop = asyncio.get_event_loop()
+    rest = await loop.run_in_executor(None, dnse_client.health_check)
+    ws = dnse_feed.stats()
+    shark_src = data_source.get_source("shark")
+
+    # Vì sao WS chưa có tick? Đây mới là thứ hay bị hiểu nhầm là "bị chặn".
+    hint = None
+    if shark_src != "dnse":
+        hint = (f"Shark đang đặt nguồn '{shark_src}' → không đăng ký mã nào với DNSE. "
+                f"Đổi Shark sang 'dnse' ở mục Nguồn dữ liệu để dùng WS.")
+    elif not ws.get("enabled"):
+        hint = "WS feed đang tắt (DNSE_WS_ENABLED=false)."
+    elif not ws.get("connected"):
+        hint = "WS chưa kết nối được — xem REST ở trên để biết có bị chặn không."
+    elif not ws.get("subscribed"):
+        hint = ("WS đã kết nối nhưng chưa mã nào được đăng ký — hãy MỞ trang Shark Action "
+                "(feed chỉ theo dõi mã đang xem, hết 5 phút không xem thì bỏ).")
+    elif not ws.get("ticks"):
+        hint = ("Đã đăng ký nhưng chưa có tick — ngoài giờ khớp lệnh, đang ATO/nghỉ trưa, "
+                "hoặc mã thanh khoản thấp chưa khớp.")
+
+    return {"rest": rest, "ws": ws, "breaker": dnse_client.breaker_state(),
+            "shark_source": shark_src, "hint": hint}
+
+
 @router.post("/data-source")
 async def set_data_source(module: str = Query(...), value: str = Query(...)):
     """Đặt nguồn cho 1 module. value: 'dnse' | 'vnstock'."""
