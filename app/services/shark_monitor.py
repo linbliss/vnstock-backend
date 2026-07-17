@@ -132,19 +132,23 @@ def _update(ticker: str, max_age: Optional[float] = None) -> dict:
                 c["seeded"] = True               # store đã có tape phiên → khỏi seed lại
             _cache[tk] = c
 
-    dnse_on = data_source.use_dnse("shark")
+    dnse_on = data_source.use_dnse("shark")     # REST DNSE (có breaker)
     fetch_interval = 3.0 if dnse_on else MIN_FETCH_INTERVAL
     if max_age is not None:
         fetch_interval = max(fetch_interval, max_age)
-    if dnse_on:
-        # Báo cho WS feed biết mã đang được quan tâm → feed subscribe & push tick.
-        # (import trong hàm: dnse_feed import ngược shark_monitor)
+
+    # WS độc lập với REST: REST (openapi) có thể bị chặn IP trong khi WS (ws-openapi)
+    # vẫn chạy. Nên KHÔNG dùng dnse_on ở đây — nếu không, breaker của REST sẽ khiến
+    # feed không đăng ký mã nào và WS thành vô dụng.
+    if data_source.get_source("shark") == "dnse" and dnse_client.configured():
         try:
-            from app.services import dnse_feed
+            from app.services import dnse_feed   # import trong hàm: tránh vòng lặp
             dnse_feed.register_demand(tk)
-            # WS đang đẩy tick cho mã này → khỏi poll REST (đúng thiết kế DNSE).
-            # BẮT BUỘC đã seed REST trước: WS chỉ có tick TỪ LÚC KẾT NỐI, nếu tin ngay
-            # WS thì tape mất phần đầu phiên → điểm Shark (luỹ kế cả phiên) sai.
+            # WS đang đẩy tick cho mã này → khỏi poll REST (kể cả vnstock), vừa đúng
+            # thiết kế DNSE vừa tránh ĐẾM TRÙNG (id vnstock ≠ id DNSE nên dedup không
+            # bắt được cùng một lệnh khớp từ hai nguồn).
+            # BẮT BUỘC seed xong trước: WS chỉ có tick TỪ LÚC KẾT NỐI, tin ngay WS thì
+            # tape mất phần đầu phiên → điểm Shark (luỹ kế cả phiên) sai.
             if c.get("seeded") and dnse_feed.streaming(tk):
                 return c
         except Exception:  # noqa: BLE001

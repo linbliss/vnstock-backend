@@ -50,7 +50,11 @@ async def dnse_health():
 
     # Vì sao WS chưa có tick? Đây mới là thứ hay bị hiểu nhầm là "bị chặn".
     hint = None
-    if shark_src != "dnse":
+    if not rest["ok"] and rest["state"] == "blocked" and ws.get("connected"):
+        hint = ("REST (openapi.dnse.com.vn) bị chặn nhưng WS (ws-openapi.dnse.com.vn) là "
+                "HOST KHÁC và vẫn chạy → Shark vẫn có realtime qua WS, chỉ phần nạp đầu "
+                "phiên lùi về vnstock. Không cần đổi gì.")
+    elif shark_src != "dnse":
         hint = (f"Shark đang đặt nguồn '{shark_src}' → không đăng ký mã nào với DNSE. "
                 f"Đổi Shark sang 'dnse' ở mục Nguồn dữ liệu để dùng WS.")
     elif not ws.get("enabled"):
@@ -64,8 +68,11 @@ async def dnse_health():
         hint = ("Đã đăng ký nhưng chưa có tick — ngoài giờ khớp lệnh, đang ATO/nghỉ trưa, "
                 "hoặc mã thanh khoản thấp chưa khớp.")
 
+    from urllib.parse import urlparse as _up
     return {"rest": rest, "ws": ws, "breaker": dnse_client.breaker_state(),
-            "shark_source": shark_src, "hint": hint}
+            "shark_source": shark_src, "hint": hint,
+            "hosts": {"rest": _up(dnse_client.REST_BASE).hostname,
+                      "ws": _up(dnse_feed.WS_BASE).hostname}}
 
 
 @router.post("/data-source")

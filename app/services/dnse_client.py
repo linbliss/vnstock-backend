@@ -41,8 +41,20 @@ _BREAKER_THRESHOLD = 3
 _BREAKER_COOLDOWN = 300.0   # giây
 
 
+def configured() -> bool:
+    """Chỉ xét ĐÃ CÓ KEY hay chưa — KHÔNG xét circuit breaker.
+
+    REST (openapi.dnse.com.vn) và WS (ws-openapi.dnse.com.vn) là HAI host/IP khác
+    nhau: REST có thể bị chặn từ IP nước ngoài trong khi WS vẫn chạy tốt. Vì vậy WS
+    phải dùng hàm này, không dùng enabled() — nếu không, breaker của REST sẽ kéo WS
+    chết theo (không đăng ký được mã nào).
+    """
+    return bool(_key() and _secret())
+
+
 def enabled() -> bool:
-    if not (_key() and _secret()):
+    """REST có dùng được không (có key + breaker không ngắt)."""
+    if not configured():
         return False
     if time.time() < _disabled_until:   # đang trong thời gian ngắt tạm
         return False
@@ -158,10 +170,12 @@ def health_check() -> dict:
         return {"ok": False, "state": "http_error", "latency_ms": ms,
                 "message": f"HTTP {r.status_code}: {r.text[:100]}"}
     except requests.exceptions.ConnectTimeout:
-        # DNS ra IP nhưng TCP handshake bị nuốt → đúng chữ ký của việc bị chặn IP
+        # DNS ra IP nhưng TCP handshake bị nuốt → chữ ký của việc bị chặn ở tầng mạng.
+        # LƯU Ý: chỉ nói về HOST REST. WS là host khác (ws-openapi) và có thể vẫn chạy tốt.
         return {"ok": False, "state": "blocked",
-                "message": "Không thiết lập được kết nối (ConnectTimeout) — nhiều khả năng "
-                           "IP server đang bị DNSE chặn"}
+                "message": f"Không thiết lập được kết nối tới {urlparse(REST_BASE).hostname} "
+                           f"(ConnectTimeout) — host REST đang chặn IP server. "
+                           f"WS là host khác nên có thể vẫn hoạt động bình thường."}
     except requests.exceptions.ReadTimeout:
         return {"ok": False, "state": "timeout",
                 "message": "Kết nối được nhưng DNSE không trả lời kịp"}

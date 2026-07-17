@@ -70,13 +70,15 @@ def stats() -> dict:
 
 
 def register_demand(ticker: str) -> None:
-    """shark_monitor gọi khi cần dữ liệu 1 mã → feed sẽ subscribe mã đó."""
-    if dnse_client.enabled():
+    """shark_monitor gọi khi cần dữ liệu 1 mã → feed sẽ subscribe mã đó.
+    Dùng configured() (chỉ xét key) chứ KHÔNG dùng enabled(): REST bị chặn/breaker
+    ngắt không được phép làm WS ngừng đăng ký mã — hai host độc lập nhau."""
+    if dnse_client.configured():
         _demand[ticker.upper()] = time.time()
 
 
 def active() -> bool:
-    return _running and _ws is not None and dnse_client.enabled()
+    return _running and _ws is not None and dnse_client.configured()
 
 
 def streaming(ticker: str) -> bool:
