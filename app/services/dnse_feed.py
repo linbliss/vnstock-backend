@@ -273,6 +273,16 @@ def _on_data(d: dict) -> None:
     if _tick_count == 1:      # xác nhận 1 lần: tick ĐẦU TIÊN thật sự về tới nơi
         print(f"🌊 DNSE WS: tick đầu tiên OK ({sym} {row['side']} "
               f"{row['volume']} @ {row['price']} — {row['ts']})", flush=True)
+    # Chỉ nạp vào tape Shark khi Shark THỰC SỰ chọn nguồn DNSE. Trước đây đẩy vô điều
+    # kiện ⇒ ép Shark sang vnstock ở Admin nhưng tick DNSE vẫn chui vào tape (trộn 2
+    # nguồn ngoài ý muốn). Bảng giá (_quote ở trên) không bị ảnh hưởng vì nó theo
+    # cấu hình "priceboard" riêng.
+    try:
+        from app.services import data_source
+        if data_source.get_source("shark") != "dnse":
+            return
+    except Exception:  # noqa: BLE001
+        pass
     # aggregate=True: WS đẩy TỪNG khớp lẻ → gộp cùng chiều trong 150ms thành 1 "lệnh"
     # (giống REST get_intraday_ticks) để nhận diện lệnh lớn cho đúng.
     shark_monitor.push_ticks(sym, [row], source="DNSE", aggregate=True)
