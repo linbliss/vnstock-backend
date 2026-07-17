@@ -399,7 +399,9 @@ async def start():
     if os.environ.get("DNSE_WS_ENABLED", "true").lower() in ("0", "false", "no"):
         print("ℹ️  DNSE feed OFF (DNSE_WS_ENABLED=false)", flush=True)
         return
-    if not dnse_client.enabled():
+    # configured() chứ không enabled(): WS là host RIÊNG (ws-openapi), không được để
+    # sức khoẻ REST (openapi) quyết định có bật feed hay không.
+    if not dnse_client.configured():
         print("ℹ️  DNSE feed OFF (chưa có DNSE_API_KEY/SECRET)", flush=True)
         return
     _running = True

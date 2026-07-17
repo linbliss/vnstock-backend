@@ -130,7 +130,12 @@ async def get_tickers(exchange: str):
         ]
         return {"exchange": ex, "tickers": tickers, "count": len(tickers)}
 
-    # DNSE trước (nếu có key)
+    # 1) stock_list trong SQLite — dữ liệu CỤC BỘ, KHÔNG đặt sau cổng use_dnse()
+    saved = ohlcv_store.get_tickers_by_exchange(ex)
+    if saved:
+        return {"exchange": ex, "tickers": saved, "count": len(saved)}
+
+    # 2) DNSE (nếu có key + REST dùng được)
     try:
         from app.services import dnse_client, data_source
         if data_source.use_dnse("ticker_list"):

@@ -435,6 +435,28 @@ def get_stock_list() -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+def get_tickers_by_exchange(exchange: str) -> List[str]:
+    """Danh sách mã của 1 sàn từ bảng stock_list.
+
+    Dữ liệu CỤC BỘ → luôn gọi được, KHÔNG phụ thuộc DNSE/vnstock. Mọi nơi cần danh
+    sách mã phải thử hàm này TRƯỚC: nếu đặt sau cổng use_dnse() thì khi DNSE bị chặn
+    (breaker ngắt) sẽ rơi xuống vnstock Listing() chậm/lỗi → danh sách rỗng → các
+    tính năng phía sau (screener/backfill) tưởng "không có mã nào".
+    """
+    ex = (exchange or "").strip().upper()
+    if not ex:
+        return []
+    try:
+        with _connect() as conn:
+            rows = conn.execute(
+                "SELECT ticker FROM stock_list WHERE UPPER(exchange)=? ORDER BY ticker",
+                (ex,),
+            ).fetchall()
+        return [r["ticker"] for r in rows]
+    except Exception:  # noqa: BLE001 — chưa có bảng/DB → để caller fallback
+        return []
+
+
 def get_stock_list_stats() -> Dict[str, Any]:
     """Thống kê bảng stock_list."""
     with _connect() as conn:

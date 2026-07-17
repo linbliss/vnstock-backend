@@ -35,7 +35,12 @@ def get_live(job_id: str) -> Optional[dict]:
 
 
 def _listing_for(exchange: str) -> List[str]:
-    """Lấy ticker list 1 sàn. Ưu tiên DNSE (nếu có key) → fallback vnstock Listing."""
+    """Lấy ticker list 1 sàn: SQLite (cục bộ) → DNSE → vnstock Listing."""
+    # stock_list là dữ liệu CỤC BỘ → thử trước, KHÔNG đặt sau cổng use_dnse()
+    # (DNSE bị chặn ⇒ breaker ngắt ⇒ rơi xuống vnstock chậm/lỗi ⇒ backfill 0 mã).
+    saved = ohlcv_store.get_tickers_by_exchange(exchange)
+    if saved:
+        return saved
     try:
         from app.services import dnse_client, data_source
         if data_source.use_dnse("ticker_list"):
