@@ -1744,6 +1744,19 @@ class ScreenerService:
             if cached_time and (now - cached_time).seconds < cache_ttl:
                 return self._cache[ticker]
 
+        # ── NGOÀI PHIÊN: các chỉ số ngày (MA/RS/Stage/VCP…) KHÔNG đổi cho tới lần cập
+        # nhật OHLCV kế tiếp (~16:00). Có cache bền vững đúng ngày dữ liệu cuối → trả
+        # NGAY, không tính lại, không đọc cả lịch sử OHLCV. So data_date với last_date
+        # trong store: khớp = dữ liệu chưa đổi. (Trong phiên vẫn tính để bám volume.)
+        if not is_trading_hour:
+            last_date = ohlcv_store.get_ohlcv_last_date(ticker)
+            cached = ohlcv_store.load_analyze(ticker)
+            if last_date and cached and cached.get("data_date") == last_date:
+                res = cached["result"]
+                self._cache[ticker] = res
+                self._cache_time[ticker] = now
+                return res
+
         # Lấy toàn bộ lịch sử có sẵn – càng nhiều càng tin cậy cho MA200, RS
         end   = now.strftime("%Y-%m-%d")
         start = "2000-01-01"
@@ -1857,6 +1870,16 @@ class ScreenerService:
 
         self._cache[ticker] = result
         self._cache_time[ticker] = now
+        # Lưu cache bền vững CHỈ khi NGOÀI phiên: lúc đó result phản ánh dữ liệu ngày ổn
+        # định (không trộn volume intraday) nên đọc lại sau này là đúng. Trong phiên chỉ
+        # dùng cache RAM 60s (đã có ở trên) để bám volume realtime.
+        if not is_trading_hour:
+            try:
+                data_date = str(df["date"].iloc[-1])[:10]
+                if data_date:
+                    ohlcv_store.save_analyze(ticker, data_date, result)
+            except Exception:  # noqa: BLE001
+                pass
         return result
 
     async def _fetch_history_async(

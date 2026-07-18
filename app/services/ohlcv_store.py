@@ -77,6 +77,13 @@ def init_db() -> None:
                 updated_at  TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS analyze_cache (
+                ticker      TEXT PRIMARY KEY,
+                data_date   TEXT NOT NULL,   -- ngày OHLCV cuối dùng để tính (để biết stale)
+                result_json TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS rs_ratings (
                 ticker      TEXT PRIMARY KEY,
                 rs_score    REAL NOT NULL,   -- raw weighted return score
@@ -193,6 +200,16 @@ def get_last_date(ticker: str) -> Optional[str]:
             (ticker.upper(),),
         ).fetchone()
     return row["last_date"] if row else None
+
+
+def get_ohlcv_last_date(ticker: str) -> Optional[str]:
+    """Ngày OHLCV MỚI NHẤT thực tế trong bảng ohlcv (dùng để so cache analyze —
+    tự nhất quán với dữ liệu đã lưu, không lệ thuộc backfill_status)."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT MAX(date) AS d FROM ohlcv WHERE ticker=?", (ticker.upper(),)
+        ).fetchone()
+    return row["d"] if row and row["d"] else None
 
 
 def get_last_close(ticker: str) -> Optional[float]:
@@ -319,6 +336,37 @@ def get_fundamental(ticker: str) -> Optional[Dict[str, Any]]:
     data = json.loads(row["data_json"])
     data["_updated_at"] = row["updated_at"]
     return data
+
+
+def save_analyze(ticker: str, data_date: str, result: Dict[str, Any]) -> None:
+    """Lưu kết quả phân tích screener (bền vững) kèm data_date = ngày OHLCV cuối cùng
+    đã dùng — để biết khi nào dữ liệu đổi (cần tính lại)."""
+    t = ticker.upper()
+    now = datetime.now().isoformat()
+    with _lock, _connect() as conn:
+        conn.execute(
+            """INSERT INTO analyze_cache(ticker, data_date, result_json, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(ticker) DO UPDATE SET
+                 data_date=excluded.data_date, result_json=excluded.result_json,
+                 updated_at=excluded.updated_at""",
+            (t, data_date, json.dumps(result, ensure_ascii=False), now),
+        )
+
+
+def load_analyze(ticker: str) -> Optional[Dict[str, Any]]:
+    """Trả {data_date, result} hoặc None."""
+    t = ticker.upper()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT data_date, result_json FROM analyze_cache WHERE ticker=?", (t,)
+        ).fetchone()
+    if not row:
+        return None
+    try:
+        return {"data_date": row["data_date"], "result": json.loads(row["result_json"])}
+    except (ValueError, TypeError):
+        return None
 
 
 def is_fundamental_stale(ticker: str) -> bool:
