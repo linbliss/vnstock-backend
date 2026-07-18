@@ -42,6 +42,10 @@ async def lifespan(app: FastAPI):
     daily_task = asyncio.create_task(daily_update_scheduler())
     rs_task = asyncio.create_task(_rs_rating_scheduler())
     shark_eod_task = asyncio.create_task(_shark_eod_scheduler())
+    # Worker nền làm mới tape Shark cho các mã đang xem (tách API khỏi request)
+    from app.services import shark_monitor
+    shark_refresh_task = asyncio.create_task(shark_monitor.refresh_loop())
+    app.state.shark_refresh_task = shark_refresh_task
     # Load VNINDEX khi khởi động (không block, chạy background)
     asyncio.create_task(_warmup_vnindex())
     yield
@@ -53,6 +57,9 @@ async def lifespan(app: FastAPI):
         rs_task.cancel()
     if shark_eod_task:
         shark_eod_task.cancel()
+    _srt = getattr(app.state, "shark_refresh_task", None)
+    if _srt:
+        _srt.cancel()
     from app.services import dnse_feed
     await dnse_feed.stop()
     await market_service.stop()

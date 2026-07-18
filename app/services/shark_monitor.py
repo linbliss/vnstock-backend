@@ -106,9 +106,35 @@ def _save_tape(tk: str, trade_date: str, ticks: list, complete: bool) -> None:
         print(f"⚠️  tape_store.save {tk}: {type(e).__name__}: {e}", flush=True)
 
 
+def _ensure_loaded(ticker: str) -> dict:
+    """Lấy cache của mã; cold start nạp từ store bền vững (SQLite) — CỤC BỘ, KHÔNG gọi
+    API. Dùng ở đường REQUEST (get_signal/get_tape) để đọc-cache-thuần, không đụng mạng."""
+    tk = ticker.upper()
+    today = _today()
+    now = time.time()
+    with _lock:
+        c = _cache.get(tk)
+        if c and c.get("date") != today:      # sang ngày mới → bỏ tape cũ
+            c = None
+        if c is None:
+            c = {"ticks": [], "seen": set(), "src": "STORE", "last_fetch": 0.0,
+                 "date": today, "last_saved": now, "complete": False, "deep": False,
+                 "seeded": False}
+            stored = tape_store.load(tk, today)
+            if stored and stored["ticks"]:
+                c["ticks"] = stored["ticks"]
+                c["seen"] = {t["id"] for t in stored["ticks"]}
+                c["complete"] = stored["complete"]
+                c["deep"] = stored["complete"]
+                c["seeded"] = True
+            _cache[tk] = c
+        return c
+
+
 def _update(ticker: str, max_age: Optional[float] = None) -> dict:
-    """max_age: tuổi tối đa chấp nhận của cache (giây). List truyền giá trị lớn để đỡ
-    tốn rate limit; màn chi tiết để mặc định (tươi nhất có thể)."""
+    """Nạp/làm mới tape 1 mã — CÓ THỂ gọi API (seed/poll). Chỉ chạy ở BACKGROUND
+    (refresh_loop) hoặc batch, KHÔNG gọi trực tiếp từ request handler.
+    max_age: tuổi tối đa chấp nhận của cache (giây)."""
     tk = ticker.upper()
     now = time.time()
     today = _today()
@@ -234,6 +260,83 @@ def _update(ticker: str, max_age: Optional[float] = None) -> dict:
     if snapshot is not None:
         _save_tape(tk, today, snapshot, complete=complete_flag)
     return result
+
+
+# ── Đăng ký nhu cầu + worker làm mới NỀN (tách API khỏi đường request) ─────────────
+# Mô hình: request handler CHỈ đọc cache; worker nền mới gọi API (seed/poll) + WS đẩy
+# tick vào cache. Nhờ vậy bấm vào mã trong Shark Action luôn trả tức thì từ cache,
+# không kích hoạt lệnh API nào → giảm tải rate & nhanh hơn nhiều.
+_demand: Dict[str, float] = {}     # mã đang xem → thời điểm cuối được hỏi
+_deep_want: set = set()            # mã cần nạp SÂU cả phiên (màn chi tiết)
+DEMAND_TTL = 300.0                 # 5' không xem → thôi làm mới
+REFRESH_INTERVAL = 3.0             # nhịp worker nền quét các mã đang xem
+
+
+def _touch(ticker: str, deep: bool = False) -> None:
+    tk = ticker.upper()
+    _demand[tk] = time.time()
+    if deep:
+        _deep_want.add(tk)
+    # WS (nếu dùng DNSE) — subscribe để nhận tick realtime đẩy thẳng vào cache
+    if data_source.get_source("shark") == "dnse" and dnse_client.configured():
+        try:
+            from app.services import dnse_feed
+            dnse_feed.register_demand(tk, book=deep)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _demanded() -> list:
+    now = time.time()
+    return [t for t, ts in _demand.items() if now - ts < DEMAND_TTL]
+
+
+def _ensure_deep(tk: str) -> None:
+    """Nạp SÂU cả phiên 1 lần (REST) — CHẠY Ở WORKER NỀN, không ở request."""
+    c = _cache.get(tk)
+    if not c or c.get("deep") or not data_source.use_dnse("shark"):
+        return
+    deep = dnse_client.get_intraday_ticks(tk, max_pages=25) or []
+    if deep:
+        push_ticks(tk, deep, "DNSE")
+    with _lock:
+        c = _cache.get(tk, c)
+        c["deep"] = True
+        snap = list(c["ticks"])
+    if snap:
+        _save_tape(tk, _today(), snap, complete=not _is_trading_hours())
+
+
+def _refresh_one(tk: str) -> None:
+    """Làm mới 1 mã ở worker nền: poll/seed REST (nếu cần) + deep-seed nếu đang xem chi tiết.
+    Mã đang xem CHI TIẾT → làm mới tươi (throttle 3s); mã chỉ nằm trong LIST → giãn
+    (SIGNAL_MAX_AGE=45s) để không tốn rate. Mã đang có WS stream thì _update tự bỏ REST."""
+    deep = tk in _deep_want
+    _update(tk, max_age=None if deep else SIGNAL_MAX_AGE)
+    if deep:
+        try:
+            _ensure_deep(tk)
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️  deep-seed {tk}: {type(e).__name__}: {e}", flush=True)
+
+
+async def refresh_loop():
+    """Worker nền: giữ cache của các mã ĐANG XEM luôn tươi. Đây là NƠI DUY NHẤT gọi API
+    theo nhịp — request handler không bao giờ gọi API nữa."""
+    import asyncio
+    loop = asyncio.get_event_loop()
+    while True:
+        try:
+            tks = _demanded()
+            _deep_want.intersection_update(set(tks))   # dọn deep_want theo nhu cầu còn hiệu lực
+            if tks and (_is_trading_hours() or any(
+                    not (_cache.get(t) or {}).get("seeded") for t in tks)):
+                for tk in tks:
+                    await loop.run_in_executor(None, _refresh_one, tk)
+                    await asyncio.sleep(0.2)   # rải đều, không dội nguồn
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️  shark refresh_loop: {type(e).__name__}: {e}", flush=True)
+        await asyncio.sleep(REFRESH_INTERVAL if _is_trading_hours() else 30.0)
 
 
 def _units_consistent(ticks: List[dict], rows: List[dict]) -> bool:
@@ -540,54 +643,53 @@ def compute_and_cache_signal(ticker: str, big_value: float = BIG_VALUE_VND,
 
 
 def get_signal(ticker: str, big_value: float = BIG_VALUE_VND, window_min: int = WINDOW_MIN) -> dict:
-    """Tín hiệu gọn (không kèm tape) — cho danh sách nhiều mã.
+    """Tín hiệu gọn (không kèm tape) — CHỈ ĐỌC CACHE, không gọi API.
 
-    NGOÀI PHIÊN: nếu đã có cache điểm chốt cuối phiên (complete) → trả NGAY, không
-    _update/_metrics lại (điểm cả phiên không đổi khi thị trường đóng) → mở watchlist
-    /Shark Action tức thì, không tốn CPU tính lại trên hàng chục nghìn tick.
-    TRONG PHIÊN: tính lại (throttle SIGNAL_MAX_AGE) và cập nhật cache."""
+    Đăng ký nhu cầu → worker nền (refresh_loop) + WS lo việc làm mới. Handler này chỉ:
+      • NGOÀI PHIÊN: có cache điểm chốt (complete) → trả NGAY.
+      • Còn lại: tính _metrics trên tape đang có trong cache (CPU cục bộ, không đụng mạng)."""
     tk = ticker.upper()
+    _touch(tk)
     if not _is_trading_hours() and _score_cacheable(big_value, window_min):
         cached = tape_store.load_score(tk, _today())
         if cached and cached.get("complete") and cached.get("big_value") == big_value:
             return cached["signal"]
-    return compute_and_cache_signal(tk, big_value, window_min)
+    c = _ensure_loaded(tk)          # nạp từ store nếu cần — KHÔNG gọi API
+    m = _metrics(tk, c.get("ticks", []), big_value, window_min)
+    m.pop("big_orders", None)
+    if "err" in c and m.get("empty"):
+        m["error"] = c["err"]
+    if _score_cacheable(big_value, window_min) and not m.get("empty"):
+        try:
+            tape_store.save_score(tk, _today(), m, big_value,
+                                  complete=not _is_trading_hours())
+        except Exception:  # noqa: BLE001
+            pass
+    return m
 
 
 def get_tape(ticker: str, limit: int = 2000, big_value: float = BIG_VALUE_VND,
              window_min: int = WINDOW_MIN) -> dict:
-    """Tape (log khớp lệnh cả phiên) + metrics + sổ lệnh — cho màn chi tiết 1 mã."""
+    """Tape + metrics + sổ lệnh cho màn chi tiết — CHỈ ĐỌC CACHE, không gọi API.
+
+    Đăng ký nhu cầu (kèm deep + sổ lệnh); worker nền seed sâu + WS đẩy tick/sổ lệnh vào
+    cache. Lần bấm đầu cache có thể còn mỏng → trả về phần đang có (frontend hiện 'đang
+    tải'), vài giây sau worker nền nạp đủ → poll kế tiếp là đầy."""
     tk = ticker.upper()
-    c = _update(tk)
-    # Nạp SÂU cả phiên 1 lần cho màn chi tiết (list chỉ seed nông để nhanh).
-    # Bỏ qua nếu tape đã đủ từ store (deep=True) → không tải lại từ DNSE.
-    if data_source.use_dnse("shark") and not c.get("deep"):
-        deep = dnse_client.get_intraday_ticks(tk, max_pages=25) or []
-        if deep:
-            push_ticks(tk, deep, "DNSE")
-        with _lock:
-            c = _cache.get(tk, c)
-            c["deep"] = True
-            snap = list(c["ticks"])
-        # Lưu tape sâu vào store để lần sau / restart khỏi nạp lại
-        if snap:
-            _save_tape(tk, _today(), snap, complete=not _is_trading_hours())
+    _touch(tk, deep=True)
+    c = _ensure_loaded(tk)          # KHÔNG gọi API
     ticks = c.get("ticks", [])
     m = _metrics(tk, ticks, big_value, window_min)
     recent = list(reversed(ticks[-limit:]))
     m["tape"] = recent
-    # Sổ lệnh: ưu tiên WS top_price (realtime, 10 mức, không tốn hạn mức REST) →
-    # lùi về REST get_quotes (3 mức, 10k/giờ) nếu WS chưa có.
+    # Sổ lệnh: đọc từ cache WS (worker/WS cập nhật). Không gọi REST ở đây.
     ob = None
     if data_source.get_source("shark") == "dnse" and dnse_client.configured():
         try:
             from app.services import dnse_feed
-            dnse_feed.register_demand(tk, book=True)   # màn chi tiết → cần sổ lệnh
             ob = dnse_feed.get_orderbook(tk)
         except Exception:  # noqa: BLE001
             ob = None
-    if ob is None and data_source.use_dnse("shark"):
-        ob = dnse_client.get_orderbook(tk)
     m["orderbook"] = ob
     if "err" in c and m.get("empty"):
         m["error"] = c["err"]
