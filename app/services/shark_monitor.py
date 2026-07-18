@@ -23,8 +23,10 @@ WINDOW_MIN = 15                    # cửa sổ trượt (phút) cho tín hiệu
 MIN_FETCH_INTERVAL = 8.0           # giây — không refetch 1 mã dày hơn mức này (có fallback VCI↔KBS)
 SEED_PAGE = 1000                   # lần đầu lấy nhiều tick để có bối cảnh
 POLL_PAGE = 300                    # các lần sau chỉ lấy tick mới
-MAX_TICKS = 60000                  # giới hạn bộ nhớ mỗi mã (đủ chứa TRỌN phiên mã
-                                   # thanh khoản rất cao như STB — 20k cũ cắt mất sáng)
+# Giới hạn bộ nhớ mỗi mã. Đây là số "lệnh" ĐÃ GỘP (150ms same-side), không phải khớp
+# lẻ — mã thanh khoản cao nhất VN sau khi gộp ~30-50k/phiên, nên 100k là dư margin.
+# Nếu 1 mã vẫn vượt (cực hiếm) → _cap_ticks cắt phần CŨ và LOG cảnh báo để ta biết.
+MAX_TICKS = 100000
 SAVE_INTERVAL = 45.0               # giây — ghi tape ra store bền vững thưa (giảm I/O)
 # Cột Shark ở LIST chỉ cần điểm tổng phiên → không cần tươi từng giây. Rate limit DNSE
 # "Get Trades" = 10.000 req/GIỜ: list poll 12s/mã ⇒ 300 req/giờ/mã ⇒ >34 mã là vượt trần.
@@ -97,6 +99,18 @@ def _fetch_with_fallback(ticker: str, page_size: int, prefer: Optional[str] = No
 
 def _today() -> str:
     return datetime.now().strftime("%Y-%m-%d")
+
+
+def _cap_ticks(c: dict, tk: str) -> None:
+    """Giữ tape trong giới hạn bộ nhớ. Cắt phần CŨ nếu vượt — và CẢNH BÁO 1 lần để biết
+    có mã nào chạm trần (khi đó điểm có thể thiếu đầu phiên → cân nhắc nâng MAX_TICKS)."""
+    if len(c["ticks"]) > MAX_TICKS:
+        c["ticks"] = c["ticks"][-MAX_TICKS:]
+        c["seen"] = {t["id"] for t in c["ticks"]}
+        if not c.get("_capped"):
+            c["_capped"] = True
+            print(f"⚠️  {tk}: tape chạm trần MAX_TICKS={MAX_TICKS} — cắt bớt phần cũ "
+                  f"(điểm có thể thiếu đầu phiên). Cân nhắc nâng MAX_TICKS.", flush=True)
 
 
 def _save_tape(tk: str, trade_date: str, ticks: list, complete: bool) -> None:
@@ -234,9 +248,7 @@ def _update(ticker: str, max_age: Optional[float] = None) -> dict:
                     seen.add(r["id"])
                 new.sort(key=lambda r: _parse_ts(r["ts"]) or datetime.min)
                 c["ticks"].extend(new)
-                if len(c["ticks"]) > MAX_TICKS:
-                    c["ticks"] = c["ticks"][-MAX_TICKS:]
-                    c["seen"] = {t["id"] for t in c["ticks"]}
+                _cap_ticks(c, tk)
                 added = True
             if src != "STORE":
                 c["src"] = src
@@ -428,9 +440,7 @@ def push_ticks(ticker: str, rows: List[dict], source: str = "DNSE",
                     _append_agg(c["ticks"], r)
             else:
                 c["ticks"].extend(new)
-            if len(c["ticks"]) > MAX_TICKS:
-                c["ticks"] = c["ticks"][-MAX_TICKS:]
-                c["seen"] = {t["id"] for t in c["ticks"]}
+            _cap_ticks(c, tk)
             # WS đẩy tick → _update bị throttle nên sẽ không tự lưu; lưu ở đây (thưa).
             if now - c.get("last_saved", 0) >= SAVE_INTERVAL:
                 c["last_saved"] = now
@@ -718,24 +728,37 @@ def rebuild_session(ticker: str, date: Optional[str] = None) -> dict:
     fetch trước đây). date=None → tự lùi tìm phiên giao dịch gần nhất có khớp lệnh.
     Ghi đè cache + store để hiển thị/điểm đúng ngay. CHẠY Ở THREAD (có REST)."""
     tk = ticker.upper()
-    cands = [date] if date else [
-        (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(8)]
-    target, rows = None, []
-    for d in cands:
-        if not d:
-            continue
-        r = dnse_client.get_intraday_ticks(tk, max_pages=250, max_ticks=1_000_000, date=d) or []
-        if r:
-            target, rows = d, r
-            break
-    if not rows:
-        return {"ok": False, "ticker": tk, "message": "không lấy được khớp lệnh (kiểm tra nguồn/ngày)"}
+    target, rows, src, agg = None, [], None, False
 
-    # Reset cache mã này rồi nạp trọn phiên (rows đã gộp sẵn → aggregate=False)
+    # 1) DNSE nếu REST dùng được (lấy được cả phiên CŨ theo date)
+    if data_source.get_source("shark") == "dnse" and dnse_client.enabled():
+        cands = [date] if date else [
+            (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(8)]
+        for d in cands:
+            if not d:
+                continue
+            r = dnse_client.get_intraday_ticks(tk, max_pages=250, max_ticks=1_000_000, date=d) or []
+            if r:
+                target, rows, src, agg = d, r, "DNSE", False   # DNSE đã gộp sẵn
+                break
+
+    # 2) vnstock (khi DNSE bị chặn IP). LƯU Ý: vnstock intraday CHỈ có phiên HÔM NAY —
+    #    không lấy được ngày cũ. Chạy trong/ngay sau phiên giao dịch mới có dữ liệu.
+    if not rows and (date is None or date == _today()):
+        vrows, vsrc, _err = _fetch_with_fallback(tk, 100000)   # page_size lớn = trọn phiên
+        if vrows:
+            target, rows, src, agg = _today(), vrows, vsrc, True   # vnstock lẻ → gộp 150ms
+
+    if not rows:
+        return {"ok": False, "ticker": tk,
+                "message": "không lấy được khớp lệnh (DNSE bị chặn + vnstock không có "
+                           "dữ liệu phiên này — chạy trong/sau phiên giao dịch)"}
+
+    # Reset cache mã này rồi nạp trọn phiên
     with _lock:
         _cache.pop(tk, None)
     _ensure_loaded(tk)
-    push_ticks(tk, rows, "DNSE")
+    push_ticks(tk, rows, src, aggregate=agg)
     with _lock:
         c = _cache[tk]
         c["deep"] = True
@@ -749,3 +772,31 @@ def rebuild_session(ticker: str, date: Optional[str] = None) -> dict:
     return {"ok": True, "ticker": tk, "session_date": target, "ticks": len(snap),
             "first_ts": snap[0]["ts"] if snap else None,
             "last_ts": snap[-1]["ts"] if snap else None, "score": m.get("score")}
+
+
+async def rebuild_watchlist(tickers: Optional[List[str]] = None) -> dict:
+    """Dựng lại trọn tape phiên cho TẤT CẢ mã trong watchlist (hoặc danh sách cho trước).
+    Dùng nguồn hiện có: DNSE nếu REST dùng được, không thì vnstock (phiên hôm nay)."""
+    import asyncio
+    from app.services import user_store
+    tks = tickers or user_store.all_watchlist_tickers()
+    loop = asyncio.get_event_loop()
+    done, failed, results = 0, [], []
+    for tk in tks:
+        try:
+            r = await loop.run_in_executor(None, rebuild_session, tk)
+            if r.get("ok"):
+                done += 1
+            else:
+                failed.append(tk)
+            results.append({"ticker": tk, "ok": r.get("ok"), "n": r.get("ticks"),
+                            "first_ts": r.get("first_ts"), "score": r.get("score")})
+            print(f"🔧 rebuild {tk}: ok={r.get('ok')} n={r.get('ticks')} "
+                  f"first={r.get('first_ts')} score={r.get('score')}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            failed.append(tk)
+            print(f"❌ rebuild {tk}: {type(e).__name__}: {e}", flush=True)
+        await asyncio.sleep(1.5)   # nhẹ tay với vnstock (tránh throttle)
+    msg = f"rebuild_watchlist: {done}/{len(tks)} ok, {len(failed)} lỗi"
+    print(f"✅ {msg}", flush=True)
+    return {"total": len(tks), "done": done, "failed": failed, "results": results, "message": msg}

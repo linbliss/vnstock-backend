@@ -233,6 +233,33 @@ async def verify_adjust_status():
     return {"running": _readjust_running["on"], "result": _readjust_running["result"]}
 
 
+_shark_rebuild_running = {"on": False, "result": None}
+
+
+@router.post("/shark/rebuild-watchlist")
+async def shark_rebuild_watchlist():
+    """Dựng lại trọn tape phiên cho TẤT CẢ mã watchlist (DNSE nếu được, không thì vnstock).
+    Chạy NỀN — trả về ngay, xem tiến độ ở log / status."""
+    if _shark_rebuild_running["on"]:
+        return {"ok": False, "message": "đang chạy rồi — chờ hoàn tất"}
+    from app.services import shark_monitor
+
+    async def _run():
+        _shark_rebuild_running["on"] = True
+        try:
+            _shark_rebuild_running["result"] = await shark_monitor.rebuild_watchlist()
+        finally:
+            _shark_rebuild_running["on"] = False
+
+    asyncio.create_task(_run())
+    return {"ok": True, "message": "Đã bắt đầu dựng lại tape watchlist — xem log/status."}
+
+
+@router.get("/shark/rebuild-watchlist/status")
+async def shark_rebuild_watchlist_status():
+    return {"running": _shark_rebuild_running["on"], "result": _shark_rebuild_running["result"]}
+
+
 @router.post("/shark/rebuild/{ticker}")
 async def shark_rebuild(ticker: str, date: Optional[str] = Query(
         default=None, description="YYYY-MM-DD; bỏ trống = tự tìm phiên gần nhất")):
