@@ -285,16 +285,27 @@ def _norm_side(s) -> str:
     return "B" if s.startswith("B") else ("S" if s.startswith("S") else "U")
 
 
-def get_intraday_ticks(symbol: str, max_ticks: int = 3000, max_pages: int = 8):
-    """Lấy tick khớp lệnh phiên hôm nay, chuẩn hoá cho shark_monitor.
+def get_intraday_ticks(symbol: str, max_ticks: int = 3000, max_pages: int = 8,
+                       date: Optional[str] = None):
+    """Lấy tick khớp lệnh của 1 phiên, chuẩn hoá cho shark_monitor.
     Trả list {id, ts, price(kVND), volume, side('B'/'S'), value(VND)} tăng dần theo thời gian.
+
+    date=None → phiên hôm nay; date='YYYY-MM-DD' → phiên ngày đó (để dựng lại tape cũ).
+    LƯU Ý: get_trades trả DESC (mới→cũ) và phân trang bằng nextPageToken. Muốn ĐỦ CẢ
+    PHIÊN phải phân trang tới khi hết token — đừng đặt max_ticks/max_pages quá nhỏ, nếu
+    không mã thanh khoản cao (STB…) sẽ chỉ còn nửa phiên cuối (mất phần sáng).
     """
     if not enabled():
         return None
     import time as _t
-    from datetime import datetime
-    now = int(_t.time())
-    start = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    from datetime import datetime, timedelta
+    if date:
+        d0 = datetime.strptime(date, "%Y-%m-%d").replace(hour=0, minute=0, second=0, microsecond=0)
+        start = int(d0.timestamp())
+        now = int((d0 + timedelta(days=1)).timestamp())
+    else:
+        now = int(_t.time())
+        start = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
     rows: list = []
     token = None
     for _ in range(max_pages):

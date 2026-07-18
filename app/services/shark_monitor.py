@@ -23,7 +23,8 @@ WINDOW_MIN = 15                    # cửa sổ trượt (phút) cho tín hiệu
 MIN_FETCH_INTERVAL = 8.0           # giây — không refetch 1 mã dày hơn mức này (có fallback VCI↔KBS)
 SEED_PAGE = 1000                   # lần đầu lấy nhiều tick để có bối cảnh
 POLL_PAGE = 300                    # các lần sau chỉ lấy tick mới
-MAX_TICKS = 20000                  # giới hạn bộ nhớ mỗi mã
+MAX_TICKS = 60000                  # giới hạn bộ nhớ mỗi mã (đủ chứa TRỌN phiên mã
+                                   # thanh khoản rất cao như STB — 20k cũ cắt mất sáng)
 SAVE_INTERVAL = 45.0               # giây — ghi tape ra store bền vững thưa (giảm I/O)
 # Cột Shark ở LIST chỉ cần điểm tổng phiên → không cần tươi từng giây. Rate limit DNSE
 # "Get Trades" = 10.000 req/GIỜ: list poll 12s/mã ⇒ 300 req/giờ/mã ⇒ >34 mã là vượt trần.
@@ -305,11 +306,14 @@ def _demanded() -> list:
 
 
 def _ensure_deep(tk: str) -> None:
-    """Nạp SÂU cả phiên 1 lần (REST) — CHẠY Ở WORKER NỀN, không ở request."""
+    """Nạp SÂU CẢ PHIÊN 1 lần (REST) — CHẠY Ở WORKER NỀN, không ở request.
+    Phân trang tới khi hết token (đủ từ 9:00) — KHÔNG giới hạn 3000 tick/25 trang như
+    trước (mã thanh khoản cao sẽ mất phần sáng, sai điểm Shark)."""
     c = _cache.get(tk)
     if not c or c.get("deep") or not data_source.use_dnse("shark"):
         return
-    deep = dnse_client.get_intraday_ticks(tk, max_pages=25) or []
+    # max_pages/max_ticks đủ lớn để lấy TRỌN phiên; dừng tự nhiên khi hết nextPageToken.
+    deep = dnse_client.get_intraday_ticks(tk, max_pages=250, max_ticks=1_000_000) or []
     if deep:
         push_ticks(tk, deep, "DNSE")
     with _lock:
@@ -707,3 +711,41 @@ def get_tape(ticker: str, limit: int = 2000, big_value: float = BIG_VALUE_VND,
     if "err" in c and m.get("empty"):
         m["error"] = c["err"]
     return m
+
+
+def rebuild_session(ticker: str, date: Optional[str] = None) -> dict:
+    """Dựng LẠI TRỌN tape 1 phiên từ DNSE (sửa tape cũ bị thiếu phần sáng do giới hạn
+    fetch trước đây). date=None → tự lùi tìm phiên giao dịch gần nhất có khớp lệnh.
+    Ghi đè cache + store để hiển thị/điểm đúng ngay. CHẠY Ở THREAD (có REST)."""
+    tk = ticker.upper()
+    cands = [date] if date else [
+        (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(8)]
+    target, rows = None, []
+    for d in cands:
+        if not d:
+            continue
+        r = dnse_client.get_intraday_ticks(tk, max_pages=250, max_ticks=1_000_000, date=d) or []
+        if r:
+            target, rows = d, r
+            break
+    if not rows:
+        return {"ok": False, "ticker": tk, "message": "không lấy được khớp lệnh (kiểm tra nguồn/ngày)"}
+
+    # Reset cache mã này rồi nạp trọn phiên (rows đã gộp sẵn → aggregate=False)
+    with _lock:
+        _cache.pop(tk, None)
+    _ensure_loaded(tk)
+    push_ticks(tk, rows, "DNSE")
+    with _lock:
+        c = _cache[tk]
+        c["deep"] = True
+        c["seeded"] = True
+        snap = list(c["ticks"])
+    _save_tape(tk, _today(), snap, complete=True)
+    m = _metrics(tk, snap, BIG_VALUE_VND, WINDOW_MIN)
+    if not m.get("empty"):
+        m2 = {k: v for k, v in m.items() if k != "big_orders"}
+        tape_store.save_score(tk, _today(), m2, BIG_VALUE_VND, complete=True)
+    return {"ok": True, "ticker": tk, "session_date": target, "ticks": len(snap),
+            "first_ts": snap[0]["ts"] if snap else None,
+            "last_ts": snap[-1]["ts"] if snap else None, "score": m.get("score")}

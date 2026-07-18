@@ -233,6 +233,16 @@ async def verify_adjust_status():
     return {"running": _readjust_running["on"], "result": _readjust_running["result"]}
 
 
+@router.post("/shark/rebuild/{ticker}")
+async def shark_rebuild(ticker: str, date: Optional[str] = Query(
+        default=None, description="YYYY-MM-DD; bỏ trống = tự tìm phiên gần nhất")):
+    """Dựng lại TRỌN tape 1 phiên cho 1 mã (sửa tape thiếu phần sáng)."""
+    from app.services import shark_monitor
+    loop = asyncio.get_event_loop()
+    res = await loop.run_in_executor(None, shark_monitor.rebuild_session, ticker.upper(), date)
+    return res
+
+
 @router.post("/stock-list/refresh")
 async def refresh_stock_list():
     """Fetch toàn bộ danh sách mã CK từ vnstock Listing và lưu vào SQLite.
