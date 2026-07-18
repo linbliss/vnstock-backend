@@ -46,7 +46,57 @@ def init_db() -> None:
                  PRIMARY KEY(ticker, trade_date)
                )"""
         )
+        # Cache ĐIỂM Shark đã tính (không phải cả tape) — để list watchlist/Shark Action
+        # khỏi tính lại _metrics trên hàng chục nghìn tick mỗi lần mở. complete=1 = chốt
+        # cuối phiên (ngoài giờ đọc thẳng, không tính lại). big_value để biết cache có
+        # đúng ngưỡng "lệnh lớn" đang yêu cầu không.
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS shark_score(
+                 ticker      TEXT NOT NULL,
+                 trade_date  TEXT NOT NULL,
+                 signal_json TEXT NOT NULL,
+                 big_value   REAL,
+                 complete    INTEGER DEFAULT 0,
+                 updated_at  TEXT,
+                 PRIMARY KEY(ticker, trade_date)
+               )"""
+        )
     _inited = True
+
+
+def save_score(ticker: str, trade_date: str, signal: dict,
+               big_value: float, complete: bool = False) -> None:
+    """Lưu điểm Shark đã tính cho (mã, ngày)."""
+    init_db()
+    payload = json.dumps(signal, separators=(",", ":"), ensure_ascii=False)
+    with _lock, _conn() as c:
+        c.execute(
+            """INSERT INTO shark_score(ticker, trade_date, signal_json, big_value, complete, updated_at)
+               VALUES(?,?,?,?,?,?)
+               ON CONFLICT(ticker, trade_date) DO UPDATE SET
+                 signal_json=excluded.signal_json, big_value=excluded.big_value,
+                 complete=excluded.complete, updated_at=excluded.updated_at""",
+            (ticker.upper(), trade_date, payload, float(big_value),
+             1 if complete else 0, datetime.now().isoformat()),
+        )
+
+
+def load_score(ticker: str, trade_date: str) -> dict | None:
+    """Trả {signal, big_value, complete} hoặc None."""
+    init_db()
+    with _lock, _conn() as c:
+        row = c.execute(
+            "SELECT signal_json, big_value, complete FROM shark_score "
+            "WHERE ticker=? AND trade_date=?",
+            (ticker.upper(), trade_date),
+        ).fetchone()
+    if not row:
+        return None
+    try:
+        signal = json.loads(row[0])
+    except (ValueError, TypeError):
+        return None
+    return {"signal": signal, "big_value": row[1], "complete": bool(row[2])}
 
 
 def load(ticker: str, trade_date: str) -> dict | None:
@@ -90,4 +140,5 @@ def cleanup(keep_days: int = 5) -> int:
     cutoff = (datetime.now() - timedelta(days=keep_days)).strftime("%Y-%m-%d")
     with _lock, _conn() as c:
         cur = c.execute("DELETE FROM intraday_tape WHERE trade_date < ?", (cutoff,))
+        c.execute("DELETE FROM shark_score WHERE trade_date < ?", (cutoff,))
         return cur.rowcount

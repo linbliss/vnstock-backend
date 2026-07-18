@@ -516,15 +516,42 @@ def _metrics(ticker: str, ticks: List[dict], big_value: float, window_min: int) 
     }
 
 
-def get_signal(ticker: str, big_value: float = BIG_VALUE_VND, window_min: int = WINDOW_MIN) -> dict:
-    """Tín hiệu gọn (không kèm tape) — cho danh sách nhiều mã.
-    Dùng cache tới SIGNAL_MAX_AGE giây để không đốt rate limit khi danh mục nhiều mã."""
-    c = _update(ticker, max_age=SIGNAL_MAX_AGE)
-    m = _metrics(ticker, c.get("ticks", []), big_value, window_min)
+def _score_cacheable(big_value: float, window_min: int) -> bool:
+    """Chỉ cache điểm khi dùng THAM SỐ MẶC ĐỊNH (tránh cache lẫn nhiều ngưỡng)."""
+    return big_value == BIG_VALUE_VND and window_min == WINDOW_MIN
+
+
+def compute_and_cache_signal(ticker: str, big_value: float = BIG_VALUE_VND,
+                             window_min: int = WINDOW_MIN, force: bool = False) -> dict:
+    """Tính điểm Shark rồi ghi cache. force=True bỏ qua throttle (dùng cho batch cuối phiên)."""
+    tk = ticker.upper()
+    c = _update(tk, max_age=(0.0 if force else SIGNAL_MAX_AGE))
+    m = _metrics(tk, c.get("ticks", []), big_value, window_min)
     m.pop("big_orders", None)   # list view không cần chi tiết lệnh lớn
     if "err" in c and m.get("empty"):
         m["error"] = c["err"]
+    if _score_cacheable(big_value, window_min) and not m.get("empty"):
+        try:
+            tape_store.save_score(tk, _today(), m, big_value,
+                                  complete=not _is_trading_hours())
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️  save_score {tk}: {e}", flush=True)
     return m
+
+
+def get_signal(ticker: str, big_value: float = BIG_VALUE_VND, window_min: int = WINDOW_MIN) -> dict:
+    """Tín hiệu gọn (không kèm tape) — cho danh sách nhiều mã.
+
+    NGOÀI PHIÊN: nếu đã có cache điểm chốt cuối phiên (complete) → trả NGAY, không
+    _update/_metrics lại (điểm cả phiên không đổi khi thị trường đóng) → mở watchlist
+    /Shark Action tức thì, không tốn CPU tính lại trên hàng chục nghìn tick.
+    TRONG PHIÊN: tính lại (throttle SIGNAL_MAX_AGE) và cập nhật cache."""
+    tk = ticker.upper()
+    if not _is_trading_hours() and _score_cacheable(big_value, window_min):
+        cached = tape_store.load_score(tk, _today())
+        if cached and cached.get("complete") and cached.get("big_value") == big_value:
+            return cached["signal"]
+    return compute_and_cache_signal(tk, big_value, window_min)
 
 
 def get_tape(ticker: str, limit: int = 2000, big_value: float = BIG_VALUE_VND,

@@ -407,6 +407,15 @@ def _get_account_by_id(acct_id: str, user_id: str) -> Optional[dict]:
 
 # ── Watchlists ────────────────────────────────────────────────────────────────
 
+def all_watchlist_tickers() -> List[str]:
+    """Tất cả mã (distinct) trong MỌI watchlist — cho batch tính điểm Shark cuối phiên."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT UPPER(ticker) AS t FROM watchlist_items ORDER BY t"
+        ).fetchall()
+    return [r["t"] for r in rows if r["t"]]
+
+
 def get_watchlists(user_id: str) -> List[dict]:
     """Trả về watchlists kèm items."""
     with _connect() as conn:

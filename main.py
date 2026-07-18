@@ -18,10 +18,11 @@ from app.routers import shark
 alert_task = None
 daily_task = None
 rs_task = None
+shark_eod_task = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global alert_task, daily_task, rs_task
+    global alert_task, daily_task, rs_task, shark_eod_task
     ohlcv_store.init_db()
     user_store.init_db()
     # Cache tape trong phiên (bền vững) — init + dọn tape cũ > 5 ngày
@@ -40,6 +41,7 @@ async def lifespan(app: FastAPI):
     alert_task = asyncio.create_task(run_alert_engine())
     daily_task = asyncio.create_task(daily_update_scheduler())
     rs_task = asyncio.create_task(_rs_rating_scheduler())
+    shark_eod_task = asyncio.create_task(_shark_eod_scheduler())
     # Load VNINDEX khi khởi động (không block, chạy background)
     asyncio.create_task(_warmup_vnindex())
     yield
@@ -49,9 +51,44 @@ async def lifespan(app: FastAPI):
         daily_task.cancel()
     if rs_task:
         rs_task.cancel()
+    if shark_eod_task:
+        shark_eod_task.cancel()
     from app.services import dnse_feed
     await dnse_feed.stop()
     await market_service.stop()
+
+
+async def _shark_eod_scheduler():
+    """Chốt điểm Shark cuối phiên cho MỌI mã trong watchlist.
+
+    Sau khi thị trường đóng (~15:05), tính 1 lần điểm Shark cả phiên cho tất cả mã
+    watchlist rồi lưu cache complete → ngoài giờ mở watchlist/Shark Action là có ngay,
+    không phải tính lại trên hàng chục nghìn tick. Chỉ chạy 1 lần mỗi phiên."""
+    from datetime import datetime
+    from app.services import shark_monitor, user_store
+    done_for = None
+    await asyncio.sleep(60)   # chờ khởi động ổn định
+    while True:
+        try:
+            now = datetime.now()
+            after_close = now.weekday() < 5 and (now.hour * 60 + now.minute) >= 15 * 60 + 5
+            today = now.strftime("%Y-%m-%d")
+            if after_close and done_for != today:
+                tickers = user_store.all_watchlist_tickers()
+                ok = 0
+                for tk in tickers:
+                    try:
+                        m = shark_monitor.compute_and_cache_signal(tk, force=True)
+                        if not m.get("empty"):
+                            ok += 1
+                    except Exception as e:  # noqa: BLE001
+                        print(f"⚠️  shark EOD {tk}: {type(e).__name__}: {e}", flush=True)
+                    await asyncio.sleep(0.3)   # nhẹ tay, tránh dội nguồn dữ liệu
+                done_for = today
+                print(f"🦈 Shark EOD: đã chốt điểm {ok}/{len(tickers)} mã watchlist", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️  Shark EOD scheduler: {e}", flush=True)
+        await asyncio.sleep(600)   # kiểm tra mỗi 10'
 
 async def _warmup_vnindex():
     """Load VNINDEX data ngay khi server start, không block lifespan."""
