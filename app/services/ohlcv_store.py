@@ -202,6 +202,15 @@ def get_last_date(ticker: str) -> Optional[str]:
     return row["last_date"] if row else None
 
 
+def get_ohlcv_first_date(ticker: str) -> Optional[str]:
+    """Ngày OHLCV CŨ NHẤT trong bảng ohlcv — để refetch giữ nguyên bề dày lịch sử."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT MIN(date) AS d FROM ohlcv WHERE ticker=?", (ticker.upper(),)
+        ).fetchone()
+    return row["d"] if row and row["d"] else None
+
+
 def get_ohlcv_last_date(ticker: str) -> Optional[str]:
     """Ngày OHLCV MỚI NHẤT thực tế trong bảng ohlcv (dùng để so cache analyze —
     tự nhất quán với dữ liệu đã lưu, không lệ thuộc backfill_status)."""

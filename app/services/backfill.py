@@ -338,14 +338,10 @@ async def daily_update() -> Dict:
     """Cập nhật tất cả ticker trong store từ last_date (+1) → hôm nay.
     Chạy tự động lúc 16:00 Việt Nam.
 
-    Tự động phát hiện điều chỉnh giá (corporate action: thưởng CP, tách/gộp cổ phiếu):
-    Nếu open của ngày mới lệch > GAP_THRESHOLD so với close cuối → re-fetch toàn bộ lịch sử
-    để lấy giá đã được điều chỉnh ngược từ data provider.
+    Tự động phát hiện ĐIỀU CHỈNH GIÁ NGƯỢC (thưởng CP / cổ tức CP / tách-gộp) bằng cách
+    fetch cửa sổ CHỒNG LẤN rồi so khớp giá cùng ngày store↔nguồn: lệch >1% ⇒ đã điều
+    chỉnh ⇒ refetch toàn bộ. Bắt được cả cổ tức CP nhỏ (5-15%) mà ngưỡng 15% cũ bỏ sót.
     """
-    # Gap > 15%: dấu hiệu corporate action (thưởng CP, tách cổ phiếu, quyền mua...)
-    # Thay đổi thông thường trong phiên hiếm khi vượt 15% (trần sàn VN thường ±7%)
-    GAP_THRESHOLD = 0.15
-
     tickers = ohlcv_store.list_tickers()
     if not tickers:
         return {"updated": 0, "total": 0, "message": "store empty"}
@@ -356,31 +352,30 @@ async def daily_update() -> Dict:
         last = ohlcv_store.get_last_date(t)
         if last and last >= today:
             continue
-        if last:
-            nxt = (datetime.strptime(last, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
-        else:
-            nxt = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
         try:
-            # Lấy close cuối trước khi fetch (để so sánh gap)
-            prev_close = ohlcv_store.get_last_close(t)
+            # Fetch 1 lần: cửa sổ CHỒNG LẤN (so khớp điều chỉnh) + ngày mới.
+            if last:
+                ov_start = (datetime.strptime(last, "%Y-%m-%d")
+                            - timedelta(days=OVERLAP_DAYS)).strftime("%Y-%m-%d")
+            else:
+                ov_start = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
 
-            n = await _backfill_one(t, nxt, today)
+            df = await _fetch_only(t, ov_start, today)
+            if df is None or df.empty:
+                continue
 
-            # Phát hiện corporate action: so sánh close cũ với open mới
-            if n > 0 and prev_close and prev_close > 0:
-                new_close = ohlcv_store.get_last_close(t)
-                if new_close and new_close > 0:
-                    gap = abs(new_close - prev_close) / prev_close
-                    if gap > GAP_THRESHOLD:
-                        print(
-                            f"🔔 Corporate action detected {t}: "
-                            f"prev_close={prev_close:.1f} → new_close={new_close:.1f} "
-                            f"gap={gap*100:.1f}% > {GAP_THRESHOLD*100:.0f}% → re-fetch full history",
-                            flush=True,
-                        )
-                        await refetch_ticker(t)
-                        readjusted.append(t)
+            # Điều chỉnh ngược? So giá cùng ngày trên phần chồng lấn.
+            if last:
+                stored = ohlcv_store.get_ohlcv(t, ov_start, last)
+                if _price_mismatch(stored, df):
+                    print(f"🔔 {t}: phát hiện điều chỉnh giá ngược → refetch toàn bộ", flush=True)
+                    await refetch_ticker(t)
+                    readjusted.append(t)
+                    updated += 1
+                    continue
 
+            n = await asyncio.get_event_loop().run_in_executor(
+                None, ohlcv_store.upsert_ohlcv, t, df)
             if n > 0:
                 updated += 1
         except BaseException as e:
@@ -401,15 +396,86 @@ async def daily_update() -> Dict:
 async def refetch_ticker(ticker: str, years: int = 3) -> int:
     """Xoá OHLCV cũ và fetch lại toàn bộ lịch sử cho 1 ticker.
     Dùng khi phát hiện corporate action (giá điều chỉnh ngược) hoặc gọi thủ công.
+    GIỮ NGUYÊN bề dày lịch sử: refetch từ first_date đã có (không co lại còn `years`).
     Trả về số rows đã ghi."""
     t = ticker.upper()
-    start = (datetime.now() - timedelta(days=365 * years)).strftime("%Y-%m-%d")
+    first = ohlcv_store.get_ohlcv_first_date(t)   # giữ span cũ nếu đã backfill dài
+    default_start = (datetime.now() - timedelta(days=365 * years)).strftime("%Y-%m-%d")
+    start = min(first, default_start) if first else default_start
     end   = datetime.now().strftime("%Y-%m-%d")
-    print(f"🔄 refetch_ticker {t}: xoá cache cũ, fetch lại {years} năm [{start}..{end}]", flush=True)
+    print(f"🔄 refetch_ticker {t}: xoá cache cũ, fetch lại [{start}..{end}]", flush=True)
     ohlcv_store.delete_ohlcv(t)
-    n = await _backfill_one(t, start, end, timeout=90.0)
+    n = await _backfill_one(t, start, end, timeout=120.0)
     print(f"✅ refetch_ticker {t}: {n} rows", flush=True)
     return n
+
+
+# ── Phát hiện ĐIỀU CHỈNH GIÁ NGƯỢC (thưởng CP / cổ tức CP / tách-gộp) ──────────────
+# Cách cũ (so close cuối trước/sau khi thêm ngày mới, ngưỡng 15%) bỏ SÓT cổ tức CP
+# nhỏ (5-15%) và phụ thuộc daily_update chạy đúng ex-date. Cách mới: SO KHỚP GIÁ CÙNG
+# NGÀY giữa store và nguồn trên một cửa sổ chồng lấn — nguồn luôn trả giá đã điều chỉnh
+# ngược, nên nếu giá cùng 1 ngày lệch >1% ⇒ đã có điều chỉnh ⇒ refetch toàn bộ.
+OVERLAP_DAYS = 12          # ~8 phiên chồng lấn để so khớp
+ADJ_EPS = 0.01             # lệch >1% ở ngày chung = đã điều chỉnh (bỏ nhiễu làm tròn)
+
+
+async def _fetch_only(ticker: str, start: str, end: str, timeout: float = 45.0):
+    """Fetch OHLCV nhưng KHÔNG upsert — để so khớp trước khi quyết định."""
+    from app.services import data_source
+    if not data_source.use_dnse("ohlcv"):
+        await market_service._limiter.acquire()
+    loop = asyncio.get_event_loop()
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, _fetch_history_sync, ticker, start, end),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        return None
+
+
+def _price_mismatch(stored, fresh, eps: float = ADJ_EPS) -> bool:
+    """True nếu giá đóng cửa CÙNG NGÀY lệch > eps giữa store và nguồn (đã điều chỉnh)."""
+    if stored is None or fresh is None or stored.empty or fresh.empty:
+        return False
+    s = stored.set_index("date")["close"]
+    f = fresh.set_index("date")["close"]
+    common = [d for d in s.index if d in f.index]
+    if len(common) < 3:
+        return False
+    for d in common[-6:]:
+        sv, fv = float(s.loc[d]), float(f.loc[d])
+        if sv > 0 and abs(fv - sv) / sv > eps:
+            return True
+    return False
+
+
+async def verify_and_readjust(tickers: Optional[List[str]] = None) -> Dict:
+    """Rà tất cả (hoặc 1 nhóm) ticker: nếu giá lịch sử đã bị điều chỉnh ngược ở nguồn
+    mà store chưa cập nhật → refetch toàn bộ. Sửa dữ liệu tồn đọng mà không phải
+    refetch từng mã thủ công."""
+    tickers = tickers or ohlcv_store.list_tickers()
+    checked, readjusted, failed = 0, [], 0
+    for t in tickers:
+        last = ohlcv_store.get_last_date(t)
+        if not last:
+            continue
+        try:
+            ov_start = (datetime.strptime(last, "%Y-%m-%d")
+                        - timedelta(days=OVERLAP_DAYS)).strftime("%Y-%m-%d")
+            fresh = await _fetch_only(t, ov_start, last)
+            stored = ohlcv_store.get_ohlcv(t, ov_start, last)
+            if _price_mismatch(stored, fresh):
+                await refetch_ticker(t)
+                readjusted.append(t)
+            checked += 1
+        except BaseException as e:  # noqa: BLE001
+            failed += 1
+            print(f"❌ verify {t}: {type(e).__name__}: {e}", flush=True)
+        await asyncio.sleep(0.05)
+    msg = f"verify_and_readjust: {checked} checked, {len(readjusted)} readjusted, {failed} failed"
+    print(f"✅ {msg}: {readjusted}", flush=True)
+    return {"checked": checked, "readjusted": readjusted, "failed": failed, "message": msg}
 
 
 async def refresh_fundamentals() -> Dict:

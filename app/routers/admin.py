@@ -196,6 +196,43 @@ async def refetch_ticker_ohlcv(
     return {"ticker": ticker.upper(), "rows_fetched": n, "years": years, "ok": n > 0}
 
 
+_readjust_running = {"on": False, "result": None}
+
+
+@router.post("/ohlcv/verify-adjust")
+async def verify_adjust(scope: Optional[str] = Query(
+        default=None, description="VN30 | HOSE | HNX | UPCOM | ALL | csv; bỏ trống = toàn store")):
+    """Rà điều chỉnh giá ngược (thưởng CP / cổ tức CP / tách-gộp) cho toàn bộ (hoặc 1
+    nhóm) mã và refetch những mã bị lệch. Chạy NỀN — trả về ngay, xem tiến độ ở log.
+    Dùng để sửa dữ liệu tồn đọng mà không phải refetch từng mã thủ công."""
+    if _readjust_running["on"]:
+        return {"ok": False, "message": "đang chạy rồi — chờ hoàn tất"}
+
+    tickers = None
+    if scope:
+        try:
+            tickers = await backfill.get_tickers_for_scope(scope)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(e))
+
+    async def _run():
+        _readjust_running["on"] = True
+        try:
+            _readjust_running["result"] = await backfill.verify_and_readjust(tickers)
+        finally:
+            _readjust_running["on"] = False
+
+    asyncio.create_task(_run())
+    n = len(tickers) if tickers else "toàn bộ"
+    return {"ok": True, "message": f"Đã bắt đầu rà điều chỉnh giá ({n} mã) — xem log/tiến độ."}
+
+
+@router.get("/ohlcv/verify-adjust/status")
+async def verify_adjust_status():
+    """Trạng thái lần rà điều chỉnh gần nhất."""
+    return {"running": _readjust_running["on"], "result": _readjust_running["result"]}
+
+
 @router.post("/stock-list/refresh")
 async def refresh_stock_list():
     """Fetch toàn bộ danh sách mã CK từ vnstock Listing và lưu vào SQLite.
