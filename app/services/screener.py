@@ -1820,7 +1820,15 @@ class ScreenerService:
         quote = market_service.quotes.get(ticker, {})
         current_price = float(quote.get("price", df['close'].iloc[-1]))
         change_pct    = float(quote.get("change_pct", 0))
+        # Khối lượng hôm nay: ưu tiên quote realtime; nếu chưa có (ngoài phiên/quote
+        # chưa về) thì lấy KL của bar OHLCV cuối. Nhờ vậy result cache LUÔN có volume
+        # → Volx hiện ngay từ cache như các cột khác, không phải chờ luồng giá realtime.
         volume        = int(quote.get("volume", 0))
+        if volume <= 0:
+            try:
+                volume = int(df['volume'].iloc[-1])
+            except (KeyError, IndexError, ValueError, TypeError):
+                volume = 0
 
         # Quy đổi sang nghìn VND để khớp đơn vị df.close
         cur_kvnd = current_price / 1000.0 if current_price > 1000 else current_price
