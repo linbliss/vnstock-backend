@@ -287,8 +287,21 @@ def _touch(ticker: str, deep: bool = False) -> None:
 
 
 def _demanded() -> list:
+    """Mã đang xem (còn trong TTL), SẮP THEO ƯU TIÊN để worker nền xử lý:
+      1. Mã CHƯA seed (cần nạp lần đầu) — lên đầu để bấm vào là có ngay
+      2. Mã đang xem CHI TIẾT (deep) trước mã chỉ trong list
+      3. Mã được bấm GẦN ĐÂY NHẤT trước
+    Nhờ vậy mã vừa bấm luôn ở đầu hàng đợi, seed trong ≤1 vòng (~3s)."""
     now = time.time()
-    return [t for t, ts in _demand.items() if now - ts < DEMAND_TTL]
+    live = [(t, ts) for t, ts in _demand.items() if now - ts < DEMAND_TTL]
+
+    def _key(item):
+        t, ts = item
+        seeded = (_cache.get(t) or {}).get("seeded", False)
+        return (0 if not seeded else 1, 0 if t in _deep_want else 1, -ts)
+
+    live.sort(key=_key)
+    return [t for t, _ in live]
 
 
 def _ensure_deep(tk: str) -> None:
