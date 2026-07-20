@@ -541,10 +541,34 @@ def _adaptive_big_value(ticks: List[dict]) -> float:
     return float(max(BIG_MIN_VND, min(BIG_MAX_VND, vals[k])))
 
 
-def _tick_pct(price_k: float) -> float:
-    """1 bước giá HOSE quy ra % giá (giá tính bằng kVND)."""
+_exch_memo: Dict[str, str] = {}
+
+
+def _exchange_of(tk: str) -> str:
+    """Sàn của mã (nhớ trong RAM). Mặc định HOSE nếu chưa có trong stock_list."""
+    tk = tk.upper()
+    if tk in _exch_memo:
+        return _exch_memo[tk]
+    ex = "HOSE"
+    try:
+        from app.services import ohlcv_store
+        ex = (ohlcv_store.get_exchange(tk) or "HOSE").upper()
+    except Exception:  # noqa: BLE001
+        pass
+    _exch_memo[tk] = ex
+    return ex
+
+
+def _tick_pct(price_k: float, exchange: str = "HOSE") -> float:
+    """1 bước giá quy ra % giá (giá tính bằng kVND).
+
+    HOSE chia bậc theo giá (10đ/50đ/100đ), còn HNX & UPCOM dùng 100đ ĐỒNG NHẤT mọi mức
+    giá. Dùng công thức HOSE cho mã HNX giá thấp sẽ cho ngưỡng nhỏ hơn thực tế tới 10×
+    (mã 8k: 0.125% so với 1.25% thật)."""
     if price_k <= 0:
         return 0.25
+    if exchange in ("HNX", "UPCOM"):
+        return 0.10 / price_k * 100.0
     step = 0.01 if price_k < 10 else (0.05 if price_k < 50 else 0.10)
     return step / price_k * 100.0
 
@@ -595,7 +619,8 @@ def _window_agg(ticks: List[dict], window_min: int):
     return wb, ws
 
 
-def _detect_manip(ticks: List[dict], big_value: float, follow: int = 30) -> dict:
+def _detect_manip(ticks: List[dict], big_value: float, follow: int = 30,
+                  exchange: str = "HOSE") -> dict:
     """Rũ hàng / kéo giá — bản SIẾT để không còn là tautology.
 
     Bản cũ chỉ đòi "sau lệnh MUA lớn có một lệnh BÁN giá thấp hơn & KL nhỏ hơn". Vì lệnh
@@ -615,8 +640,12 @@ def _detect_manip(ticks: List[dict], big_value: float, follow: int = 30) -> dict
         return {"manip": 0.0, "shakeout": 0, "uptrap": 0, "min_dip_pct": 0.0}
     prices = [t["price"] for t in ticks]
     mean_p = sum(prices) / n
-    rng_pct = (max(prices) - min(prices)) / mean_p * 100.0 if mean_p else 0.0
-    min_dip = max(2.0 * _tick_pct(mean_p), 0.25 * rng_pct, 0.4)
+    # Chuẩn hoá bằng BIẾN ĐỘNG CỤC BỘ (median |Δ| giữa các tick), KHÔNG dùng biên độ cả
+    # phiên: biên độ chỉ tăng theo thời gian ⇒ ngưỡng phình dần (đo được 0.50%→1.04%)
+    # ⇒ detector mù dần về cuối phiên, đúng lúc thanh khoản cao nhất.
+    diffs = sorted(abs(prices[i] - prices[i - 1]) for i in range(1, n))
+    med_move_pct = (diffs[len(diffs) // 2] / mean_p * 100.0) if diffs and mean_p else 0.0
+    min_dip = max(2.0 * _tick_pct(mean_p, exchange), 6.0 * med_move_pct, 0.4)
 
     big_idx = [i for i, t in enumerate(ticks) if t["value"] >= big_value]
     shake = trap = 0
@@ -626,15 +655,25 @@ def _detect_manip(ticks: List[dict], big_value: float, follow: int = 30) -> dict
         if len(wnd) < 5:
             continue
         px = [w["price"] for w in wnd]
-        bv = sum(w["volume"] for w in wnd if w["side"] == "B")
-        sv = sum(w["volume"] for w in wnd if w["side"] == "S")
-        tot = (bv + sv) or 1
+        # Đo lực ép CHỈ TRÊN NHÁNH ÉP (từ lệnh lớn tới đáy/đỉnh), KHÔNG trên toàn cửa sổ.
+        # Cửa sổ buộc phải chứa nhánh HỒI để thoả điều kiện "giá hồi lại", mà nhánh hồi
+        # toàn lệnh ngược chiều ⇒ pha loãng tỉ lệ xuống dưới 0.55 ⇒ cú rũ càng hồi mạnh
+        # càng KHÓ bị phát hiện — ngược hoàn toàn với ý đồ (đo được: nhánh hồi dài thì
+        # độ nhạy tụt 88%→72%).
         if b["side"] == "B":
-            dip = (b["price"] - min(px)) / b["price"] * 100.0
+            k = px.index(min(px))                       # vị trí ĐÁY
+            dip = (b["price"] - px[k]) / b["price"] * 100.0
+            leg = wnd[:k + 1]                           # nhánh GIẢM
+            sv = sum(w["volume"] for w in leg if w["side"] == "S")
+            tot = sum(w["volume"] for w in leg) or 1
             if dip >= min_dip and sv / tot > 0.55 and px[-1] >= b["price"]:
                 shake += 1
         elif b["side"] == "S":
-            pump = (max(px) - b["price"]) / b["price"] * 100.0
+            k = px.index(max(px))                       # vị trí ĐỈNH
+            pump = (px[k] - b["price"]) / b["price"] * 100.0
+            leg = wnd[:k + 1]                           # nhánh TĂNG
+            bv = sum(w["volume"] for w in leg if w["side"] == "B")
+            tot = sum(w["volume"] for w in leg) or 1
             if pump >= min_dip and bv / tot > 0.55 and px[-1] <= b["price"]:
                 trap += 1
     # Giữ mẫu số có sàn (như bản cũ) để tape mỏng không cho điểm nhiễu
@@ -643,7 +682,7 @@ def _detect_manip(ticks: List[dict], big_value: float, follow: int = 30) -> dict
             "min_dip_pct": round(min_dip, 3)}
 
 
-def _behavior(ticks: List[dict], big_value: float) -> dict:
+def _behavior(ticks: List[dict], big_value: float, exchange: str = "HOSE") -> dict:
     """Phát hiện HÀNH VI thao túng của cá mập từ chuỗi khớp lệnh (order-flow / tape reading).
     Trả các thành phần [-1..1] (dương = gom, âm = xả) + cờ mô tả để hiển thị.
 
@@ -676,7 +715,7 @@ def _behavior(ticks: List[dict], big_value: float) -> dict:
         flags.append("Hấp thụ lực mua (xả)")
 
     # 2) MÁNH quanh LỆNH LỚN — rũ hàng gom / kéo giá xả (đã siết, xem _detect_manip)
-    mp = _detect_manip(ticks, big_value)
+    mp = _detect_manip(ticks, big_value, exchange=exchange)
     manip, shakeout, uptrap = mp["manip"], mp["shakeout"], mp["uptrap"]
     if shakeout:
         flags.append(f"Rũ hàng gom ×{shakeout}")
@@ -733,7 +772,7 @@ def _metrics(ticker: str, ticks: List[dict], big_value: float, window_min: int) 
     w_imbalance = (w_buy - w_sell) / w_total if w_total else 0.0
 
     # Hành vi thao túng (tape reading): hấp thụ / rũ hàng-kéo giá / spring-upthrust
-    beh = _behavior(ticks, big_value)
+    beh = _behavior(ticks, big_value, exchange=_exchange_of(tk))
 
     # PHÂN KỲ lớn/nhỏ — thành phần độc lập, trước đây không hề đo
     dv = _divergence(ticks, big_value)

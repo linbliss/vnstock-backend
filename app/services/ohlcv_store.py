@@ -492,6 +492,15 @@ def get_stock_list() -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+def get_exchange(ticker: str) -> Optional[str]:
+    """Sàn của 1 mã (HOSE/HNX/UPCOM) — cần cho BƯỚC GIÁ (HOSE chia bậc, HNX/UPCOM 100đ)."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT exchange FROM stock_list WHERE ticker=?", (ticker.upper(),)
+        ).fetchone()
+    return (row["exchange"] or "").upper() if row and row["exchange"] else None
+
+
 def get_tickers_by_exchange(exchange: str) -> List[str]:
     """Danh sách mã của 1 sàn từ bảng stock_list.
 
