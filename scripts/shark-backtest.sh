@@ -7,7 +7,7 @@
 #
 #   bash scripts/shark-backtest.sh            # T+1, T+3, T+5
 #   bash scripts/shark-backtest.sh 1,3,5,10   # tuỳ chọn kỳ hạn
-#   HORIZONS=1,5 MIN_DATE=2026-06-01 bash scripts/shark-backtest.sh
+#   MIN_DATE=2026-06-01 bash scripts/shark-backtest.sh
 set -e
 BASE="${BASE:-http://localhost:8000}"
 HORIZONS="${1:-${HORIZONS:-1,3,5}}"
@@ -21,24 +21,34 @@ fi
 URL="$BASE/api/admin/shark/backtest?horizons=$HORIZONS"
 [ -n "$MIN_DATE" ] && URL="$URL&min_date=$MIN_DATE"
 
-curl -s -H "X-Admin-Token: $TOKEN" "$URL" | python3 -c '
-import sys, json
-d = json.load(sys.stdin)
-if not d.get("ok"):
-    print("⚠️ ", d.get("message", d)); sys.exit(0)
+TMP="$(mktemp)"
+trap 'rm -f "$TMP"' EXIT
+curl -s -H "X-Admin-Token: $TOKEN" "$URL" >"$TMP"
 
-print(f"Mẫu: {d[\"n_matched\"]} tín hiệu / {d[\"n_tickers\"]} mã  ({d[\"date_from\"]} → {d[\"date_to\"]})")
-print(d["note"]); print()
+python3 - "$TMP" <<'PY'
+import sys, json
+d = json.load(open(sys.argv[1]))
+if not d.get("ok"):
+    print("⚠️ ", d.get("message", d))
+    sys.exit(0)
+
+print("Mẫu: {} tín hiệu / {} mã  ({} → {})".format(
+    d["n_matched"], d["n_tickers"], d["date_from"], d["date_to"]))
+print(d["note"])
+print()
 for h, blk in d["horizons"].items():
-    print(f"── {h}  (nền = {blk[\"baseline_mean_pct\"]:+.2f}%) " + "─"*30)
-    print(f'   {"nhóm":<12}{"n":>6}{"TB %":>9}{"thắng %":>9}{"EDGE %":>9}{"t":>7}  kết luận')
+    print("── {}  (nền = {:+.2f}%) ".format(h, blk["baseline_mean_pct"]) + "─" * 28)
+    print("   {:<12}{:>6}{:>9}{:>9}{:>9}{:>7}  kết luận".format(
+        "nhóm", "n", "TB %", "thắng %", "EDGE %", "t"))
     for name in ("Gom hàng", "Trung tính", "Xả hàng"):
-        b = blk["buckets"].get(name, {})
+        b = blk["buckets"].get(name) or {}
         if not b.get("n"):
-            print(f'   {name:<12}{0:>6}   (không có mẫu)'); continue
+            print("   {:<12}{:>6}   (không có mẫu)".format(name, 0))
+            continue
         verdict = "CÓ tín hiệu" if b["significant"] else "chưa phân biệt được với nhiễu"
-        print(f'   {name:<12}{b["n"]:>6}{b["mean_pct"]:>9.2f}{b["win_rate_pct"]:>9.1f}'
-              f'{b["edge_vs_base_pct"]:>9.2f}{b["t_stat"]:>7.1f}  {verdict}')
+        print("   {:<12}{:>6}{:>9.2f}{:>9.1f}{:>9.2f}{:>7.1f}  {}".format(
+            name, b["n"], b["mean_pct"], b["win_rate_pct"],
+            b["edge_vs_base_pct"], b["t_stat"], verdict))
     print()
 print("Đọc kết quả:", d["how_to_read"])
-'
+PY
