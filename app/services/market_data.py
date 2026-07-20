@@ -32,6 +32,7 @@ class MarketDataService:
     def __init__(self):
         self.quotes: Dict[str, dict] = {}
         self.subscribed: set         = set()
+        self._screener_subs: set     = set()   # mã do screener đăng ký (tự thay thế)
         self.listeners: List[Callable] = []
         self._task    = None
         self._running = False
@@ -75,6 +76,22 @@ class MarketDataService:
         for t in tickers:
             self.subscribed.add(t.upper())
         self._register_ws(tickers)
+
+    def subscribe_screener(self, tickers: List[str], cap: int = 40):
+        """Đăng ký giá realtime cho các mã LỌT KẾT QUẢ screener.
+
+        Khác subscribe() thường: bộ này TỰ THAY THẾ mỗi lần quét (bỏ mã của lần quét
+        trước) và bị CHẶN TRẦN — vì subscribe() chỉ thêm chứ không bao giờ gỡ, quét
+        nhiều lần sẽ phình set vô hạn làm nặng vòng poll KBS (35 lệnh/phút) và ăn hết
+        trần 100 subscription của DNSE WS (tranh chỗ với Shark).
+        Mã nào nguồn khác vẫn cần sẽ được /api/quotes tự đăng ký lại ở nhịp kế tiếp."""
+        new = {t.upper() for t in tickers[:cap] if t}
+        for t in getattr(self, "_screener_subs", set()) - new:
+            self.subscribed.discard(t)
+        self._screener_subs = new
+        for t in new:
+            self.subscribed.add(t)
+        self._register_ws(list(new))
 
     @staticmethod
     def _register_ws(tickers: List[str]) -> None:

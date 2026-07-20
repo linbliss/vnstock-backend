@@ -1703,6 +1703,16 @@ class ScreenerService:
 
         # Sắp xếp theo tổng điểm
         results.sort(key=lambda x: x.get("total_score", 0), reverse=True)
+
+        # ĐĂNG KÝ GIÁ REALTIME cho các mã LỌT KẾT QUẢ (thường vài chục mã, không phải
+        # cả sàn) → lần quét/refresh sau chúng có giá & KL hôm nay thay vì T-1.
+        # Không thể subscribe cả sàn: KBS bị bóp 35 lệnh/phút, DNSE WS trần 100 mã.
+        try:
+            hits = [r["ticker"] for r in results if r.get("ticker")]
+            if hits:
+                market_service.subscribe_screener(hits)
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️  subscribe kết quả screener: {type(e).__name__}: {e}", flush=True)
         return results
 
     async def build_snapshot(self, exchange: str, min_score: int = 5) -> dict:
@@ -1781,12 +1791,19 @@ class ScreenerService:
         # ✅ uptrend, MA stack, gain_12m, swing points → ổn định như EOD
         # ⚠️ close[-1] vẫn là T-1 close — nhưng alert/UI dùng quote.price
         #    (đã realtime), nên không bị ảnh hưởng.
+        #
+        # QUAN TRỌNG — điều kiện `intra_vol > 0` cũ gây CẢNH BÁO MUA SAI ĐẦU PHIÊN:
+        # lúc 9:0x mã chưa khớp ⇒ intra_vol = 0 ⇒ BỎ QUA merge ⇒ df giữ KL CẢ NGÀY
+        # HÔM QUA ⇒ vol_ratio ≈ 1+ ⇒ kích hoạt tiêu chí "bùng nổ khối lượng" dù thực
+        # tế chưa có giao dịch nào. Nay: hễ CÓ quote realtime thì lấy KL hôm nay kể cả
+        # bằng 0 (0 là sự thật của đầu phiên). Không có quote → đành giữ T-1 (không có
+        # cách nào biết KL hôm nay), nhưng các mã lọt kết quả đã được subscribe nên
+        # lần quét/refresh kế tiếp sẽ có số thật.
         try:
-            q_intra = market_service.quotes.get(ticker, {})
-            intra_vol = int(q_intra.get("volume") or 0)
-            if is_trading_hour and intra_vol > 0 and len(df) > 0:
+            q_intra = market_service.quotes.get(ticker)
+            if is_trading_hour and q_intra is not None and len(df) > 0:
                 df = df.copy()
-                df.at[df.index[-1], 'volume'] = intra_vol
+                df.at[df.index[-1], 'volume'] = int(q_intra.get("volume") or 0)
         except Exception as e:
             print(f"⚠️  Intraday volume merge {ticker}: {type(e).__name__}: {e}")
 
