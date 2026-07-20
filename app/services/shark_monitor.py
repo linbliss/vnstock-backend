@@ -522,6 +522,127 @@ def _parse_ts(ts: str) -> Optional[datetime]:
         return None
 
 
+# ── Ngưỡng "lệnh lớn" THÍCH ỨNG theo từng mã ─────────────────────────────────────
+# Ngưỡng tuyệt đối 1 tỷ đổi nghĩa hoàn toàn theo thanh khoản: với smallcap 300k cp/phiên
+# thì 1 lệnh 1 tỷ ≈ 42% KL phiên (không bao giờ có); với bluechip 25M cp thì ≈ 0.14%
+# (xảy ra liên tục). Nên "lớn" phải định nghĩa TƯƠNG ĐỐI so với chính mã đó.
+BIG_PCTILE = 97.0
+BIG_MIN_VND = 200_000_000
+BIG_MAX_VND = 5_000_000_000
+SCORE_VERSION = 2          # đổi công thức ⇒ cache điểm cũ không còn so sánh được
+
+
+def _adaptive_big_value(ticks: List[dict]) -> float:
+    """Ngưỡng lệnh lớn = percentile giá trị lệnh CỦA CHÍNH MÃ ĐÓ trong phiên (kẹp biên)."""
+    if len(ticks) < 200:
+        return BIG_VALUE_VND
+    vals = sorted(t["value"] for t in ticks)
+    k = min(int(len(vals) * BIG_PCTILE / 100.0), len(vals) - 1)
+    return float(max(BIG_MIN_VND, min(BIG_MAX_VND, vals[k])))
+
+
+def _tick_pct(price_k: float) -> float:
+    """1 bước giá HOSE quy ra % giá (giá tính bằng kVND)."""
+    if price_k <= 0:
+        return 0.25
+    step = 0.01 if price_k < 10 else (0.05 if price_k < 50 else 0.10)
+    return step / price_k * 100.0
+
+
+def _divergence(ticks: List[dict], big_value: float) -> dict:
+    """PHÂN KỲ lớn/nhỏ — tín hiệu độc lập với 'hướng dòng tiền tổng'.
+    >0: lệnh LỚN mua ròng trong khi lệnh NHỎ bán ròng → tổ chức gom từ tay yếu."""
+    bb = bs = sb = ss = 0
+    for t in ticks:
+        big = t["value"] >= big_value
+        if t["side"] == "B":
+            if big: bb += t["volume"]
+            else:   sb += t["volume"]
+        elif t["side"] == "S":
+            if big: bs += t["volume"]
+            else:   ss += t["volume"]
+    bt, stt = bb + bs, sb + ss
+    big_dir = (bb - bs) / bt if bt else 0.0
+    sml_dir = (sb - ss) / stt if stt else 0.0
+    valid = bt > 0 and stt > 0 and bt >= 0.02 * (bt + stt)
+    return {"big_dir": round(big_dir, 3), "small_dir": round(sml_dir, 3),
+            "divergence": round(big_dir - sml_dir, 3) if valid else 0.0,
+            "divergence_valid": valid}
+
+
+def _window_agg(ticks: List[dict], window_min: int):
+    """Mua/bán trong cửa sổ cuối — QUÉT NGƯỢC từ cuối nên chỉ parse tick TRONG cửa sổ
+    (O(cửa sổ)), thay vì parse timestamp toàn tape mỗi lần gọi (O(n), 149ms/100k tick)."""
+    if not ticks:
+        return 0, 0
+    last = None
+    for t in reversed(ticks):
+        last = _parse_ts(t["ts"])
+        if last:
+            break
+    if not last:
+        return 0, 0
+    start = last - timedelta(minutes=window_min)
+    wb = ws = 0
+    for t in reversed(ticks):
+        dt = _parse_ts(t["ts"])
+        if dt and dt < start:
+            break
+        if t["side"] == "B":
+            wb += t["volume"]
+        elif t["side"] == "S":
+            ws += t["volume"]
+    return wb, ws
+
+
+def _detect_manip(ticks: List[dict], big_value: float, follow: int = 30) -> dict:
+    """Rũ hàng / kéo giá — bản SIẾT để không còn là tautology.
+
+    Bản cũ chỉ đòi "sau lệnh MUA lớn có một lệnh BÁN giá thấp hơn & KL nhỏ hơn". Vì lệnh
+    lớn luôn có KL lớn hơn lệnh thường nên điều kiện gần như LUÔN đúng → đo thực tế:
+    bật cờ 100% trên phiên NGẪU NHIÊN thuần (200/200 phiên).
+
+    Bản mới đòi đủ 3 yếu tố — hình dạng THẬT của cú rũ:
+      1. Giá bị ép xuống ≥ ngưỡng dip (không phải 1 bước giá lẻ)
+      2. Lực ép là BÁN CHỦ ĐỘNG chiếm ưu thế (>55%)
+      3. Giá HỒI LẠI trên giá lệnh lớn trước khi hết cửa sổ ← mấu chốt bản cũ thiếu
+
+    Ngưỡng dip THÍCH ỨNG (không cố định): phải vượt ~2 bước giá VÀ tỉ lệ với biên độ
+    phiên. Ngưỡng cố định 0.15% là NHỎ HƠN 1 bước giá HOSE ở mức 20k (0.25%) nên bất kỳ
+    nhịp giảm 1 bước nào cũng thoả → vẫn 78% dương tính giả (đã đo)."""
+    n = len(ticks)
+    if n < 20:
+        return {"manip": 0.0, "shakeout": 0, "uptrap": 0, "min_dip_pct": 0.0}
+    prices = [t["price"] for t in ticks]
+    mean_p = sum(prices) / n
+    rng_pct = (max(prices) - min(prices)) / mean_p * 100.0 if mean_p else 0.0
+    min_dip = max(2.0 * _tick_pct(mean_p), 0.25 * rng_pct, 0.4)
+
+    big_idx = [i for i, t in enumerate(ticks) if t["value"] >= big_value]
+    shake = trap = 0
+    for i in big_idx:
+        b = ticks[i]
+        wnd = ticks[i + 1:i + 1 + follow]
+        if len(wnd) < 5:
+            continue
+        px = [w["price"] for w in wnd]
+        bv = sum(w["volume"] for w in wnd if w["side"] == "B")
+        sv = sum(w["volume"] for w in wnd if w["side"] == "S")
+        tot = (bv + sv) or 1
+        if b["side"] == "B":
+            dip = (b["price"] - min(px)) / b["price"] * 100.0
+            if dip >= min_dip and sv / tot > 0.55 and px[-1] >= b["price"]:
+                shake += 1
+        elif b["side"] == "S":
+            pump = (max(px) - b["price"]) / b["price"] * 100.0
+            if pump >= min_dip and bv / tot > 0.55 and px[-1] <= b["price"]:
+                trap += 1
+    # Giữ mẫu số có sàn (như bản cũ) để tape mỏng không cho điểm nhiễu
+    manip = _clamp((shake - trap) / max(3.0, len(big_idx) or 1), -1, 1)
+    return {"manip": round(manip, 3), "shakeout": shake, "uptrap": trap,
+            "min_dip_pct": round(min_dip, 3)}
+
+
 def _behavior(ticks: List[dict], big_value: float) -> dict:
     """Phát hiện HÀNH VI thao túng của cá mập từ chuỗi khớp lệnh (order-flow / tape reading).
     Trả các thành phần [-1..1] (dương = gom, âm = xả) + cờ mô tả để hiển thị.
@@ -554,29 +675,9 @@ def _behavior(ticks: List[dict], big_value: float) -> dict:
         absorption = -min(1.0, net + max(0.0, -price_chg) * 8)
         flags.append("Hấp thụ lực mua (xả)")
 
-    # 2) MÁNH quanh LỆNH LỚN — rũ hàng gom / kéo giá xả + động lượng nối tiếp
-    big_idx = [i for i, t in enumerate(ticks) if t["value"] >= big_value]
-    manip_raw = 0.0
-    shakeout = uptrap = 0
-    for i in big_idx:
-        b = ticks[i]
-        wnd = ticks[i + 1:i + 9]            # 8 khớp ngay sau
-        if not wnd:
-            continue
-        follow_same = sum(1 for w in wnd if w["side"] == b["side"])
-        if b["side"] == "B":
-            # sau MUA lớn có BÁN nhỏ giá THẤP hơn → đạp giá để gom tiếp (rũ hàng)
-            if any(w["side"] == "S" and w["price"] < b["price"] and w["volume"] < b["volume"] for w in wnd):
-                manip_raw += 1.0; shakeout += 1
-            if follow_same >= len(wnd) * 0.6:      # nối tiếp mua → động lượng gom
-                manip_raw += 0.4
-        elif b["side"] == "S":
-            # sau BÁN lớn có MUA nhỏ giá CAO hơn → kéo giá để xả tiếp
-            if any(w["side"] == "B" and w["price"] > b["price"] and w["volume"] < b["volume"] for w in wnd):
-                manip_raw -= 1.0; uptrap += 1
-            if follow_same >= len(wnd) * 0.6:
-                manip_raw -= 0.4
-    manip = _clamp(manip_raw / max(3.0, len(big_idx)), -1, 1)
+    # 2) MÁNH quanh LỆNH LỚN — rũ hàng gom / kéo giá xả (đã siết, xem _detect_manip)
+    mp = _detect_manip(ticks, big_value)
+    manip, shakeout, uptrap = mp["manip"], mp["shakeout"], mp["uptrap"]
     if shakeout:
         flags.append(f"Rũ hàng gom ×{shakeout}")
     if uptrap:
@@ -601,6 +702,10 @@ def _behavior(ticks: List[dict], big_value: float) -> dict:
 
 def _metrics(ticker: str, ticks: List[dict], big_value: float, window_min: int) -> dict:
     tk = ticker.upper()
+    # Người dùng để MẶC ĐỊNH → dùng ngưỡng THÍCH ỨNG theo mã; nếu tự đặt ngưỡng ở
+    # Shark Action thì tôn trọng giá trị đó.
+    if ticks and big_value == BIG_VALUE_VND:
+        big_value = _adaptive_big_value(ticks)
     if not ticks:
         return {
             "ticker": tk, "empty": True, "score": 0, "label": "Chưa có dữ liệu",
@@ -619,22 +724,8 @@ def _metrics(ticker: str, ticks: List[dict], big_value: float, window_min: int) 
     big_sell_val = sum(t["value"] for t in big if t["side"] == "S")
     big_net = big_buy_val - big_sell_val
 
-    # Cửa sổ trượt gần đây theo thời gian tick mới nhất
-    last_dt = None
-    for t in reversed(ticks):
-        last_dt = _parse_ts(t["ts"])
-        if last_dt:
-            break
-    w_buy = w_sell = 0
-    if last_dt:
-        start = last_dt - timedelta(minutes=window_min)
-        for t in ticks:
-            dt = _parse_ts(t["ts"])
-            if dt and dt >= start:
-                if t["side"] == "B":
-                    w_buy += t["volume"]
-                elif t["side"] == "S":
-                    w_sell += t["volume"]
+    # Cửa sổ trượt — quét ngược, chỉ parse tick trong cửa sổ (nhanh hơn nhiều)
+    w_buy, w_sell = _window_agg(ticks, window_min)
 
     imbalance = (total_buy - total_sell) / total_vol if total_vol else 0.0          # -1..1
     big_dir = big_net / (big_buy_val + big_sell_val) if (big_buy_val + big_sell_val) else 0.0  # -1..1
@@ -644,14 +735,21 @@ def _metrics(ticker: str, ticks: List[dict], big_value: float, window_min: int) 
     # Hành vi thao túng (tape reading): hấp thụ / rũ hàng-kéo giá / spring-upthrust
     beh = _behavior(ticks, big_value)
 
-    # Shark Score: kết hợp tiền LỚN + mất cân bằng chủ động + HÀNH VI cá mập.
+    # PHÂN KỲ lớn/nhỏ — thành phần độc lập, trước đây không hề đo
+    dv = _divergence(ticks, big_value)
+
+    # Shark Score v2 — bỏ ĐA CỘNG TUYẾN.
+    # Bản cũ đặt 0.28 big_dir + 0.18 imbalance + 0.16 manip = 0.62 trọng số lên ba
+    # cách viết của CÙNG một đại lượng "hướng dòng tiền" (đo được corr(big_dir,
+    # imbalance) = +0.92). Nay gộp nhóm cùng phương thành MỘT "flow", nhường trọng
+    # số cho phân kỳ + hấp thụ (hai tín hiệu thực sự độc lập).
+    flow = 0.45 * big_dir + 0.35 * imbalance + 0.20 * w_imbalance
     score = 100.0 * (
-        0.28 * big_dir +          # hướng tiền lớn
-        0.18 * imbalance +        # mất cân bằng toàn phiên
-        0.10 * w_imbalance +      # động lượng cửa sổ gần đây
-        0.22 * beh["absorption"] +  # hấp thụ
-        0.16 * beh["manip"] +       # mánh quanh lệnh lớn (rũ/kéo)
-        0.06 * beh["reversal"]      # spring / upthrust
+        0.30 * flow +                                  # hướng dòng tiền (đã gộp)
+        0.28 * _clamp(dv["divergence"] / 1.2, -1, 1) +  # phân kỳ lớn/nhỏ (MỚI)
+        0.24 * beh["absorption"] +                     # hấp thụ (độc lập)
+        0.10 * beh["manip"] +                          # rũ/kéo (đã siết)
+        0.08 * beh["reversal"]                         # spring / upthrust
     )
     score = round(_clamp(score, -100, 100))
 
@@ -661,6 +759,13 @@ def _metrics(ticker: str, ticks: List[dict], big_value: float, window_min: int) 
         label = "Xả hàng"
     else:
         label = "Trung tính"
+
+    # Cờ phân kỳ — diễn giải trực tiếp "tiền lớn gom / nhỏ lẻ bán"
+    patterns = list(beh["flags"])
+    if dv["divergence_valid"] and dv["divergence"] >= 0.35:
+        patterns.insert(0, f"Tiền lớn gom, nhỏ lẻ bán (phân kỳ {dv['divergence']:+.2f})")
+    elif dv["divergence_valid"] and dv["divergence"] <= -0.35:
+        patterns.insert(0, f"Tiền lớn xả, nhỏ lẻ mua (phân kỳ {dv['divergence']:+.2f})")
 
     last_price = ticks[-1]["price"]
     big_orders = [
@@ -695,10 +800,16 @@ def _metrics(ticker: str, ticks: List[dict], big_value: float, window_min: int) 
         "absorption": beh["absorption"],
         "manip": beh["manip"],
         "reversal": beh["reversal"],
-        "patterns": beh["flags"],
+        "patterns": patterns,
+        # Thành phần MỚI (v2) — hướng dòng tiền đã gộp + phân kỳ lớn/nhỏ
+        "flow": round(flow, 3),
+        "big_dir": dv["big_dir"],
+        "small_dir": dv["small_dir"],
+        "divergence": dv["divergence"],
         "last_price": last_price,
         "last_ts": ticks[-1]["ts"],
         "n_ticks": len(ticks),
+        "_v": SCORE_VERSION,
         "updated_at": datetime.now().isoformat(),
     }
 
@@ -736,7 +847,9 @@ def get_signal(ticker: str, big_value: float = BIG_VALUE_VND, window_min: int = 
     _touch(tk)
     if not _is_trading_hours() and _score_cacheable(big_value, window_min):
         cached = tape_store.load_score(tk, _session_date(tk))
-        if cached and cached.get("complete") and cached.get("big_value") == big_value:
+        # Bỏ qua cache tính bằng CÔNG THỨC CŨ (khác SCORE_VERSION) — điểm không so được
+        if (cached and cached.get("complete") and cached.get("big_value") == big_value
+                and (cached.get("signal") or {}).get("_v") == SCORE_VERSION):
             return cached["signal"]
     c = _ensure_loaded(tk)          # nạp từ store nếu cần — KHÔNG gọi API
     m = _metrics(tk, c.get("ticks", []), big_value, window_min)
