@@ -146,11 +146,39 @@ def last_session_date(ticker: str, max_date: str) -> str | None:
     return row[0] if row and row[0] else None
 
 
-def cleanup(keep_days: int = 5) -> int:
-    """Xoá tape cũ hơn keep_days (giữ ổ đĩa gọn). Trả số bản ghi đã xoá."""
+def cleanup(keep_days: int = 5, keep_score_days: int = 400) -> int:
+    """Dọn dữ liệu cũ. TÁCH BẠCH hai loại:
+      • intraday_tape: NẶNG (vài MB/mã/phiên) → chỉ giữ vài ngày.
+      • shark_score:   NHẸ (vài KB) và là DỮ LIỆU GỐC ĐỂ BACKTEST → giữ rất lâu.
+    Trước đây xoá cả hai sau 5 ngày ⇒ không bao giờ tích được mẫu để đo hiệu quả."""
     init_db()
     cutoff = (datetime.now() - timedelta(days=keep_days)).strftime("%Y-%m-%d")
+    s_cutoff = (datetime.now() - timedelta(days=keep_score_days)).strftime("%Y-%m-%d")
     with _lock, _conn() as c:
         cur = c.execute("DELETE FROM intraday_tape WHERE trade_date < ?", (cutoff,))
-        c.execute("DELETE FROM shark_score WHERE trade_date < ?", (cutoff,))
+        c.execute("DELETE FROM shark_score WHERE trade_date < ?", (s_cutoff,))
         return cur.rowcount
+
+
+def all_scores(min_date: str | None = None) -> list:
+    """Toàn bộ điểm Shark đã lưu → [{ticker, date, score, label, v}] (cho backtest)."""
+    init_db()
+    q = "SELECT ticker, trade_date, signal_json FROM shark_score"
+    args: list = []
+    if min_date:
+        q += " WHERE trade_date >= ?"
+        args.append(min_date)
+    q += " ORDER BY trade_date, ticker"
+    with _lock, _conn() as c:
+        rows = c.execute(q, args).fetchall()
+    out = []
+    for tk, d, js in rows:
+        try:
+            sig = json.loads(js)
+        except (ValueError, TypeError):
+            continue
+        if sig.get("empty"):
+            continue
+        out.append({"ticker": tk, "date": d, "score": sig.get("score", 0),
+                    "label": sig.get("label", ""), "v": sig.get("_v")})
+    return out

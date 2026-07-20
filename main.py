@@ -29,7 +29,8 @@ async def lifespan(app: FastAPI):
     from app.services import tape_store
     tape_store.init_db()
     try:
-        n = tape_store.cleanup(keep_days=5)
+        # tape nặng → 5 ngày; ĐIỂM Shark nhẹ và là dữ liệu gốc để backtest → giữ lâu
+        n = tape_store.cleanup(keep_days=5, keep_score_days=400)
         if n:
             print(f"🧹 tape_store: dọn {n} tape cũ (>5 ngày)")
     except Exception as e:

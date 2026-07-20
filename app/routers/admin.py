@@ -260,6 +260,19 @@ async def shark_rebuild_watchlist_status():
     return {"running": _shark_rebuild_running["on"], "result": _shark_rebuild_running["result"]}
 
 
+@router.get("/shark/backtest")
+async def shark_backtest(horizons: str = Query(default="1,3,5", description="vd 1,3,5,10"),
+                         min_date: Optional[str] = Query(default=None, description="YYYY-MM-DD")):
+    """Đo điểm Shark có DỰ BÁO được giá không: lợi suất T+h sau mỗi tín hiệu, so mức nền."""
+    from app.services import shark_backtest as bt
+    try:
+        hs = [int(x) for x in horizons.split(",") if x.strip()]
+    except ValueError:
+        raise HTTPException(status_code=400, detail="horizons phải là số, vd '1,3,5'")
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, bt.run_backtest, hs, min_date)
+
+
 @router.post("/shark/rebuild/{ticker}")
 async def shark_rebuild(ticker: str, date: Optional[str] = Query(
         default=None, description="YYYY-MM-DD; bỏ trống = tự tìm phiên gần nhất")):
