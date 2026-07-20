@@ -101,6 +101,22 @@ def _today() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 
+def _session_only(rows: list, date: str, tk: str = "") -> list:
+    """CHỈ giữ tick thuộc ĐÚNG phiên `date`.
+
+    Điểm Shark trong phiên là luỹ kế CỦA PHIÊN ĐÓ — nếu tick phiên trước lẫn vào (tape
+    cũ còn trong store/cache, hoặc rebuild ghi nhầm ngày) thì mua/bán chủ động và lệnh
+    lớn bị cộng dồn hai phiên ⇒ điểm SAI. Chặn ngay tại cửa vào.
+    Định dạng ts thống nhất 'YYYY-MM-DD HH:MM:SS...' (cả REST lẫn WS)."""
+    if not rows:
+        return rows
+    out = [r for r in rows
+           if isinstance(r.get("ts"), str) and r["ts"][:10] == date]
+    if tk and len(out) != len(rows):
+        print(f"🧹 {tk}: bỏ {len(rows) - len(out)} tick KHÔNG thuộc phiên {date}", flush=True)
+    return out
+
+
 def _cap_ticks(c: dict, tk: str) -> None:
     """Giữ tape trong giới hạn bộ nhớ. Cắt phần CŨ nếu vượt — và CẢNH BÁO 1 lần để biết
     có mã nào chạm trần (khi đó điểm có thể thiếu đầu phiên → cân nhắc nâng MAX_TICKS)."""
@@ -137,6 +153,10 @@ def _ensure_loaded(ticker: str) -> dict:
                  "seeded": False}
             stored = tape_store.load(tk, today)
             if stored and stored["ticks"]:
+                # Lọc theo phiên: blob cũ có thể lẫn tick phiên trước (vd rebuild ghi
+                # nhầm ngày) → không lọc thì điểm trong phiên cộng dồn 2 phiên ⇒ SAI.
+                stored["ticks"] = _session_only(stored["ticks"], today, tk)
+            if stored and stored["ticks"]:
                 c["ticks"] = stored["ticks"]
                 c["seen"] = {t["id"] for t in stored["ticks"]}
                 c["complete"] = stored["complete"]
@@ -165,6 +185,10 @@ def _update(ticker: str, max_age: Optional[float] = None) -> dict:
                  "date": today, "last_saved": now, "complete": False, "deep": False,
                  "seeded": False}
             stored = tape_store.load(tk, today)
+            if stored and stored["ticks"]:
+                # Lọc theo phiên: blob cũ có thể lẫn tick phiên trước (vd rebuild ghi
+                # nhầm ngày) → không lọc thì điểm trong phiên cộng dồn 2 phiên ⇒ SAI.
+                stored["ticks"] = _session_only(stored["ticks"], today, tk)
             if stored and stored["ticks"]:
                 c["ticks"] = stored["ticks"]
                 c["seen"] = {t["id"] for t in stored["ticks"]}
@@ -236,6 +260,8 @@ def _update(ticker: str, max_age: Optional[float] = None) -> dict:
     with _lock:
         c = _cache.get(tk) or c
         added = False
+        # Chỉ nhận tick thuộc ĐÚNG phiên của cache (chặn lẫn phiên trước)
+        rows = _session_only(rows, c.get("date") or today, tk)
         if rows and not _units_consistent(c["ticks"], rows):
             print(f"⛔ {tk}: lệch ĐƠN VỊ giá giữa nguồn cũ ({c['ticks'][-1]['price']}) và "
                   f"{src} ({rows[0]['price']}) — bỏ lô này để không hỏng tape", flush=True)
@@ -425,6 +451,10 @@ def push_ticks(ticker: str, rows: List[dict], source: str = "DNSE",
                  "date": today, "last_saved": now, "complete": False, "deep": False,
                  "seeded": False}   # WS đẩy tick KHÔNG tính là đã seed cả phiên
             _cache[tk] = c
+        # Chỉ nhận tick thuộc ĐÚNG phiên của cache (chặn lẫn phiên trước)
+        rows = _session_only(rows, c.get("date") or today, tk)
+        if not rows:
+            return
         if not _units_consistent(c["ticks"], rows):
             print(f"⛔ {tk}: lệch ĐƠN VỊ giá giữa tape ({c['ticks'][-1]['price']}) và "
                   f"{source} ({rows[0]['price']}) — bỏ tick này", flush=True)
@@ -754,21 +784,27 @@ def rebuild_session(ticker: str, date: Optional[str] = None) -> dict:
                 "message": "không lấy được khớp lệnh (DNSE bị chặn + vnstock không có "
                            "dữ liệu phiên này — chạy trong/sau phiên giao dịch)"}
 
-    # Reset cache mã này rồi nạp trọn phiên
-    with _lock:
-        _cache.pop(tk, None)
-    _ensure_loaded(tk)
-    push_ticks(tk, rows, src, aggregate=agg)
-    with _lock:
-        c = _cache[tk]
-        c["deep"] = True
-        c["seeded"] = True
-        snap = list(c["ticks"])
-    _save_tape(tk, _today(), snap, complete=True)
+    # Chỉ nạp vào cache hiển thị khi đúng phiên HÔM NAY. Phiên CŨ chỉ ghi store theo
+    # ĐÚNG ngày phiên — tuyệt đối không ghi dưới khoá hôm nay, nếu không tick phiên cũ
+    # sẽ cộng dồn vào phiên mới làm SAI điểm Shark trong phiên.
+    if target == _today():
+        with _lock:
+            _cache.pop(tk, None)
+        _ensure_loaded(tk)
+        push_ticks(tk, rows, src, aggregate=agg)
+        with _lock:
+            c = _cache[tk]
+            c["deep"] = True
+            c["seeded"] = True
+            snap = list(c["ticks"])
+    else:
+        snap = rows   # phiên cũ (chỉ DNSE lấy được) — rows đã gộp sẵn
+
+    _save_tape(tk, target, snap, complete=True)
     m = _metrics(tk, snap, BIG_VALUE_VND, WINDOW_MIN)
     if not m.get("empty"):
         m2 = {k: v for k, v in m.items() if k != "big_orders"}
-        tape_store.save_score(tk, _today(), m2, BIG_VALUE_VND, complete=True)
+        tape_store.save_score(tk, target, m2, BIG_VALUE_VND, complete=True)
     return {"ok": True, "ticker": tk, "session_date": target, "ticks": len(snap),
             "first_ts": snap[0]["ts"] if snap else None,
             "last_ts": snap[-1]["ts"] if snap else None, "score": m.get("score")}
