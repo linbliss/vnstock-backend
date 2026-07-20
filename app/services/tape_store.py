@@ -134,6 +134,18 @@ def save(ticker: str, trade_date: str, ticks: list, complete: bool = False) -> N
         )
 
 
+def last_session_date(ticker: str, max_date: str) -> str | None:
+    """Ngày phiên GẦN NHẤT (≤ max_date) có tape của mã — để ngày nghỉ vẫn xem được
+    phiên cuối cùng. Mỗi phiên vẫn nằm ở khoá ngày RIÊNG nên không lẫn dữ liệu."""
+    init_db()
+    with _lock, _conn() as c:
+        row = c.execute(
+            "SELECT MAX(trade_date) FROM intraday_tape WHERE ticker=? AND trade_date<=?",
+            (ticker.upper(), max_date),
+        ).fetchone()
+    return row[0] if row and row[0] else None
+
+
 def cleanup(keep_days: int = 5) -> int:
     """Xoá tape cũ hơn keep_days (giữ ổ đĩa gọn). Trả số bản ghi đã xoá."""
     init_db()

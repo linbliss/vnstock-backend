@@ -101,6 +101,31 @@ def _today() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 
+_sess_memo: Dict[str, tuple] = {}      # tk -> (hết hạn, ngày phiên, ngày hôm nay)
+
+
+def _session_date(tk: str) -> str:
+    """Ngày PHIÊN dùng để hiển thị & tính điểm:
+      • Trong giờ giao dịch → hôm nay (phiên đang chạy)
+      • Ngoài giờ → hôm nay nếu đã có tape; nếu chưa (ngày nghỉ/cuối tuần/trước giờ mở)
+        → PHIÊN GẦN NHẤT có dữ liệu, để vẫn xem/rà soát được phiên cuối.
+    Mỗi phiên vẫn nằm ở khoá ngày RIÊNG → KHÔNG trộn tick giữa các phiên."""
+    today = _today()
+    if _is_trading_hours():
+        return today
+    now = time.time()
+    hit = _sess_memo.get(tk)
+    if hit and now < hit[0] and hit[2] == today:
+        return hit[1]
+    d = today
+    try:
+        d = tape_store.last_session_date(tk, today) or today
+    except Exception:  # noqa: BLE001
+        pass
+    _sess_memo[tk] = (now + 300.0, d, today)   # nhớ 5' cho nhẹ DB
+    return d
+
+
 def _session_only(rows: list, date: str, tk: str = "") -> list:
     """CHỈ giữ tick thuộc ĐÚNG phiên `date`.
 
@@ -141,11 +166,11 @@ def _ensure_loaded(ticker: str) -> dict:
     """Lấy cache của mã; cold start nạp từ store bền vững (SQLite) — CỤC BỘ, KHÔNG gọi
     API. Dùng ở đường REQUEST (get_signal/get_tape) để đọc-cache-thuần, không đụng mạng."""
     tk = ticker.upper()
-    today = _today()
+    today = _session_date(tk)   # ngày nghỉ → phiên gần nhất; trong phiên → hôm nay
     now = time.time()
     with _lock:
         c = _cache.get(tk)
-        if c and c.get("date") != today:      # sang ngày mới → bỏ tape cũ
+        if c and c.get("date") != today:      # sang phiên khác → bỏ tape cũ
             c = None
         if c is None:
             c = {"ticks": [], "seen": set(), "src": "STORE", "last_fetch": 0.0,
@@ -172,7 +197,9 @@ def _update(ticker: str, max_age: Optional[float] = None) -> dict:
     max_age: tuổi tối đa chấp nhận của cache (giây)."""
     tk = ticker.upper()
     now = time.time()
-    today = _today()
+    # Dùng CÙNG khoá phiên với _ensure_loaded, nếu không sẽ reset sạch tape phiên gần
+    # nhất mà request vừa nạp (ngày nghỉ).
+    today = _session_date(tk)
     trading = _is_trading_hours()
 
     # ── Lấy/khởi tạo cache; cold start thì nạp từ store bền vững trước ──
@@ -359,7 +386,7 @@ def _ensure_deep(tk: str) -> None:
         c["deep"] = True
         snap = list(c["ticks"])
     if snap:
-        _save_tape(tk, _today(), snap, complete=not _is_trading_hours())
+        _save_tape(tk, _session_date(tk), snap, complete=not _is_trading_hours())
 
 
 def _refresh_one(tk: str) -> None:
@@ -692,7 +719,7 @@ def compute_and_cache_signal(ticker: str, big_value: float = BIG_VALUE_VND,
         m["error"] = c["err"]
     if _score_cacheable(big_value, window_min) and not m.get("empty"):
         try:
-            tape_store.save_score(tk, _today(), m, big_value,
+            tape_store.save_score(tk, _session_date(tk), m, big_value,
                                   complete=not _is_trading_hours())
         except Exception as e:  # noqa: BLE001
             print(f"⚠️  save_score {tk}: {e}", flush=True)
@@ -708,7 +735,7 @@ def get_signal(ticker: str, big_value: float = BIG_VALUE_VND, window_min: int = 
     tk = ticker.upper()
     _touch(tk)
     if not _is_trading_hours() and _score_cacheable(big_value, window_min):
-        cached = tape_store.load_score(tk, _today())
+        cached = tape_store.load_score(tk, _session_date(tk))
         if cached and cached.get("complete") and cached.get("big_value") == big_value:
             return cached["signal"]
     c = _ensure_loaded(tk)          # nạp từ store nếu cần — KHÔNG gọi API
@@ -718,7 +745,7 @@ def get_signal(ticker: str, big_value: float = BIG_VALUE_VND, window_min: int = 
         m["error"] = c["err"]
     if _score_cacheable(big_value, window_min) and not m.get("empty"):
         try:
-            tape_store.save_score(tk, _today(), m, big_value,
+            tape_store.save_score(tk, _session_date(tk), m, big_value,
                                   complete=not _is_trading_hours())
         except Exception:  # noqa: BLE001
             pass
