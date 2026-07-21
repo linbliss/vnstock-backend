@@ -447,26 +447,42 @@ def _units_consistent(ticks: List[dict], rows: List[dict]) -> bool:
 
 
 def _clean_tape(c: dict) -> None:
-    """Chuẩn hoá tape: (1) khử TRÙNG CHÉO NGUỒN, (2) sắp đúng tuần tự thời gian.
+    """Chuẩn hoá tape: sắp đúng thời gian + khử TRÙNG bất kể nguồn/id.
 
-    Khi REST DNSE bị chặn IP: tape = seed vnstock (id riêng) + realtime DNSE WS (id =
-    totalVolumeTraded). Cùng một khớp lệnh nhưng id KHÁC ⇒ dedup theo id bỏ sót ⇒ log
-    lặp 2 lần ở vùng thời gian chồng lấn; và các lô merge chỉ nối đuôi nên thứ tự loạn.
+    Vì sao dedup theo id không đủ: cùng MỘT khớp lệnh nhưng id KHÁC nhau khi
+      • vnstock (id riêng) trộn DNSE WS (id = totalVolumeTraded), hoặc
+      • fallback VCI↔KBS (id kiểu khác nhau), hoặc
+      • deep-seed REST vs WS gộp lệch mốc.
+    ⇒ log lặp 2 lần. Nên khử trùng theo NỘI DUNG, không theo id.
 
-    Quy tắc: DNSE là nguồn ƯU TIÊN cho vùng thời gian nó phủ → bỏ mọi tick nguồn KHÁC
-    nằm trong [min_ts, max_ts] của DNSE (vnstock chỉ giữ phần TRƯỚC khi WS bắt đầu).
-    Sắp bằng thời gian đã parse (bỏ tz) để nhất quán giữa VCI(có tz)/KBS/DNSE(có ms).
-    Chỉ chạy khi _dirty (sau khi có tick mới / nạp từ store) — ở đường ĐỌC, không mỗi tick."""
+    3 bước (chỉ chạy khi _dirty — ở đường ĐỌC, ~1 lần/đọc):
+      1. Sắp theo thời gian đã parse (bỏ tz — nhất quán VCI có tz / KBS / DNSE có ms).
+      2. DNSE ưu tiên theo TỪNG GIÂY (không theo cả dải min–max để tránh xoá nhầm khi
+         DNSE thưa): giây nào ĐÃ có tick DNSE thì bỏ tick nguồn khác trong giây đó.
+      3. Khử trùng theo chữ ký NỘI DUNG (ts, side, volume, price) — hai bản ghi giống
+         hệt gần như chắc chắn là một lệnh; xác suất hai lệnh KHÁC nhau trùng cả 4 (kèm
+         mili-giây) là không đáng kể.
+    """
     if not c.get("_dirty"):
         return
     keyed = [((_parse_ts(t["ts"]) or datetime.min), t) for t in c["ticks"]]
-    dnse = [k for k, t in keyed if t.get("_dnse")]
-    if dnse:
-        lo, hi = min(dnse), max(dnse)
-        keyed = [(k, t) for k, t in keyed if t.get("_dnse") or k < lo or k > hi]
-    keyed.sort(key=lambda kt: kt[0])
-    c["ticks"] = [t for _, t in keyed]
-    c["seen"] = {t["id"] for t in c["ticks"]}
+    keyed.sort(key=lambda kt: kt[0])   # chỉ so theo thời gian (tránh so dict khi ts trùng)
+
+    dnse_secs = {k.replace(microsecond=0) for k, t in keyed if t.get("_dnse")}
+    out: List[dict] = []
+    sig_seen: set = set()
+    for k, t in keyed:
+        # [2] giây có DNSE → bỏ tick nguồn khác trong giây đó
+        if dnse_secs and not t.get("_dnse") and k.replace(microsecond=0) in dnse_secs:
+            continue
+        # [3] trùng hệt nội dung → bỏ
+        sig = (t["ts"], t["side"], t["volume"], round(float(t["price"]), 4))
+        if sig in sig_seen:
+            continue
+        sig_seen.add(sig)
+        out.append(t)
+    c["ticks"] = out
+    c["seen"] = {t["id"] for t in out}
     c["_dirty"] = False
 
 
