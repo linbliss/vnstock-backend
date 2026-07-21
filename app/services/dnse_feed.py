@@ -51,30 +51,63 @@ _book_demand: dict[str, float] = {}     # mã cần SỔ LỆNH (chỉ mã đang
 _orderbook: dict[str, dict] = {}        # mã → sổ lệnh mới nhất từ WS
 _quote: dict[str, dict] = {}            # mã → giá realtime mới nhất (cho bảng giá)
 _running = False
-_ws = None
-_subscribed: set[str] = set()
-_book_subscribed: set[str] = set()
 _subs_max = 100           # cập nhật từ auth_success.rate_limit.subscriptions_max
 _last_tick_at: dict[str, float] = {}   # mã → lần cuối nhận tick qua WS
 _tick_count = 0           # tổng tick nhận được (để kiểm chứng qua /api/status)
-_authed = False
+
+# ── ĐA KẾT NỐI để vượt trần 100 subscription/kết nối MÀ KHÔNG mất chính xác ──────────
+# Round-robin theo KẾT NỐI (không theo thời gian): mỗi mã nằm CỐ ĐỊNH trên 1 kết nối và
+# được subscribe LIÊN TỤC → tape không có lỗ hổng → Shark Point vẫn đúng. Watchlist vượt
+# 1 kết nối thì tự mở thêm kết nối (mỗi cái ~90 mã). Chia lượt theo giây (bật/tắt luân
+# phiên) sẽ tạo lỗ hổng tape → KHÔNG dùng.
+SLOT_RESERVE = 8          # chừa mỗi kết nối cho book + margin (không sát trần 100)
+
+
+class _Conn:
+    __slots__ = ("idx", "ws", "authed", "subscribed", "book_subscribed", "task")
+
+    def __init__(self, idx: int):
+        self.idx = idx
+        self.ws = None
+        self.authed = False
+        self.subscribed: set[str] = set()
+        self.book_subscribed: set[str] = set()
+        self.task = None
+
+
+_conns: dict[int, _Conn] = {}
+
+
+def _slot() -> int:
+    """Số mã TICK tối đa mỗi kết nối (chừa margin + book)."""
+    nb = max(1, len(STOCK_BOARDS))
+    return max(1, _subs_max // nb - SLOT_RESERVE)
+
+
+def _shard(idx: int) -> set:
+    """Phần mã (tick) mà kết nối idx phụ trách — ổn định theo thứ tự bảng chữ cái."""
+    w = sorted(_wanted(_demand))
+    s = _slot()
+    return set(w[idx * s:(idx + 1) * s])
+
+
+def _need_conns() -> int:
+    import math
+    n = len(_wanted(_demand))
+    return max(1, math.ceil(n / _slot())) if n else 1
 
 
 def stats() -> dict:
-    """Tóm tắt trạng thái feed — cho /api/status kiểm chứng WS có chạy/nhận tick không.
-    Chỉ trả SỐ LƯỢNG, không lộ danh sách mã đang theo dõi."""
+    """Tóm tắt trạng thái feed — cho /api/status. Chỉ trả SỐ LƯỢNG (đa kết nối)."""
     return {
         "enabled": _running,
-        "connected": _ws is not None,
-        "authenticated": _authed,
-        "subscribed": len(_subscribed),
-        "streaming": sum(1 for t in _last_tick_at
-                         if time.time() - _last_tick_at[t] < 60),
+        "connected": any(c.ws is not None for c in _conns.values()),
+        "authenticated": any(c.authed for c in _conns.values()),
+        "connections": sum(1 for c in _conns.values() if c.ws is not None),
+        "subscribed": sum(len(c.subscribed) for c in _conns.values()),
+        "streaming": sum(1 for t in _last_tick_at if time.time() - _last_tick_at[t] < 60),
         "ticks": _tick_count,
-        # Tách "đã đăng ký sổ lệnh" khỏi "đã nhận sổ lệnh" để phân biệt được
-        # "chưa mở màn chi tiết" (book_subscribed=0) với "đăng ký rồi mà không có
-        # dữ liệu về" (book_subscribed>0 nhưng orderbooks=0 ⇒ lỗi thật).
-        "book_subscribed": len(_book_subscribed),
+        "book_subscribed": sum(len(c.book_subscribed) for c in _conns.values()),
         "orderbooks": len(_orderbook),
     }
 
@@ -115,7 +148,7 @@ def get_quote(ticker: str, max_age: float = 90.0):
 
 
 def active() -> bool:
-    return _running and _ws is not None and dnse_client.configured()
+    return _running and any(c.ws is not None for c in _conns.values()) and dnse_client.configured()
 
 
 def streaming(ticker: str) -> bool:
@@ -312,43 +345,37 @@ async def _sync(ws, channel: str, wanted: set, current: set) -> set:
     return wanted
 
 
-async def _sub_loop(ws, authed: asyncio.Event):
-    """Đồng bộ subscription theo nhu cầu; tôn trọng subscriptions_max.
-    Mỗi (kênh, mã, board) tính 1 subscription → chia ngân sách cho tick_extra
-    (cả danh mục) và top_price (chỉ mã đang xem chi tiết)."""
-    global _subscribed, _book_subscribed
+async def _sub_loop(conn: _Conn, authed: asyncio.Event):
+    """Đồng bộ subscription cho MỘT kết nối: tick = shard của kết nối đó; book (sổ lệnh)
+    chỉ đặt trên kết nối #0 (≤ BOOK_CAP mã đang xem chi tiết)."""
     await authed.wait()
-    while _running:
-        nb = max(1, len(STOCK_BOARDS))
-        # Sổ lệnh chỉ cho mã đang xem → dành ngân sách nhỏ, phần còn lại cho tick.
-        book = set(sorted(_wanted(_book_demand))[:max(1, BOOK_CAP)])
-        tick_cap = max(1, (_subs_max - len(book) * nb) // nb)
-        tick = set(sorted(_wanted(_demand))[:tick_cap])
+    while _running and _conns.get(conn.idx) is conn:
+        tick = _shard(conn.idx)
+        book = set(sorted(_wanted(_book_demand))[:BOOK_CAP]) if conn.idx == 0 else set()
         try:
-            _subscribed = await _sync(ws, "tick_extra", tick, _subscribed)
-            _book_subscribed = await _sync(ws, "top_price", book, _book_subscribed)
+            conn.subscribed = await _sync(conn.ws, "tick_extra", tick, conn.subscribed)
+            conn.book_subscribed = await _sync(conn.ws, "top_price", book, conn.book_subscribed)
         except Exception:  # noqa: BLE001
             return
         await asyncio.sleep(8)
 
 
-async def _run():
-    global _ws, _subscribed, _book_subscribed, _subs_max, _authed
+async def _run(conn: _Conn):
+    """Vòng đời 1 KẾT NỐI WS (đa kết nối để vượt trần 100/kết nối)."""
+    global _subs_max
     import websockets
     url = f"{WS_BASE}?encoding={ENCODING}"
     backoff = 5
-    while _running:
-        _subscribed = set()
-        _book_subscribed = set()
-        _authed = False
+    while _running and _conns.get(conn.idx) is conn:
+        conn.subscribed = set()
+        conn.book_subscribed = set()
+        conn.authed = False
         try:
-            # ping_interval=None: DNSE ping ở tầng ứng dụng (JSON) và KHÔNG trả lời
-            # WS control ping → để thư viện tự ping sẽ bị đóng kết nối oan.
             async with websockets.connect(url, max_size=2 ** 22, ping_interval=None) as ws:
-                _ws = ws
+                conn.ws = ws
                 backoff = 5
                 authed = asyncio.Event()
-                sub_task = asyncio.create_task(_sub_loop(ws, authed))
+                sub_task = asyncio.create_task(_sub_loop(conn, authed))
                 pong_task = asyncio.create_task(_pong_loop(ws))
                 try:
                     async for raw in ws:
@@ -361,59 +388,87 @@ async def _run():
                         elif action == "auth_success":
                             rl = d.get("rate_limit") or {}
                             _subs_max = int(rl.get("subscriptions_max") or 100)
-                            _authed = True
+                            conn.authed = True
                             authed.set()
-                            print(f"🌊 DNSE WS authenticated (subs_max={_subs_max}, "
-                                  f"boards={','.join(STOCK_BOARDS)}, enc={ENCODING})", flush=True)
+                            print(f"🌊 DNSE WS #{conn.idx} authenticated (subs_max={_subs_max}, "
+                                  f"enc={ENCODING})", flush=True)
                         elif action == "ping":
                             await ws.send(_encode({"action": "pong",
                                                    "timestamp": d.get("timestamp")}))
                         elif action == "connection_expired":
-                            print("ℹ️  DNSE WS hết hạn (8h) — kết nối lại", flush=True)
+                            print(f"ℹ️  DNSE WS #{conn.idx} hết hạn (8h) — kết nối lại", flush=True)
                             break
                         elif action == "error":
-                            print(f"⚠️  DNSE WS error: {d}", flush=True)
+                            print(f"⚠️  DNSE WS #{conn.idx} error: {d}", flush=True)
                             if str(d.get("code")) == "AUTH_FAILED":
                                 print("⛔ DNSE WS: sai API key/secret — dừng feed", flush=True)
                                 return
                         elif action in CONTROL:
-                            pass          # subscribed / unsubscribed / pong
+                            pass
                         else:
-                            _on_data(d)   # frame dữ liệu (có field "T")
+                            _on_data(d)
                 finally:
                     sub_task.cancel()
                     pong_task.cancel()
-                    _ws = None
+                    conn.ws = None
         except Exception as e:  # noqa: BLE001
-            print(f"⚠️  DNSE WS mất kết nối ({type(e).__name__}: {e}) — thử lại sau {backoff}s",
-                  flush=True)
-        if _running:
+            print(f"⚠️  DNSE WS #{conn.idx} mất kết nối ({type(e).__name__}: {e}) — thử lại "
+                  f"sau {backoff}s", flush=True)
+        if _running and _conns.get(conn.idx) is conn:
             await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)   # lùi dần, không dội server
+            backoff = min(backoff * 2, 60)
+
+
+async def _supervisor():
+    """Giữ ĐỦ số kết nối theo nhu cầu: watchlist phình quá 1 kết nối thì mở thêm; co
+    lại thì đóng bớt. Mỗi kết nối phụ trách 1 shard cố định → mã subscribe liên tục."""
+    while _running:
+        try:
+            need = _need_conns()
+            for i in range(need):     # mở kết nối còn thiếu
+                c = _conns.get(i)
+                if c is None or c.task is None or c.task.done():
+                    c = _Conn(i)
+                    _conns[i] = c
+                    c.task = asyncio.create_task(_run(c))
+            for i in [k for k in _conns if k >= need]:   # đóng kết nối dư
+                c = _conns.pop(i)
+                if c.task:
+                    c.task.cancel()
+                if c.ws:
+                    try:
+                        await c.ws.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️  DNSE WS supervisor: {type(e).__name__}: {e}", flush=True)
+        await asyncio.sleep(10)
 
 
 async def start():
     global _running
-    # Đã kiểm chứng với dữ liệu thật trong phiên (2026-07-17) → mặc định BẬT.
-    # Tắt bằng DNSE_WS_ENABLED=false nếu cần (shark tự quay lại poll REST).
     if os.environ.get("DNSE_WS_ENABLED", "true").lower() in ("0", "false", "no"):
         print("ℹ️  DNSE feed OFF (DNSE_WS_ENABLED=false)", flush=True)
         return
-    # configured() chứ không enabled(): WS là host RIÊNG (ws-openapi), không được để
-    # sức khoẻ REST (openapi) quyết định có bật feed hay không.
+    # configured() chứ không enabled(): WS là host RIÊNG (ws-openapi), không để sức khoẻ
+    # REST (openapi) quyết định có bật feed hay không.
     if not dnse_client.configured():
         print("ℹ️  DNSE feed OFF (chưa có DNSE_API_KEY/SECRET)", flush=True)
         return
     _running = True
-    asyncio.create_task(_run())
-    print("🌊 DNSE feed: starting…", flush=True)
+    asyncio.create_task(_supervisor())
+    print("🌊 DNSE feed: starting… (đa kết nối theo nhu cầu)", flush=True)
 
 
 async def stop():
     global _running
     _running = False
-    if _ws:
-        try:
-            await _ws.close()
-        except Exception:  # noqa: BLE001
-            pass
+    for c in list(_conns.values()):
+        if c.task:
+            c.task.cancel()
+        if c.ws:
+            try:
+                await c.ws.close()
+            except Exception:  # noqa: BLE001
+                pass
+    _conns.clear()
