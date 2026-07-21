@@ -21,8 +21,12 @@ from typing import Dict, List, Optional
 BIG_VALUE_VND = 1_000_000_000      # ngưỡng "lệnh lớn": ≥ 1 tỷ đồng/lệnh
 WINDOW_MIN = 15                    # cửa sổ trượt (phút) cho tín hiệu "gần đây"
 MIN_FETCH_INTERVAL = 8.0           # giây — không refetch 1 mã dày hơn mức này (có fallback VCI↔KBS)
-SEED_PAGE = 1000                   # lần đầu lấy nhiều tick để có bối cảnh
+SEED_PAGE = 1000                   # (cũ) — không còn dùng cho seed, giữ để tương thích
 POLL_PAGE = 300                    # các lần sau chỉ lấy tick mới
+# SEED phải lấy TRỌN PHIÊN (từ 9:00), nếu không mã thanh khoản cao chỉ có phần chiều
+# (~13:00 trở lại) → tổng hợp/điểm sai. Chỉ chạy 1 lần/mã/phiên (cờ seeded) + lưu store.
+FULL_SEED_PAGE = 40000             # vnstock: đủ phủ cả phiên mã thanh khoản cao
+DNSE_SEED_PAGES = 250              # DNSE REST: phân trang tới khi hết token (≈ từ 9:00)
 # Giới hạn bộ nhớ mỗi mã. Đây là số "lệnh" ĐÃ GỘP (150ms same-side), không phải khớp
 # lẻ — mã thanh khoản cao nhất VN sau khi gộp ~30-50k/phiên, nên 100k là dư margin.
 # Nếu 1 mã vẫn vượt (cực hiếm) → _cap_ticks cắt phần CŨ và LOG cảnh báo để ta biết.
@@ -265,23 +269,24 @@ def _update(ticker: str, max_age: Optional[float] = None) -> dict:
     seed = not c.get("seeded")
 
     # ── Fetch: DNSE (nếu bật) → fallback vnstock ──
-    # Poll chỉ lấy 1 trang gần nhất (~500 khớp) rồi dedup theo id — không tải lại cả phiên.
+    # SEED lần đầu = TRỌN PHIÊN (từ 9:00). Các lần sau chỉ lấy 1 trang gần nhất + dedup.
     # (Không dùng from_ts theo giờ tick để tránh lệch múi giờ container ↔ giờ sàn.)
     if dnse_on:
         rows = dnse_client.get_intraday_ticks(
-            tk, max_pages=(4 if seed else 1)) or []
+            tk, max_pages=(DNSE_SEED_PAGES if seed else 1),
+            max_ticks=(1_000_000 if seed else 3000)) or []
         src = "DNSE"
         err = None
         if not rows and seed:   # DNSE rỗng lúc seed → thử vnstock (mã có tick ở vnstock)
             prefer = c.get("src") if c.get("src") in SOURCES else None
-            rows, vsrc, verr = _fetch_with_fallback(tk, SEED_PAGE, prefer)
+            rows, vsrc, verr = _fetch_with_fallback(tk, FULL_SEED_PAGE, prefer)
             if rows:
                 src = vsrc
             else:
                 err = verr or "Chưa có khớp lệnh"
     else:
         prefer = c.get("src") if c.get("src") in SOURCES else None
-        rows, src, err = _fetch_with_fallback(tk, SEED_PAGE if seed else POLL_PAGE, prefer)
+        rows, src, err = _fetch_with_fallback(tk, FULL_SEED_PAGE if seed else POLL_PAGE, prefer)
 
     # ── Merge dưới lock; quyết định persist rồi ghi NGOÀI lock ──
     snapshot = None
@@ -311,6 +316,8 @@ def _update(ticker: str, max_age: Optional[float] = None) -> dict:
                 added = True
             if src != "STORE":
                 c["src"] = src
+            if seed:
+                c["deep"] = True   # seed đã lấy TRỌN phiên → _ensure_deep khỏi tải lại
             c["seeded"] = True     # đã nạp được từ REST → lần sau chỉ poll/để WS lo
             c.pop("err", None)
         elif err and not c["ticks"]:
