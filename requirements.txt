@@ -2,7 +2,11 @@ fastapi==0.111.0
 uvicorn[standard]==0.30.1
 httpx==0.27.0
 python-dotenv==1.0.1
-vnstock
+# PIN vnstock trong dòng 4.0.x: bản mới nhất (4.0.4) tương thích mọi API ta dùng
+# (Quote/Trading/Listing với source kbs/vci, intraday phân trang page/last_time).
+# KHÔNG để trần: 'vnstock' sẽ tự kéo 5.0 khi ra → major bump gần như chắc vỡ build.
+# Nâng 4.1/5.0 phải làm THỦ CÔNG sau khi test (vnstock hay đổi API cả ở minor).
+vnstock>=4.0.4,<4.1
 pandas
 numpy
 apscheduler==3.10.4
