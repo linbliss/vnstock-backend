@@ -78,20 +78,19 @@ class MarketDataService:
         self._register_ws(tickers)
 
     def subscribe_screener(self, tickers: List[str], cap: int = 40):
-        """Đăng ký giá realtime cho các mã LỌT KẾT QUẢ screener.
+        """Đăng ký giá cho các mã LỌT KẾT QUẢ screener — CHỈ KBS (vnstock), KHÔNG WS.
 
-        Khác subscribe() thường: bộ này TỰ THAY THẾ mỗi lần quét (bỏ mã của lần quét
-        trước) và bị CHẶN TRẦN — vì subscribe() chỉ thêm chứ không bao giờ gỡ, quét
-        nhiều lần sẽ phình set vô hạn làm nặng vòng poll KBS (35 lệnh/phút) và ăn hết
-        trần 100 subscription của DNSE WS (tranh chỗ với Shark).
-        Mã nào nguồn khác vẫn cần sẽ được /api/quotes tự đăng ký lại ở nhịp kế tiếp."""
+        Screener chỉ cần price + volume để tính vol_ratio/near_pivot; KBS price_board đủ.
+        KHÔNG đăng ký WS: (1) tránh lẫn nguồn, (2) chừa trần 100 subscription của DNSE WS
+        cho Shark Action + danh mục. Bộ này TỰ THAY THẾ mỗi lần quét + chặn trần để
+        subscribed không phình vô hạn (subscribe() chỉ thêm không gỡ)."""
         new = {t.upper() for t in tickers[:cap] if t}
         for t in getattr(self, "_screener_subs", set()) - new:
             self.subscribed.discard(t)
         self._screener_subs = new
         for t in new:
             self.subscribed.add(t)
-        self._register_ws(list(new))
+        # KHÔNG gọi _register_ws — screener độc lập với WS.
 
     @staticmethod
     def _register_ws(tickers: List[str]) -> None:

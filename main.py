@@ -19,10 +19,11 @@ alert_task = None
 daily_task = None
 rs_task = None
 shark_eod_task = None
+shark_wl_task = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global alert_task, daily_task, rs_task, shark_eod_task
+    global alert_task, daily_task, rs_task, shark_eod_task, shark_wl_task
     ohlcv_store.init_db()
     user_store.init_db()
     # Cache tape trong phiên (bền vững) — init + dọn tape cũ > 5 ngày
@@ -43,6 +44,7 @@ async def lifespan(app: FastAPI):
     daily_task = asyncio.create_task(daily_update_scheduler())
     rs_task = asyncio.create_task(_rs_rating_scheduler())
     shark_eod_task = asyncio.create_task(_shark_eod_scheduler())
+    shark_wl_task = asyncio.create_task(_shark_watchlist_ws_scheduler())
     # Worker nền làm mới tape Shark cho các mã đang xem (tách API khỏi request)
     from app.services import shark_monitor
     shark_refresh_task = asyncio.create_task(shark_monitor.refresh_loop())
@@ -58,12 +60,35 @@ async def lifespan(app: FastAPI):
         rs_task.cancel()
     if shark_eod_task:
         shark_eod_task.cancel()
+    if shark_wl_task:
+        shark_wl_task.cancel()
     _srt = getattr(app.state, "shark_refresh_task", None)
     if _srt:
         _srt.cancel()
     from app.services import dnse_feed
     await dnse_feed.stop()
     await market_service.stop()
+
+
+async def _shark_watchlist_ws_scheduler():
+    """TRONG GIỜ giao dịch: giữ WS subscribe TOÀN watchlist NGAY TỪ ĐẦU PHIÊN.
+
+    Nhờ WS bắt trọn phiên cho mọi mã watchlist → tape Shark đầy đủ (không cần REST seed
+    nặng), và điểm Shark được worker nền cập nhật ngầm + lưu cache liên tục để Watchlist
+    /Dashboard kế thừa (không tính lại). Screener KHÔNG nằm đây — nó dùng KBS riêng."""
+    from app.services import shark_monitor, user_store, data_source, dnse_client
+    await asyncio.sleep(20)   # chờ khởi động ổn định
+    while True:
+        try:
+            if (shark_monitor._is_trading_hours()
+                    and data_source.get_source("shark") == "dnse"
+                    and dnse_client.configured()):
+                tickers = user_store.all_watchlist_tickers()
+                for tk in tickers:
+                    shark_monitor._touch(tk)   # đăng ký WS + shark refresh (giữ TTL sống)
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️  watchlist-WS scheduler: {type(e).__name__}: {e}", flush=True)
+        await asyncio.sleep(60)   # DEMAND_TTL=300s → refresh mỗi 60s là dư an toàn
 
 
 async def _shark_eod_scheduler():

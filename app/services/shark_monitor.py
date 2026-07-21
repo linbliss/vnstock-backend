@@ -146,6 +146,16 @@ def _session_only(rows: list, date: str, tk: str = "") -> list:
     return out
 
 
+def _covers_open(ticks: list) -> bool:
+    """Tape có tick từ ~đầu phiên (≤ 09:16) không → nếu có, WS đã bắt trọn phiên,
+    khỏi REST seed. Quét vài tick đầu (đã sắp thời gian phần lớn) cho nhẹ."""
+    for t in ticks[:64]:
+        ts = t.get("ts", "")
+        if isinstance(ts, str) and len(ts) >= 16 and ts[11:16] <= "09:16":
+            return True
+    return False
+
+
 def _cap_ticks(c: dict, tk: str) -> None:
     """Giữ tape trong giới hạn bộ nhớ. Cắt phần CŨ nếu vượt — và CẢNH BÁO 1 lần để biết
     có mã nào chạm trần (khi đó điểm có thể thiếu đầu phiên → cân nhắc nâng MAX_TICKS)."""
@@ -242,6 +252,10 @@ def _update(ticker: str, max_age: Optional[float] = None) -> dict:
         try:
             from app.services import dnse_feed   # import trong hàm: tránh vòng lặp
             dnse_feed.register_demand(tk)
+            # WS subscribe TOÀN watchlist từ ĐẦU PHIÊN → nếu tape đã phủ từ ~9:00 thì WS
+            # đã có trọn phiên, KHỎI REST seed nặng. Coi như đã seed.
+            if not c.get("seeded") and dnse_feed.streaming(tk) and _covers_open(c["ticks"]):
+                c["seeded"] = True
             # WS đang đẩy tick cho mã này → khỏi poll REST (kể cả vnstock), vừa đúng
             # thiết kế DNSE vừa tránh ĐẾM TRÙNG (id vnstock ≠ id DNSE nên dedup không
             # bắt được cùng một lệnh khớp từ hai nguồn).
