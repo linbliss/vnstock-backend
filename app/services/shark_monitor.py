@@ -184,6 +184,7 @@ def _ensure_loaded(ticker: str) -> dict:
             if stored and stored["ticks"]:
                 c["ticks"] = stored["ticks"]
                 c["seen"] = {t["id"] for t in stored["ticks"]}
+                c["_dirty"] = True        # tape cũ có thể lặp/loạn thứ tự → dọn khi đọc
                 c["complete"] = stored["complete"]
                 c["deep"] = stored["complete"]
                 c["seeded"] = True
@@ -219,6 +220,7 @@ def _update(ticker: str, max_age: Optional[float] = None) -> dict:
             if stored and stored["ticks"]:
                 c["ticks"] = stored["ticks"]
                 c["seen"] = {t["id"] for t in stored["ticks"]}
+                c["_dirty"] = True        # tape cũ có thể lặp/loạn thứ tự → dọn khi đọc
                 c["complete"] = stored["complete"]
                 c["deep"] = stored["complete"]   # phiên đã đóng = đã đủ cả phiên
                 c["seeded"] = True               # store đã có tape phiên → khỏi seed lại
@@ -297,10 +299,14 @@ def _update(ticker: str, max_age: Optional[float] = None) -> dict:
             seen = c["seen"]
             new = [r for r in rows if r["id"] not in seen]
             if new:
+                is_dnse = (src == "DNSE")
                 for r in new:
                     seen.add(r["id"])
+                    if is_dnse:
+                        r["_dnse"] = 1
                 new.sort(key=lambda r: _parse_ts(r["ts"]) or datetime.min)
                 c["ticks"].extend(new)
+                c["_dirty"] = True
                 _cap_ticks(c, tk)
                 added = True
             if src != "STORE":
@@ -440,11 +446,36 @@ def _units_consistent(ticks: List[dict], rows: List[dict]) -> bool:
     return ratio < 100
 
 
+def _clean_tape(c: dict) -> None:
+    """Chuẩn hoá tape: (1) khử TRÙNG CHÉO NGUỒN, (2) sắp đúng tuần tự thời gian.
+
+    Khi REST DNSE bị chặn IP: tape = seed vnstock (id riêng) + realtime DNSE WS (id =
+    totalVolumeTraded). Cùng một khớp lệnh nhưng id KHÁC ⇒ dedup theo id bỏ sót ⇒ log
+    lặp 2 lần ở vùng thời gian chồng lấn; và các lô merge chỉ nối đuôi nên thứ tự loạn.
+
+    Quy tắc: DNSE là nguồn ƯU TIÊN cho vùng thời gian nó phủ → bỏ mọi tick nguồn KHÁC
+    nằm trong [min_ts, max_ts] của DNSE (vnstock chỉ giữ phần TRƯỚC khi WS bắt đầu).
+    Sắp bằng thời gian đã parse (bỏ tz) để nhất quán giữa VCI(có tz)/KBS/DNSE(có ms).
+    Chỉ chạy khi _dirty (sau khi có tick mới / nạp từ store) — ở đường ĐỌC, không mỗi tick."""
+    if not c.get("_dirty"):
+        return
+    keyed = [((_parse_ts(t["ts"]) or datetime.min), t) for t in c["ticks"]]
+    dnse = [k for k, t in keyed if t.get("_dnse")]
+    if dnse:
+        lo, hi = min(dnse), max(dnse)
+        keyed = [(k, t) for k, t in keyed if t.get("_dnse") or k < lo or k > hi]
+    keyed.sort(key=lambda kt: kt[0])
+    c["ticks"] = [t for _, t in keyed]
+    c["seen"] = {t["id"] for t in c["ticks"]}
+    c["_dirty"] = False
+
+
 def _append_agg(ticks: List[dict], r: dict) -> None:
     """Gộp khớp CÙNG CHIỀU cách nhau ≤ AGG_WINDOW_MS vào lệnh cuối (một lệnh quét sổ
-    thường khớp thành chuỗi fill) — để nhận diện "lệnh lớn" cho đúng, giống REST."""
+    thường khớp thành chuỗi fill) — để nhận diện "lệnh lớn" cho đúng, giống REST.
+    Chỉ gộp khi CÙNG NGUỒN (không trộn tick DNSE vào tick vnstock)."""
     last = ticks[-1] if ticks else None
-    if last and last["side"] == r["side"]:
+    if last and last["side"] == r["side"] and last.get("_dnse") == r.get("_dnse"):
         a, b = _parse_ts(last["ts"]), _parse_ts(r["ts"])
         if a and b:
             dt_ms = (b - a).total_seconds() * 1000.0
@@ -489,14 +520,18 @@ def push_ticks(ticker: str, rows: List[dict], source: str = "DNSE",
         seen = c["seen"]
         new = [r for r in rows if r["id"] not in seen]
         if new:
+            is_dnse = (source == "DNSE")
             for r in new:
                 seen.add(r["id"])
+                if is_dnse:
+                    r["_dnse"] = 1
             new.sort(key=lambda r: _parse_ts(r["ts"]) or datetime.min)
             if aggregate:
                 for r in new:
                     _append_agg(c["ticks"], r)
             else:
                 c["ticks"].extend(new)
+            c["_dirty"] = True
             _cap_ticks(c, tk)
             # WS đẩy tick → _update bị throttle nên sẽ không tự lưu; lưu ở đây (thưa).
             if now - c.get("last_saved", 0) >= SAVE_INTERVAL:
@@ -863,6 +898,7 @@ def compute_and_cache_signal(ticker: str, big_value: float = BIG_VALUE_VND,
     """Tính điểm Shark rồi ghi cache. force=True bỏ qua throttle (dùng cho batch cuối phiên)."""
     tk = ticker.upper()
     c = _update(tk, max_age=(0.0 if force else SIGNAL_MAX_AGE))
+    _clean_tape(c)
     m = _metrics(tk, c.get("ticks", []), big_value, window_min)
     m.pop("big_orders", None)   # list view không cần chi tiết lệnh lớn
     if "err" in c and m.get("empty"):
@@ -891,6 +927,7 @@ def get_signal(ticker: str, big_value: float = BIG_VALUE_VND, window_min: int = 
                 and (cached.get("signal") or {}).get("_v") == SCORE_VERSION):
             return cached["signal"]
     c = _ensure_loaded(tk)          # nạp từ store nếu cần — KHÔNG gọi API
+    _clean_tape(c)
     m = _metrics(tk, c.get("ticks", []), big_value, window_min)
     m.pop("big_orders", None)
     if "err" in c and m.get("empty"):
@@ -914,6 +951,7 @@ def get_tape(ticker: str, limit: int = 2000, big_value: float = BIG_VALUE_VND,
     tk = ticker.upper()
     _touch(tk, deep=True)
     c = _ensure_loaded(tk)          # KHÔNG gọi API
+    _clean_tape(c)                  # khử trùng + sắp tuần tự trước khi đọc
     ticks = c.get("ticks", [])
     m = _metrics(tk, ticks, big_value, window_min)
     recent = list(reversed(ticks[-limit:]))
