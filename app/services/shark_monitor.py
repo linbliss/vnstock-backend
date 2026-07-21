@@ -82,6 +82,74 @@ def _fetch_intraday_src(ticker: str, page_size: int, source: str) -> List[dict]:
     return rows
 
 
+def _fetch_paged_src(ticker: str, source: str,
+                     kbs_page_size: int = 5000, max_pages: int = 20) -> List[dict]:
+    """Lấy TRỌN phiên 1 mã từ 1 nguồn vnstock (khi DNSE REST bị chặn IP).
+      • KBS: phân trang theo `page` (1,2,3…) tới trang cuối (đáng tin nhất).
+      • VCI: 1 lần với last_time = 09:00 → lấy từ ĐẦU PHIÊN (không phải 'gần nhất')."""
+    from vnstock import Quote
+    tk = ticker.upper()
+    q = Quote(symbol=tk, source=source.lower())
+    seen: set = set()
+    out: List[dict] = []
+
+    def _add(df) -> int:
+        n = 0
+        for _, r in df.iterrows():
+            idv = str(r.get("id", ""))
+            if idv and idv in seen:
+                continue
+            if idv:
+                seen.add(idv)
+            mt = str(r.get("match_type", "")).lower()
+            side = "B" if mt.startswith("b") else ("S" if mt.startswith("s") else "U")
+            try:
+                price = float(r["price"]); vol = int(r["volume"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            out.append({"id": idv or f'{r.get("time")}_{price}_{vol}', "ts": str(r["time"]),
+                        "price": price, "volume": vol, "side": side,
+                        "value": vol * price * 1000.0})
+            n += 1
+        return n
+
+    if source.upper() == "KBS":
+        for p in range(1, max_pages + 1):
+            with _fetch_sema:
+                df = q.intraday(page=p, page_size=kbs_page_size)
+            if df is None or df.empty:
+                break
+            _add(df)
+            if len(df) < kbs_page_size:   # trang cuối → hết phiên
+                break
+    else:  # VCI — 1 lần, bắt đầu từ 09:00 (last_time)
+        open_ts = int(datetime.now().replace(hour=9, minute=0, second=0,
+                                             microsecond=0).timestamp())
+        with _fetch_sema:
+            df = q.intraday(page_size=30000, last_time=open_ts)
+        if df is not None and not df.empty:
+            _add(df)
+
+    out.sort(key=lambda x: _parse_ts(x["ts"]) or datetime.min)
+    return out
+
+
+def _fetch_full_session(ticker: str, prefer: Optional[str] = None):
+    """Lấy TRỌN phiên qua vnstock (DNSE REST chặn IP) → (rows, source, err).
+    Ưu tiên KBS (phân trang chuẩn) → VCI (best-effort từ 09:00)."""
+    order = ["KBS", "VCI"] if prefer != "VCI" else ["VCI", "KBS"]
+    last_err = None
+    for src in order:
+        try:
+            rows = _fetch_paged_src(ticker, src)
+            if rows:
+                return rows, src, None
+        except Exception as e:  # noqa: BLE001
+            last_err = str(e)
+            continue
+    return [], order[0], last_err
+
+
 def _fetch_with_fallback(ticker: str, page_size: int, prefer: Optional[str] = None):
     """Thử lần lượt các nguồn (ưu tiên nguồn đang chạy tốt) → (rows, source, err)."""
     order = [prefer] if prefer in SOURCES else []
@@ -299,16 +367,19 @@ def _update(ticker: str, max_age: Optional[float] = None) -> dict:
             max_ticks=(1_000_000 if seed else 3000)) or []
         src = "DNSE"
         err = None
-        if not rows and seed:   # DNSE rỗng lúc seed → thử vnstock (mã có tick ở vnstock)
+        if not rows and seed:   # DNSE rỗng lúc seed → vnstock TRỌN PHIÊN (phân trang)
             prefer = c.get("src") if c.get("src") in SOURCES else None
-            rows, vsrc, verr = _fetch_with_fallback(tk, FULL_SEED_PAGE, prefer)
+            rows, vsrc, verr = _fetch_full_session(tk, prefer)
             if rows:
                 src = vsrc
             else:
                 err = verr or "Chưa có khớp lệnh"
     else:
         prefer = c.get("src") if c.get("src") in SOURCES else None
-        rows, src, err = _fetch_with_fallback(tk, FULL_SEED_PAGE if seed else POLL_PAGE, prefer)
+        if seed:
+            rows, src, err = _fetch_full_session(tk, prefer)   # vnstock TRỌN PHIÊN
+        else:
+            rows, src, err = _fetch_with_fallback(tk, POLL_PAGE, prefer)  # poll 1 trang
 
     # ── Merge dưới lock; quyết định persist rồi ghi NGOÀI lock ──
     snapshot = None
