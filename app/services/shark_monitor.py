@@ -147,9 +147,10 @@ def _session_only(rows: list, date: str, tk: str = "") -> list:
 
 
 def _covers_open(ticks: list) -> bool:
-    """Tape có tick từ ~đầu phiên (≤ 09:16) không → nếu có, WS đã bắt trọn phiên,
-    khỏi REST seed. Quét vài tick đầu (đã sắp thời gian phần lớn) cho nhẹ."""
-    for t in ticks[:64]:
+    """Tape có tick từ ~đầu phiên (≤ 09:16) không → nếu có, đã bắt trọn phiên, khỏi REST
+    seed. Quét toàn bộ có early-exit; chỉ được gọi khi CHƯA seeded (vài lần đầu phiên)
+    hoặc lúc nạp store (1 lần) nên chi phí không đáng kể."""
+    for t in ticks:
         ts = t.get("ts", "")
         if isinstance(ts, str) and len(ts) >= 16 and ts[11:16] <= "09:16":
             return True
@@ -200,8 +201,12 @@ def _ensure_loaded(ticker: str) -> dict:
                 c["seen"] = {t["id"] for t in stored["ticks"]}
                 c["_dirty"] = True        # tape cũ có thể lặp/loạn thứ tự → dọn khi đọc
                 c["complete"] = stored["complete"]
-                c["deep"] = stored["complete"]
-                c["seeded"] = True
+                # CHỈ coi đã seed đủ khi tape đã phủ đầu phiên (hoặc phiên đã đóng). Nếu
+                # store lưu DỞ (restart giữa phiên) → seeded=False ⇒ _update REST full-seed
+                # backfill phần sáng → Shark Point mới chính xác.
+                _full = bool(stored["complete"]) or _covers_open(stored["ticks"])
+                c["deep"] = _full
+                c["seeded"] = _full
             _cache[tk] = c
         return c
 
@@ -236,8 +241,11 @@ def _update(ticker: str, max_age: Optional[float] = None) -> dict:
                 c["seen"] = {t["id"] for t in stored["ticks"]}
                 c["_dirty"] = True        # tape cũ có thể lặp/loạn thứ tự → dọn khi đọc
                 c["complete"] = stored["complete"]
-                c["deep"] = stored["complete"]   # phiên đã đóng = đã đủ cả phiên
-                c["seeded"] = True               # store đã có tape phiên → khỏi seed lại
+                # Chỉ SEEDED nếu tape phủ đầu phiên (hoặc phiên đã đóng). Restart giữa
+                # phiên mà store lưu dở → seeded=False ⇒ REST full-seed backfill sáng.
+                _full = bool(stored["complete"]) or _covers_open(stored["ticks"])
+                c["deep"] = _full
+                c["seeded"] = _full
             _cache[tk] = c
 
     dnse_on = data_source.use_dnse("shark")     # REST DNSE (có breaker)
@@ -361,6 +369,48 @@ def _update(ticker: str, max_age: Optional[float] = None) -> dict:
 # không kích hoạt lệnh API nào → giảm tải rate & nhanh hơn nhiều.
 _demand: Dict[str, float] = {}     # mã đang xem → thời điểm cuối được hỏi
 _deep_want: set = set()            # mã cần nạp SÂU cả phiên (màn chi tiết)
+
+# Điểm Shark tính NGẦM ở worker khi tape đổi → request chỉ LOAD, không tính lại.
+_score_cache: Dict[str, dict] = {}   # tk -> {signal, sig:(n,last_ts), date, at}
+SCORE_RECOMPUTE_MIN = 20.0           # giây — không tính lại điểm dày hơn mức này/mã
+
+
+def _recompute_score(tk: str) -> None:
+    """Tính điểm Shark cho 1 mã Ở NỀN — chỉ khi tape ĐỔI (giao dịch mới) và đã qua
+    SCORE_RECOMPUTE_MIN. Lưu vào RAM (_score_cache) + store (shark_score) để request
+    chỉ việc load. 'khi tính lại nếu có thay đổi mới cập nhật'."""
+    c = _cache.get(tk)
+    if not c or not c.get("ticks"):
+        return
+    now = time.time()
+    prev = _score_cache.get(tk)
+    date = c.get("date") or _today()
+    if prev and prev.get("date") == date and now - prev.get("at", 0) < SCORE_RECOMPUTE_MIN:
+        return
+    _clean_tape(c)
+    ticks = c["ticks"]
+    if not ticks:
+        return
+    sig = (len(ticks), ticks[-1]["ts"])
+    if prev and prev.get("date") == date and prev.get("sig") == sig:
+        return                       # tape KHÔNG đổi → khỏi tính lại
+    m = _metrics(tk, ticks, BIG_VALUE_VND, WINDOW_MIN)
+    m.pop("big_orders", None)
+    _score_cache[tk] = {"signal": m, "sig": sig, "date": date, "at": now}
+    if not m.get("empty"):
+        try:
+            tape_store.save_score(tk, date, m, BIG_VALUE_VND,
+                                  complete=not _is_trading_hours())
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _cached_score(tk: str) -> Optional[dict]:
+    """Điểm đã tính ngầm còn hợp lệ (đúng phiên) trong RAM."""
+    sc = _score_cache.get(tk)
+    if sc and sc.get("date") == (_cache.get(tk, {}).get("date") or _session_date(tk)):
+        return sc["signal"]
+    return None
 DEMAND_TTL = 300.0                 # 5' không xem → thôi làm mới
 REFRESH_INTERVAL = 3.0             # nhịp worker nền quét các mã đang xem
 
@@ -427,6 +477,11 @@ def _refresh_one(tk: str) -> None:
             _ensure_deep(tk)
         except Exception as e:  # noqa: BLE001
             print(f"⚠️  deep-seed {tk}: {type(e).__name__}: {e}", flush=True)
+    # Tính NGẦM điểm Shark khi tape đổi → Watchlist/Dashboard chỉ load cache
+    try:
+        _recompute_score(tk)
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️  score {tk}: {type(e).__name__}: {e}", flush=True)
 
 
 async def refresh_loop():
@@ -954,26 +1009,35 @@ def compute_and_cache_signal(ticker: str, big_value: float = BIG_VALUE_VND,
 
 
 def get_signal(ticker: str, big_value: float = BIG_VALUE_VND, window_min: int = WINDOW_MIN) -> dict:
-    """Tín hiệu gọn (không kèm tape) — CHỈ ĐỌC CACHE, không gọi API.
+    """Tín hiệu gọn (không kèm tape) — CHỈ ĐỌC CACHE, không gọi API, KHÔNG tính lại.
 
-    Đăng ký nhu cầu → worker nền (refresh_loop) + WS lo việc làm mới. Handler này chỉ:
-      • NGOÀI PHIÊN: có cache điểm chốt (complete) → trả NGAY.
-      • Còn lại: tính _metrics trên tape đang có trong cache (CPU cục bộ, không đụng mạng)."""
+    Thứ tự (tham số mặc định): điểm worker tính ngầm (RAM) → điểm chốt trong store →
+    tính 1 lần (mã chưa được worker chạm tới, vd chưa vào watchlist). Sau khi tính
+    fallback thì lưu ngay để lần sau chỉ load."""
     tk = ticker.upper()
     _touch(tk)
-    if not _is_trading_hours() and _score_cacheable(big_value, window_min):
-        cached = tape_store.load_score(tk, _session_date(tk))
-        # Bỏ qua cache tính bằng CÔNG THỨC CŨ (khác SCORE_VERSION) — điểm không so được
-        if (cached and cached.get("complete") and cached.get("big_value") == big_value
-                and (cached.get("signal") or {}).get("_v") == SCORE_VERSION):
-            return cached["signal"]
+    default = _score_cacheable(big_value, window_min)
+    if default:
+        # 1) điểm worker tính ngầm khi có giao dịch mới (mới nhất, đúng phiên)
+        s = _cached_score(tk)
+        if s is not None:
+            return s
+        # 2) ngoài phiên: điểm chốt trong store (khỏi tải/tính)
+        if not _is_trading_hours():
+            cached = tape_store.load_score(tk, _session_date(tk))
+            if (cached and cached.get("complete") and cached.get("big_value") == big_value
+                    and (cached.get("signal") or {}).get("_v") == SCORE_VERSION):
+                return cached["signal"]
+    # 3) fallback: tính 1 lần trên tape đang có (mã chưa được worker tính ngầm)
     c = _ensure_loaded(tk)          # nạp từ store nếu cần — KHÔNG gọi API
     _clean_tape(c)
     m = _metrics(tk, c.get("ticks", []), big_value, window_min)
     m.pop("big_orders", None)
     if "err" in c and m.get("empty"):
         m["error"] = c["err"]
-    if _score_cacheable(big_value, window_min) and not m.get("empty"):
+    if default and not m.get("empty"):
+        _score_cache[tk] = {"signal": m, "sig": (len(c["ticks"]), c["ticks"][-1]["ts"]),
+                            "date": c.get("date") or _today(), "at": time.time()}
         try:
             tape_store.save_score(tk, _session_date(tk), m, big_value,
                                   complete=not _is_trading_hours())
