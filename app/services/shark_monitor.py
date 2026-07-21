@@ -472,11 +472,15 @@ def _clean_tape(c: dict) -> None:
     out: List[dict] = []
     sig_seen: set = set()
     for k, t in keyed:
+        sec = k.replace(microsecond=0)
         # [2] giây có DNSE → bỏ tick nguồn khác trong giây đó
-        if dnse_secs and not t.get("_dnse") and k.replace(microsecond=0) in dnse_secs:
+        if dnse_secs and not t.get("_dnse") and sec in dnse_secs:
             continue
-        # [3] trùng hệt nội dung → bỏ
-        sig = (t["ts"], t["side"], t["volume"], round(float(t["price"]), 4))
+        # [3] khử trùng theo GIÂY (bỏ mili-giây): cùng lệnh nhưng hai nguồn/hai lần gộp
+        # ghi mili-giây LỆCH nhau (11:00:41.100 vs .638) nên chữ ký có ms không bắt được.
+        # Rủi ro: 2 lệnh KHÁC nhau trùng cả (giây, chiều, KL, giá) — hiếm, và 150ms-agg
+        # đã gộp các fill sát nhau nên phần lớn đã là 1; chấp nhận đổi lấy hết lặp.
+        sig = (sec, t["side"], t["volume"], round(float(t["price"]), 4))
         if sig in sig_seen:
             continue
         sig_seen.add(sig)
