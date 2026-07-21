@@ -1009,10 +1009,13 @@ def _metrics(ticker: str, ticks: List[dict], big_value: float, window_min: int) 
         patterns.insert(0, f"Tiền lớn xả, nhỏ lẻ mua (phân kỳ {dv['divergence']:+.2f})")
 
     last_price = ticks[-1]["price"]
+    # Danh sách lệnh lớn HIỂN THỊ: trước đây cắt 30 gần nhất → mã nhiều lệnh lớn chỉ thấy
+    # buổi chiều (điểm KHÔNG bị ảnh hưởng vì aggregate big_buy_val/big_sell_val quét CẢ
+    # phiên). Nay giữ tới 500 lệnh gần nhất → thấy được cả buổi sáng (list cuộn được).
     big_orders = [
         {"ts": t["ts"], "side": t["side"], "volume": t["volume"],
          "price": t["price"], "value": t["value"]}
-        for t in big[-30:]
+        for t in big[-500:]
     ]
     big_orders.reverse()
 
