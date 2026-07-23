@@ -310,8 +310,38 @@ Nghiệm thu (dữ liệu 23/07, `net = Σ strength·confidence`):
 per-event context hiện chỉ đổi `location` (trend/S-R giữ mức phiên — chấp nhận được vì
 trend theo ngày).
 
-### 🔨 Phase C — kế tiếp (Decision Engine + Smart Money Report)
+### ✅ Phase C — Decision Engine + Smart Money Report (xong)
 
-Gộp events + context → `accumulation_score`, `distribution_score`, `breakout_score`,
-`trend_quality`, `institution_activity`, `smart_money_confidence`, `wyckoff_phase`,
-`conclusion` (text) + `evidence_chain`. Minh bạch, tự giải thích.
+Module `decision.py` (Layer 3) — minh bạch (rule/score, kèm `components` truy vết):
+
+- **Sub-scores**: accumulation / distribution / breakout / trend_quality /
+  institution_activity / bull_strength / bear_strength / market_control /
+  smart_money_confidence.
+- **MẤU CHỐT**: distribution GATE đóng góp của khối ngoại/cluster bởi mức **absorption** —
+  khối ngoại BÁN mà giá được hấp thụ (STB) thì `foreign_dist = max(0,-foreign)·(1−absorp)`
+  → ~0 → distribution KHÔNG tăng oan. Đây là thứ phân biệt "phân phối" thật với "hấp thụ".
+- **Wyckoff MỞ RỘNG**: Accumulation · Spring · Markup · Buying Climax · Distribution ·
+  Markdown · Trung tính — cây quyết định theo trend + điểm + vị trí + phân kỳ.
+- **Smart Money Report**: sao (0–5) cho 5 chiều + cờ (absorption/distribution/vwap/poc/
+  delta/cvd) + **kết luận tiếng Việt** ghép từ trạng thái + `evidence_chain` (truy vết).
+- `shark_monitor.get_decision` tự dựng extras (vol_trend ngày, dịch POC nửa phiên, delta
+  gần đây); `GET /api/shark/decision/{ticker}`.
+
+Nghiệm thu (23/07):
+
+| Mã | Wyckoff | absorption | distribution | Kết luận rút gọn | Khớp |
+|---|---|---|---|---|---|
+| STB | **Markup** | Detected | Not detected (17) | "được hấp thụ, giá giữ, chưa phân phối" | ✓ đúng Institutional Absorption |
+| HDB | Trung tính | Not detected | 0 | đọc trung thực phiên (tape bán nhiều, CVD âm) | ✓ honest, không ép theo brief |
+| VIC | Markup | — | 21 | "cung tại vùng cao — theo dõi phân phối" | ✓ sắc thái đúng |
+
+**Ghi chú calibrate**: ngưỡng phase (acc/dist ≥55) và trọng số sub-score là **tham số**,
+sẽ hiệu chỉnh bằng backtest Phase D. Foreign_dir=0 khi thiếu token FireAnt (local) → trên
+server sẽ đủ tín hiệu khối ngoại.
+
+### 🔨 Phase D — kế tiếp (backtest event-level + benchmark version)
+
+Tổng quát hoá `shark_backtest`: persist đã có (`smart_money_events`) → group theo
+`event.type × context-bucket` → forward return T+h trừ baseline, t-stat, edge, win-rate,
+monotonicity. Benchmark version bằng replay tape lịch sử. Đây là bước hiệu chỉnh trọng số
+Layer 3 dựa trên bằng chứng thay vì cảm tính.

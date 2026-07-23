@@ -517,6 +517,64 @@ def get_context(ticker: str, with_foreign: bool = True) -> dict:
     return d
 
 
+def get_decision(ticker: str, persist: bool = True) -> dict:
+    """LAYER 3 — Decision Engine: gộp events + context + metrics → Smart Money Report.
+    Đọc tape cache; tự dựng extras (vol_trend ngày, dịch POC nửa phiên, delta gần đây)."""
+    from app.services import order_flow, market_context, patterns, decision, ohlcv_store
+    tk = ticker.upper()
+    of = get_orderflow(tk)
+    if of.get("empty"):
+        return {"ticker": tk, "empty": True}
+    c = _ensure_loaded(tk)
+    ticks = c.get("ticks", [])
+    big_thr = float((of.get("large_orders") or {}).get("threshold_p97") or 0.0)
+    ctx = market_context.build_context(tk, ticks, of=of)
+    evs = [e.to_dict() for e in patterns.detect_all(ticks, ctx, big_thr=big_thr)]
+    date = c.get("date") or _today()
+    if persist and evs:
+        try:
+            tape_store.save_events(tk, date, evs, algo_version=patterns.ALGO_VERSION)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Extras cho Decision
+    vol_trend = 0.0
+    try:
+        from datetime import timedelta
+        df = ohlcv_store.get_ohlcv(tk, start=(datetime.now() - timedelta(days=40)).strftime("%Y-%m-%d"))
+        if df is not None and len(df) >= 10:
+            vols = [float(x) for x in df["volume"].tolist() if x]
+            half = len(vols) // 2
+            v1 = sum(vols[:half]) / max(1, half); v2 = sum(vols[half:]) / max(1, len(vols) - half)
+            vol_trend = _clamp((v2 - v1) / v1, -1, 1) if v1 else 0.0
+    except Exception:  # noqa: BLE001
+        pass
+    # Dịch POC nửa đầu → nửa sau phiên
+    poc_shift = 0.0
+    try:
+        mid = len(ticks) // 2
+        if mid >= 20:
+            p1 = order_flow.volume_profile(ticks[:mid]).get("poc")
+            p2 = order_flow.volume_profile(ticks[mid:]).get("poc")
+            if p1 and p2:
+                poc_shift = _clamp((p2 - p1) / p1, -1, 1)
+    except Exception:  # noqa: BLE001
+        pass
+    # Delta gần đây (phần cuối chuỗi CVD)
+    delta_recent = 0.0
+    ser = of.get("series") or []
+    if len(ser) >= 5:
+        delta_recent = ser[-1]["cvd"] - ser[max(0, int(len(ser) * 0.8))]["cvd"]
+
+    state = decision.decide(ctx, of, evs, vol_trend=vol_trend, poc_shift=poc_shift,
+                            delta_recent=delta_recent, n_ticks=len(ticks))
+    state["ticker"] = tk
+    state["empty"] = False
+    state["date"] = date
+    state["context"] = ctx.to_dict()
+    return state
+
+
 def get_events(ticker: str, persist: bool = True) -> dict:
     """LAYER 2 — phát hiện sự kiện dòng tiền CÓ NGỮ CẢNH cho 1 mã.
     Đọc tape cache → order flow (ngưỡng lệnh lớn thích ứng) → context → detectors.

@@ -35,6 +35,13 @@ def shark_orderflow(ticker: str):
     return shark_monitor.get_orderflow(ticker)
 
 
+@router.get("/decision/{ticker}")
+def shark_decision(ticker: str, persist: bool = Query(True)):
+    """Layer 3 — Smart Money Report: accumulation/distribution/breakout score, trend
+    quality, institution activity, Wyckoff phase, kết luận + sao + evidence chain."""
+    return shark_monitor.get_decision(ticker, persist=persist)
+
+
 @router.get("/events/{ticker}")
 def shark_events(ticker: str, persist: bool = Query(True)):
     """Layer 2 — sự kiện dòng tiền có ngữ cảnh (absorption/supply/divergence/cluster),
