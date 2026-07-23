@@ -415,7 +415,7 @@ def recent_summary(ticker, sessions=5) -> {
   HDB conflict 94(Cao)→conf 58%; STB conflict 0(Thấp)→conf 84%. Frontend: badge regime +
   "Mâu thuẫn {mức}" ở header Smart Money.
 | F4 | Story Engine — kể chuyện dòng tiền theo thời gian + Smart Money Story | ✅ |
-| F5 | Large Order aggregates (#9) | ⏳ |
+| F5 | Large Order aggregates (#9) | ✅ |
 | F6 | Presentation — hover breakdown, dashboard mới, typography | ⏳ (một phần: bấm điểm số xem ledger) |
 
 ### ✅ F1 — Contribution Ledger (xong)
@@ -479,6 +479,16 @@ Markup 83%.
 Nghiệm thu STB: 09:17 bên mua dẫn dắt → 10:40/11:05 hấp thụ tại hỗ trợ → 13:50/14:15 cụm
 tổ chức mua → cuối phiên cung chủ động → ATC bình thường → KL Tăng giá/Theo dõi. Narrative
 tổng hợp đúng hành vi.
+
+### ✅ F5 — Large Order aggregates (xong)
+
+`order_flow.large_orders` bổ sung thống kê toàn phiên (#9): buy/sell_large_pct,
+above/below_vwap_pct, near_poc_pct (POC từ volume_profile), avg_size, largest_cluster
+(cụm lệnh lớn cùng chiều liên tiếp ≤60s có tổng giá trị lớn nhất). Frontend: lưới 4 thẻ
+thống kê ở đầu mục "Lệnh lớn" (tab Order Flow).
+
+Nghiệm thu 23/07: STB Mua 91.5%/Bán 8.5%, trên VWAP 86%, cụm lớn nhất 64.9 tỷ; HDB Mua
+42.9%/Bán 57.1%, dưới VWAP 59%.
 
 ### 🔨 Phase D — sau (backtest event-level + benchmark version)
 

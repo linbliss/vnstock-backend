@@ -165,34 +165,67 @@ def volume_profile(ticks: List[dict], max_bins: int = 40) -> Dict:
             "va_high": max(va_prices) if va_prices else poc}
 
 
-# ── [4] Large Order Detector (theo tầng percentile) + vị trí so VWAP ──────────────────
-def large_orders(ticks: List[dict], thr: Dict[str, float], limit: int = 500) -> Dict:
+# ── [4] Large Order Detector (theo tầng percentile) + vị trí so VWAP + THỐNG KÊ TỔNG HỢP ─
+def large_orders(ticks: List[dict], thr: Dict[str, float], limit: int = 500,
+                 poc: Optional[float] = None) -> Dict:
     p97 = thr["p97"]
     big = [t for t in ticks if t["value"] >= p97]
     # VWAP luỹ kế để biết mỗi lệnh lớn khớp TRÊN hay DƯỚI giá bình quân
     pv = vol = 0
     vwap_at: Dict[int, float] = {}
-    for i, t in enumerate(ticks):
+    for t in ticks:
         pv += t["price"] * t["volume"]; vol += t["volume"]
         vwap_at[id(t)] = pv / vol if vol else t["price"]
     def tier(v):
         return "huge" if v >= thr["p99"] else "large"
+    def vs(t):
+        w = vwap_at.get(id(t), t["price"])
+        return "above" if t["price"] > w else ("below" if t["price"] < w else "at")
     orders = []
     for t in big[-limit:]:
-        w = vwap_at.get(id(t), t["price"])
         orders.append({"ts": t["ts"], "side": t["side"], "volume": t["volume"],
                        "price": t["price"], "value": t["value"], "tier": tier(t["value"]),
-                       "vs_vwap": "above" if t["price"] > w else ("below" if t["price"] < w else "at")})
+                       "vs_vwap": vs(t)})
     orders.reverse()
     buy_below = sum(1 for o in orders if o["side"] == "B" and o["vs_vwap"] == "below")
     sell_above = sum(1 for o in orders if o["side"] == "S" and o["vs_vwap"] == "above")
+
+    # ── Thống kê tổng hợp trên TOÀN BỘ lệnh lớn của phiên (#9) ──
+    n = len(big)
+    buy_val = sum(t["value"] for t in big if t["side"] == "B")
+    sell_val = sum(t["value"] for t in big if t["side"] == "S")
+    tot_val = buy_val + sell_val
+    above = sum(1 for t in big if vs(t) == "above")
+    below = sum(1 for t in big if vs(t) == "below")
+    near_poc = (sum(1 for t in big if abs(t["price"] - poc) / poc < 0.003) if poc else 0)
+    avg_size = round(sum(t["volume"] for t in big) / n) if n else 0
+    # Cụm lớn nhất: nhóm lệnh lớn CÙNG CHIỀU liên tiếp cách nhau ≤60s → tổng giá trị lớn nhất
+    largest_cluster = 0.0
+    cur_val = 0.0; cur_side = None; last_ts = None
+    for t in sorted(big, key=lambda x: x["ts"]):
+        tp = _pt(t["ts"])
+        cont = (cur_side == t["side"] and last_ts is not None and tp is not None
+                and tp - last_ts <= 60.0)
+        cur_val = (cur_val + t["value"]) if cont else t["value"]
+        cur_side = t["side"]; last_ts = tp
+        largest_cluster = max(largest_cluster, cur_val)
+
+    def pct(x): return round(x / n * 100, 1) if n else 0.0
     return {
         "threshold_p97": round(p97), "threshold_p99": round(thr["p99"]),
-        "count": len(big),
-        "buy_val": sum(t["value"] for t in big if t["side"] == "B"),
-        "sell_val": sum(t["value"] for t in big if t["side"] == "S"),
+        "count": n,
+        "buy_val": buy_val,
+        "sell_val": sell_val,
         "buy_below_vwap": buy_below,     # gom giá rẻ (tích luỹ)
         "sell_above_vwap": sell_above,   # xả giá cao (phân phối)
+        # thống kê tổng hợp (#9)
+        "buy_large_pct": round(buy_val / tot_val * 100, 1) if tot_val else 0.0,
+        "sell_large_pct": round(sell_val / tot_val * 100, 1) if tot_val else 0.0,
+        "above_vwap_pct": pct(above),
+        "below_vwap_pct": pct(below),
+        "near_poc_pct": pct(near_poc),
+        "avg_size": avg_size,
+        "largest_cluster": round(largest_cluster),
         "orders": orders,
     }
 
@@ -302,6 +335,7 @@ def analyze(ticks: List[dict]) -> Dict:
         return {"empty": True}
     thr = big_thresholds(ticks)
     cvd = cumulative_delta(ticks)
+    vp = volume_profile(ticks)
     return {
         "empty": False,
         "n_ticks": len(ticks),
@@ -309,8 +343,8 @@ def analyze(ticks: List[dict]) -> Dict:
         "cvd": cvd,
         "cvd_divergence": _divergence(ticks),
         "series": series(ticks),
-        "volume_profile": volume_profile(ticks),
-        "large_orders": large_orders(ticks, thr),
+        "volume_profile": vp,
+        "large_orders": large_orders(ticks, thr, poc=vp.get("poc")),
         "absorption": absorption_events(ticks),
         "iceberg": iceberg_candidates(ticks),   # experimental
         "footprint": footprint(ticks),
