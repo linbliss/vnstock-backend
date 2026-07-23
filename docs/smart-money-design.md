@@ -416,7 +416,7 @@ def recent_summary(ticker, sessions=5) -> {
   "Mâu thuẫn {mức}" ở header Smart Money.
 | F4 | Story Engine — kể chuyện dòng tiền theo thời gian + Smart Money Story | ✅ |
 | F5 | Large Order aggregates (#9) | ✅ |
-| F6 | Presentation — hover breakdown, dashboard mới, typography | ⏳ (một phần: bấm điểm số xem ledger) |
+| F6 | Presentation — hover breakdown, dashboard mới, typography | ✅ (pass 1) |
 
 ### ✅ F1 — Contribution Ledger (xong)
 
@@ -489,6 +489,19 @@ thống kê ở đầu mục "Lệnh lớn" (tab Order Flow).
 
 Nghiệm thu 23/07: STB Mua 91.5%/Bán 8.5%, trên VWAP 86%, cụm lớn nhất 64.9 tỷ; HDB Mua
 42.9%/Bán 57.1%, dưới VWAP 59%.
+
+### ✅ F6 — Presentation (pass 1, xong)
+
+Dọn phân cấp thông tin để đọc nhanh 30s (#11) + bỏ trùng lặp (frontend `SharkPage.tsx`):
+- **Header gọn**: chỉ mã + phase badge + regime + độ tin (bỏ market_control/bull/bear/
+  conflict trùng với thẻ Quyết định).
+- **Thẻ Quyết định = hero duy nhất**: gộp thêm thế trận + Bull/Bear + mâu thuẫn + phase_note.
+- **Thứ tự đọc**: Quyết định → Câu chuyện (vì sao) → điểm số/rating/gauge → cờ → timeline
+  → context/evidence. Narrative lên ngay sau verdict.
+- **Hover event** (timeline): hiện cường độ + độ tin + vị trí + bằng chứng (#8). Bấm thanh
+  điểm vẫn xổ sổ cái "Vì sao?" (#8/F1).
+
+Còn có thể làm pass 2 nếu cần: footprint hover chi tiết (delta/buy/sell), compact mode.
 
 ### 🔨 Phase D — sau (backtest event-level + benchmark version)
 
