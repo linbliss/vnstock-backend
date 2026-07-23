@@ -414,7 +414,7 @@ def recent_summary(ticker, sessions=5) -> {
   `conflict = 2·min(pos,neg)/(pos+neg)`; phạt `confidence ×(1−0.35·conflict)`. Nghiệm thu:
   HDB conflict 94(Cao)→conf 58%; STB conflict 0(Thấp)→conf 84%. Frontend: badge regime +
   "Mâu thuẫn {mức}" ở header Smart Money.
-| F4 | Story Engine — kể chuyện dòng tiền theo thời gian + Smart Money Story | ⏳ |
+| F4 | Story Engine — kể chuyện dòng tiền theo thời gian + Smart Money Story | ✅ |
 | F5 | Large Order aggregates (#9) | ⏳ |
 | F6 | Presentation — hover breakdown, dashboard mới, typography | ⏳ (một phần: bấm điểm số xem ledger) |
 
@@ -465,6 +465,20 @@ Markup 83%.
 
 **Còn lại**: F4 Story Engine · F5 Large Order aggregates · F6 Presentation. Memory (đọc
 `smart_money_events` nhiều phiên) = seam đã có, impl khi cần.
+
+### ✅ F4 — Story Engine (xong)
+
+`story.py` (Layer 5) — biến Event + diễn biến giá thành CÂU CHUYỆN, không phải event-list:
+- **beats**: dòng thời gian có lời kể (mở cửa → mốc sự kiện đa dạng ≤2/loại → cuối phiên →
+  ATC → kết luận), mỗi beat có tone bull/bear/neutral.
+- **narrative** "Smart Money Story": đoạn văn giọng chuyên gia — tiền lớn đẩy giá hay hấp
+  thụ, khối ngoại vs giá, POC/VWAP, kết luận theo xác suất giả thuyết.
+- Output `story{beats, narrative}`. Frontend: card "Câu chuyện dòng tiền" (timeline dọc có
+  chấm màu + đoạn Smart Money Story), thay card Kết luận đơn giản.
+
+Nghiệm thu STB: 09:17 bên mua dẫn dắt → 10:40/11:05 hấp thụ tại hỗ trợ → 13:50/14:15 cụm
+tổ chức mua → cuối phiên cung chủ động → ATC bình thường → KL Tăng giá/Theo dõi. Narrative
+tổng hợp đúng hành vi.
 
 ### 🔨 Phase D — sau (backtest event-level + benchmark version)
 

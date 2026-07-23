@@ -435,6 +435,14 @@ def decide(context: Union[Context, dict], of: dict, events: List[dict],
                              institution_activity, trend_quality, conflict,
                              smart_money_confidence, cx, evidence)
 
+    # ── F4 Story Engine: kể chuyện dòng tiền + Smart Money Story ──
+    from app.services import story as _story
+    story = _story.build_story(
+        of.get("series") or [], events, cx,
+        {"absorp": absorp, "supply": supply, "cluster": cluster, "flow": flow,
+         "foreign": foreign, "poc_shift": poc_shift, "diverg": diverg},
+        decision_out, hypotheses)
+
     ledgers = {
         "accumulation": [c.to_dict() for c in acc_led],
         "distribution": [c.to_dict() for c in dist_led],
@@ -483,6 +491,7 @@ def decide(context: Union[Context, dict], of: dict, events: List[dict],
         "evidence": evidence,               # F2: Evidence Engine (✓/✗ + confidence)
         "hypotheses": hypotheses,           # F3: giả thuyết song song + xác suất
         "decision": decision_out,           # F3: State/Institution/Trend/Risk/Action/Reason
+        "story": story,                     # F4: kể chuyện dòng tiền (beats + narrative)
         "evidence_chain": evidence_chain,
         "report": report,
         "n_events": len(events),
