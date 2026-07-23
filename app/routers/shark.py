@@ -35,6 +35,14 @@ def shark_orderflow(ticker: str):
     return shark_monitor.get_orderflow(ticker)
 
 
+@router.get("/health/{ticker}")
+def shark_tape_health(ticker: str, cross_check: bool = Query(False)):
+    """Phase 0 — độ tin của trường `side` (nền của CVD/imbalance/absorption):
+    phân bố B/S/U, %U, đồng thuận tick-rule, tỉ lệ nguồn DNSE/vnstock.
+    cross_check=true: đối chiếu side DNSE với KBS (chạy trên server)."""
+    return shark_monitor.get_tape_health(ticker, cross_check=cross_check)
+
+
 @router.get("/history/{ticker}")
 def shark_history_one(
     ticker: str,

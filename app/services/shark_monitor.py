@@ -501,6 +501,81 @@ def get_orderflow(ticker: str) -> dict:
     return data
 
 
+def tape_health(ticks: List[dict]) -> dict:
+    """PHASE 0 — đo ĐỘ TIN của trường `side` (nền móng của CVD/imbalance/absorption).
+
+    Trả:
+      • side_dist B/S/U + u_pct: %U cao ⇒ nhiều khớp không rõ chiều ⇒ CVD kém tin.
+      • tickrule_agree_pct: %khớp mà `side` cùng hướng với tick-rule (uptick→B, downtick→S).
+        `side` LÀ aggressor thật thì tương quan mạnh (80–96% thực đo) chứ KHÔNG 100%
+        (aggressor ≠ tick-rule hoàn toàn). ~50% ⇒ nghi `side` là nhãn rỗng/ngẫu nhiên.
+      • source_mix: tỉ lệ tick từ DNSE (WS) vs vnstock (REST) — biết nguồn đang cấp side.
+      • auction: số khớp phiên định kỳ (ATO/ATC = side U, đúng khi bị loại khỏi CVD).
+    """
+    n = len(ticks)
+    if not n:
+        return {"empty": True}
+    b = sum(1 for t in ticks if t["side"] == "B")
+    s = sum(1 for t in ticks if t["side"] == "S")
+    u = n - b - s
+    dnse = sum(1 for t in ticks if t.get("_dnse"))
+    # Tick-rule: bỏ U và giá bằng (zero-tick không kết luận)
+    agree = disagree = 0
+    prev = None
+    for t in ticks:
+        p, side = t["price"], t["side"]
+        if prev is not None and side in ("B", "S"):
+            if p > prev:
+                agree += (side == "B"); disagree += (side == "S")
+            elif p < prev:
+                agree += (side == "S"); disagree += (side == "B")
+        prev = p
+    tr_tot = agree + disagree
+    return {
+        "empty": False,
+        "n_ticks": n,
+        "side_dist": {"B": b, "S": s, "U": u},
+        "u_pct": round(u / n * 100, 2),
+        "tickrule_agree_pct": round(agree / tr_tot * 100, 1) if tr_tot else None,
+        "tickrule_n": tr_tot,
+        "source_mix": {"dnse": dnse, "vnstock": n - dnse,
+                       "dnse_pct": round(dnse / n * 100, 1)},
+        "time_span": [ticks[0]["ts"][11:19], ticks[-1]["ts"][11:19]],
+    }
+
+
+def get_tape_health(ticker: str, cross_check: bool = False) -> dict:
+    """Sức khoẻ tape 1 mã (đọc cache). cross_check=True: kéo KBS full-session và đối
+    chiếu `side` DNSE-vs-KBS trên các khớp trùng (giây, giá, KL) — CHỈ chạy trên server
+    (nơi có tape DNSE) để xác nhận side của DNSE khớp với vendor độc lập."""
+    tk = ticker.upper()
+    c = _ensure_loaded(tk)
+    _clean_tape(c)
+    ticks = c.get("ticks", [])
+    h = tape_health(ticks)
+    h["ticker"] = tk
+    h["date"] = c.get("date") or _today()
+    if cross_check and ticks:
+        try:
+            rows, src, _ = _fetch_full_session(tk)
+            ref = {}
+            for r in rows:
+                ref.setdefault((r["ts"][11:19], round(r["price"], 2), r["volume"]), r["side"])
+            same = diff = 0
+            for t in ticks:
+                k = (t["ts"][11:19], round(t["price"], 2), t["volume"])
+                rs = ref.get(k)
+                if rs and rs in ("B", "S") and t["side"] in ("B", "S"):
+                    same += (rs == t["side"]); diff += (rs != t["side"])
+            tot = same + diff
+            h["cross_check"] = {"ref_source": src, "matched": tot,
+                                "side_agree_pct": round(same / tot * 100, 1) if tot else None,
+                                "disagree": diff}
+        except Exception as e:  # noqa: BLE001
+            h["cross_check"] = {"error": str(e)}
+    return h
+
+
 def _cached_score(tk: str) -> Optional[dict]:
     """Điểm đã tính ngầm còn hợp lệ (đúng phiên) trong RAM."""
     sc = _score_cache.get(tk)
