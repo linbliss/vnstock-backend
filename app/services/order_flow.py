@@ -265,6 +265,36 @@ def iceberg_candidates(ticks: List[dict], min_repeat: int = 5,
     return out[:20]
 
 
+# ── Footprint: net delta theo lưới GIÁ × THỜI GIAN (cho heatmap) ──────────────────────
+def footprint(ticks: List[dict], price_bins: int = 20, time_buckets: int = 30) -> Dict:
+    """Lưới (mức giá × khung thời gian) → net delta (mua−bán) mỗi ô. Nhìn ngay được
+    dòng tiền GOM/XẢ diễn ra ở VÙNG GIÁ nào, THỜI ĐIỂM nào — biểu đồ footprint kinh điển."""
+    if not ticks:
+        return {"empty": True}
+    prices = [t["price"] for t in ticks]
+    lo, hi = min(prices), max(prices)
+    t0, t1 = _pt(ticks[0]["ts"]), _pt(ticks[-1]["ts"])
+    if hi <= lo or not t0 or not t1 or t1 <= t0:
+        return {"empty": True}
+    pw = (hi - lo) / price_bins
+    tw = (t1 - t0) / time_buckets
+    grid = [[0 for _ in range(time_buckets)] for _ in range(price_bins)]  # [giá][thời gian]
+    for t in ticks:
+        pi = min(int((t["price"] - lo) / pw), price_bins - 1)
+        tp = _pt(t["ts"])
+        ti = min(int((tp - t0) / tw), time_buckets - 1) if tp else 0
+        d = t["volume"] if t["side"] == "B" else (-t["volume"] if t["side"] == "S" else 0)
+        grid[pi][ti] += d
+    # hàng trên = giá CAO (đảo thứ tự bin)
+    price_levels = [round(lo + (i + 0.5) * pw, 2) for i in range(price_bins)][::-1]
+    grid_rows = grid[::-1]
+    time_labels = [datetime.fromtimestamp(t0 + (i + 0.5) * tw).strftime("%H:%M")
+                   for i in range(time_buckets)]
+    max_abs = max((abs(c) for row in grid for c in row), default=0) or 1
+    return {"empty": False, "price_levels": price_levels, "time_labels": time_labels,
+            "grid": grid_rows, "max_abs": max_abs}
+
+
 # ── Gộp tất cả ───────────────────────────────────────────────────────────────────────
 def analyze(ticks: List[dict]) -> Dict:
     """Tính TOÀN BỘ order flow trên tape đã cache. Một lượt gọi các hàm O(n)."""
@@ -283,5 +313,6 @@ def analyze(ticks: List[dict]) -> Dict:
         "large_orders": large_orders(ticks, thr),
         "absorption": absorption_events(ticks),
         "iceberg": iceberg_candidates(ticks),   # experimental
+        "footprint": footprint(ticks),
         "updated_at": datetime.now().isoformat(),
     }

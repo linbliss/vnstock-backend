@@ -355,8 +355,13 @@ Tab **Smart Money** trong Shark Action (frontend `SharkPage.tsx` + hook `useShar
 Gọi 1 endpoint `GET /api/shark/decision/{ticker}` (đã kèm `events` để vẽ timeline).
 Type-check + build frontend PASS. Cần deploy backend để có dữ liệu.
 
-**Còn nợ viz** (Phase E.2): Footprint heatmap (lưới giá×thời gian, màu net delta) — cần
-thêm endpoint Layer 1 sinh lưới footprint; Composite dashboard gauge.
+### ✅ Phase E.2 — Footprint heatmap + dashboard gauge (xong)
+
+- Backend: `order_flow.footprint(ticks, price_bins=20, time_buckets=30)` → lưới net delta
+  (giá×thời gian) + tô POC/VWAP; đưa vào `analyze()`. Kiểm: tổng lưới = CVD cuối phiên.
+- Frontend: `FootprintHeatmap` trong tab Order Flow (ô xanh gom/đỏ xả, đậm theo |delta|,
+  nhãn giá POC/VWAP + trục thời gian). `SMGauge` bán nguyệt "Cán cân dòng tiền" (Xả◄►Gom
+  = accumulation−distribution) trong tab Smart Money.
 
 ### 🔨 Phase D — kế tiếp (backtest event-level + benchmark version)
 
