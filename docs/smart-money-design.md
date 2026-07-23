@@ -339,9 +339,29 @@ Nghiệm thu (23/07):
 sẽ hiệu chỉnh bằng backtest Phase D. Foreign_dir=0 khi thiếu token FireAnt (local) → trên
 server sẽ đủ tín hiệu khối ngoại.
 
+### ✅ Phase E — Trực quan hoá (frontend, xong build)
+
+Tab **Smart Money** trong Shark Action (frontend `SharkPage.tsx` + hook `useSharkDecision`):
+
+- **Header**: mã + badge Wyckoff phase (màu theo pha) + market_control + Bull/Bear + độ tin.
+- **Rating sao** (0–5) × 5 chiều: Xu hướng · Tổ chức · Gom · Xả · Breakout.
+- **Thanh điểm** (0–100): accumulation/distribution/breakout/institution/trend_quality.
+- **Cờ nhanh** màu: Hấp thụ · Phân phối · VWAP · POC · Delta · CVD.
+- **Kết luận** tiếng Việt (render **đậm**).
+- **Timeline sự kiện**: vạch theo giờ 09:00–14:45, trên/dưới trục = gom/xả, cao theo
+  |strength|, đậm theo confidence; kèm danh sách 8 event mạnh nhất + evidence.
+- **Ngữ cảnh** (trend/MA/S-R/VWAP/POC/ngoại-tự doanh) + **evidence chain**.
+
+Gọi 1 endpoint `GET /api/shark/decision/{ticker}` (đã kèm `events` để vẽ timeline).
+Type-check + build frontend PASS. Cần deploy backend để có dữ liệu.
+
+**Còn nợ viz** (Phase E.2): Footprint heatmap (lưới giá×thời gian, màu net delta) — cần
+thêm endpoint Layer 1 sinh lưới footprint; Composite dashboard gauge.
+
 ### 🔨 Phase D — kế tiếp (backtest event-level + benchmark version)
 
 Tổng quát hoá `shark_backtest`: persist đã có (`smart_money_events`) → group theo
 `event.type × context-bucket` → forward return T+h trừ baseline, t-stat, edge, win-rate,
 monotonicity. Benchmark version bằng replay tape lịch sử. Đây là bước hiệu chỉnh trọng số
-Layer 3 dựa trên bằng chứng thay vì cảm tính.
+Layer 3 dựa trên bằng chứng thay vì cảm tính. **Cần tích luỹ event qua nhiều phiên mới
+đọc được kết quả** (giống `shark_backtest` hiện có).

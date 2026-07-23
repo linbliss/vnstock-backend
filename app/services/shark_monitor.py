@@ -572,6 +572,7 @@ def get_decision(ticker: str, persist: bool = True) -> dict:
     state["empty"] = False
     state["date"] = date
     state["context"] = ctx.to_dict()
+    state["events"] = evs            # kèm để frontend vẽ timeline (khỏi gọi 2 lần)
     return state
 
 
