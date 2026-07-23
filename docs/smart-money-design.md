@@ -373,7 +373,7 @@ Mục tiêu: mỗi kết luận trả lời được "TẠI SAO?". Không thêm 
 |---|---|---|
 | **F1** | **Contribution Ledger** — mỗi điểm = danh sách +/− (nguồn, nhãn, điểm, reliability) + confidence per-score | ✅ |
 | F2 | Evidence Engine — ✓/✗ ngôn ngữ người cho mỗi kết luận | ✅ |
-| F3 | **Decision = Rule-based Inference**: Score+Context+Regime+Evidence+Conflict+Memory → Hypotheses + State/Risk/Action(định tính+vùng giá)/Reason | ⏳ |
+| F3 | **Decision = Rule-based Inference**: Score+Context+Regime+Evidence+Conflict+Memory → Hypotheses + State/Risk/Action(định tính+vùng giá)/Reason | ✅ |
 
 ### Kiến trúc suy luận (Signal → Evidence → Hypothesis → Decision)
 
@@ -442,6 +442,29 @@ Frontend: card "Bằng chứng" ✓/✗ ở tab Smart Money.
 Nghiệm thu 23/07: STB Markup — ✓ 9 cụm tổ chức mua, ✓ 2 hấp thụ mua, ✗ cung chặn, ✗ giá
 dưới VWAP (conf 74%). HDB Trung tính — ✓ nền tích luỹ tại hỗ trợ, ✓ hấp thụ, ✓ giá giữ
 trên VWAP, ✗ breakout chưa xác nhận (conf 60%).
+
+### ✅ F3 — Decision = Rule-based Inference (xong)
+
+`decision._hypotheses` + `_decision` — KHÔNG chỉ cộng điểm, mà suy luận từ nhiều đầu vào:
+
+- **Hypothesis Engine**: sinh giả thuyết SONG SONG {Tích luỹ, Phân phối, Markup, Markdown,
+  Rũ hàng, Cao trào mua, Chưa rõ} → raw score (regime chi phối trọng số: absorption trong
+  sideway ≠ uptrend) → **softmax (T=18)** → xác suất. `memory` là seam (None = bỏ qua).
+  "Chưa rõ" tăng theo conflict → tín hiệu mâu thuẫn thì giả thuyết phân tán.
+- **Decision (inference)**: từ giả thuyết ưu thế + regime + conflict + confidence + context
+  → `state · institution · trend · risk_level · action · reference_zones · reason`.
+  **Action ĐỊNH TÍNH** (Theo dõi tích luỹ / Theo dõi xu hướng tăng / Cảnh giác rủi ro /
+  Quan sát thêm) + **vùng giá tham chiếu** (vượt R xác nhận, giữ trên S an toàn) — KHÔNG
+  lệnh mua/bán. Reason ghép từ bằng chứng mạnh nhất + mốc giá + cảnh báo mâu thuẫn.
+- Output `hypotheses` + `decision`. Frontend: **thẻ Quyết định** (headline, đọc 30s) ở đầu
+  tab Smart Money — Action lớn + chip State/Institution/Trend + Risk + thanh giả thuyết + lý do.
+
+Nghiệm thu 23/07: STB → Markup 90%, "Theo dõi xu hướng tăng", Risk Thấp, mốc vượt 72.30 /
+giữ 71.60. HDB (conflict cao) → "Chưa rõ 62%", "Quan sát thêm", Risk Trung bình. VIC →
+Markup 83%.
+
+**Còn lại**: F4 Story Engine · F5 Large Order aggregates · F6 Presentation. Memory (đọc
+`smart_money_events` nhiều phiên) = seam đã có, impl khi cần.
 
 ### 🔨 Phase D — sau (backtest event-level + benchmark version)
 

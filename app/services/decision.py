@@ -158,10 +158,114 @@ def _evidence_engine(lean: str, phase: str, acc_led: List[Contribution],
     }
 
 
+def _hypotheses(regime: str, location: str, acc: int, dist: int, brk: int, inst: int,
+                absorp: float, supply: float, diverg: float, cluster: float, flow: float,
+                conflict: float, memory: Optional[dict] = None) -> List[dict]:
+    """F3 Hypothesis Engine — sinh nhiều giả thuyết SONG SONG rồi softmax → xác suất.
+    Tái dùng điểm/tín hiệu đã có (không detector mới). Regime chi phối trọng số:
+    absorption trong sideway ≠ trong uptrend. `memory` (nếu có) nhích giả thuyết theo
+    diễn biến nhiều phiên — hiện là seam (None → bỏ qua)."""
+    at_support = location in ("support", "inside_va", "at_poc")
+    at_resist = location in ("resistance", "breakout")
+    raw = {
+        "Tích luỹ": acc * (1.15 if regime in ("sideway", "trending_down") else 0.9)
+                    + (15 if at_support else 0) - 0.4 * dist,
+        "Phân phối": dist * (1.15 if regime in ("trending_up", "sideway") else 0.9)
+                     + (15 if at_resist else 0) + 20 * max(0.0, -diverg) - 0.4 * acc,
+        "Markup": (58 if regime == "trending_up" else 12) + 0.4 * brk + 0.25 * acc + 18 * max(0.0, flow),
+        "Markdown": (58 if regime == "trending_down" else 8) + 0.4 * dist - 22 * flow,
+        "Rũ hàng (Shakeout)": (24 if at_support else 4)
+                              + 45 * absorp * (1.0 if regime in ("sideway", "trending_down") else 0.5),
+        "Cao trào mua": (18 if (regime == "trending_up" and at_resist) else 0)
+                        + 30 * supply + 25 * max(0.0, -diverg) + 0.25 * inst,
+        "Chưa rõ": 22 + 45 * conflict,
+    }
+    if memory:                                   # seam: nhích theo quá trình nhiều phiên
+        raw["Tích luỹ"] += memory.get("accum_bias", 0.0)
+        raw["Phân phối"] += memory.get("distrib_bias", 0.0)
+    raw = {k: max(0.0, v) for k, v in raw.items()}
+    T = 18.0
+    exps = {k: math.exp(v / T) for k, v in raw.items()}
+    tot = sum(exps.values()) or 1.0
+    hyps = [{"name": k, "probability": round(100 * e / tot)} for k, e in exps.items()]
+    hyps.sort(key=lambda h: -h["probability"])
+    return [h for h in hyps if h["probability"] >= 3][:5]
+
+
+# Ánh xạ giả thuyết → trạng thái ngắn gọn hiển thị
+_STATE_VI = {
+    "Tích luỹ": "Tích luỹ", "Phân phối": "Phân phối", "Markup": "Tăng giá",
+    "Markdown": "Giảm giá", "Rũ hàng (Shakeout)": "Rũ hàng", "Cao trào mua": "Cao trào mua",
+    "Chưa rõ": "Trung tính",
+}
+_BEARISH_HYP = {"Phân phối", "Markdown", "Cao trào mua"}
+
+
+def _decision(hyps: List[dict], regime: str, bull: int, bear: int, inst: int,
+              trend_quality: int, conflict: float, confidence: int, cx: dict,
+              evidence: dict) -> dict:
+    """F3 Decision — suy luận từ nhiều đầu vào (KHÔNG chỉ cộng điểm): giả thuyết + regime
+    + conflict + context → State/Institution/Trend/Risk/Action(định tính+vùng giá)/Reason."""
+    primary = hyps[0] if hyps else {"name": "Chưa rõ", "probability": 0}
+    pname, pprob = primary["name"], primary["probability"]
+
+    state = _STATE_VI.get(pname, pname)
+    institution = ("Mua mạnh" if bull - bear > 25 else "Bán mạnh" if bear - bull > 25
+                   else "Hoạt động" if inst >= 55 else "Trung tính")
+    trend_label = ({"trending_up": "Tăng", "trending_down": "Giảm", "sideway": "Đi ngang"}
+                   .get(regime, "—")) + (" (mạnh)" if trend_quality >= 60 else " (yếu)" if trend_quality < 35 else "")
+
+    # Risk: mâu thuẫn cao + giả thuyết giảm + confidence thấp → rủi ro cao
+    risk_num = (0.40 * conflict + 0.30 * (1.0 if pname in _BEARISH_HYP else 0.0)
+                + 0.30 * (1.0 - confidence / 100.0))
+    risk_level = "Cao" if risk_num >= 0.6 else ("Trung bình" if risk_num >= 0.35 else "Thấp")
+
+    # Action ĐỊNH TÍNH (không lệnh mua/bán) — theo giả thuyết + confidence + risk
+    if pname in _BEARISH_HYP and pprob >= 45:
+        action = "Cảnh giác rủi ro"
+    elif pname in ("Tích luỹ", "Rũ hàng (Shakeout)") and confidence >= 60 and risk_level != "Cao":
+        action = "Theo dõi tích luỹ"
+    elif pname == "Markup" and confidence >= 60 and risk_level != "Cao":
+        action = "Theo dõi xu hướng tăng"
+    elif conflict >= 0.6 or pname == "Chưa rõ":
+        action = "Quan sát thêm"
+    else:
+        action = "Theo dõi"
+
+    sup = cx.get("support"); res = cx.get("resistance"); vwap = cx.get("vwap")
+    reference_zones = {"support": sup, "resistance": res, "vwap": vwap, "poc": cx.get("poc")}
+
+    # Reason: ghép từ giả thuyết + bằng chứng mạnh nhất + mâu thuẫn
+    sup_ev = [r["label"] for r in evidence.get("supporting", [])[:2]]
+    con_ev = [r["label"] for r in evidence.get("contradicting", [])[:1]]
+    bits = [f"Giả thuyết ưu thế: **{pname}** ({pprob}%)."]
+    if sup_ev:
+        bits.append("Ủng hộ: " + ", ".join(sup_ev).lower() + ".")
+    if con_ev:
+        bits.append("Nhưng: " + ", ".join(con_ev).lower() + ".")
+    zone_hint = []
+    if res:
+        zone_hint.append(f"vượt {res:.2f} xác nhận xu hướng")
+    if sup:
+        zone_hint.append(f"giữ trên {sup:.2f} là an toàn")
+    if zone_hint:
+        bits.append("Mốc theo dõi: " + "; ".join(zone_hint) + ".")
+    if conflict >= 0.6:
+        bits.append("Tín hiệu mâu thuẫn cao → độ tin giảm, cần thêm xác nhận.")
+
+    return {
+        "state": state, "institution": institution, "trend": trend_label,
+        "risk_level": risk_level, "action": action,
+        "reference_zones": reference_zones, "reason": " ".join(bits),
+    }
+
+
 def decide(context: Union[Context, dict], of: dict, events: List[dict],
            vol_trend: float = 0.0, poc_shift: float = 0.0,
-           delta_recent: float = 0.0, n_ticks: int = 0) -> dict:
-    """Tính toàn bộ Smart Money State. `of` = order_flow.analyze; events = list dict."""
+           delta_recent: float = 0.0, n_ticks: int = 0,
+           memory: Optional[dict] = None) -> dict:
+    """Tính toàn bộ Smart Money State. `of` = order_flow.analyze; events = list dict.
+    `memory` = tổng hợp nhiều phiên (F3 seam, None = chưa dùng)."""
     cx = _cd(context)
     trend = cx.get("trend", "unknown")
     location = cx.get("location", "mid")
@@ -322,6 +426,15 @@ def decide(context: Union[Context, dict], of: dict, events: List[dict],
     evidence = _evidence_engine(lean, phase, acc_led, dist_led, acc_conf, dist_conf,
                                 breakout_score, cx, conflict)
 
+    # ── F3 Hypothesis + Decision (rule-based inference, KHÔNG chỉ cộng điểm) ──
+    regime = cx.get("regime", "unknown")
+    hypotheses = _hypotheses(regime, location, accumulation_score, distribution_score,
+                             breakout_score, institution_activity, absorp, supply, diverg,
+                             cluster, flow, conflict, memory)
+    decision_out = _decision(hypotheses, regime, bull_strength, bear_strength,
+                             institution_activity, trend_quality, conflict,
+                             smart_money_confidence, cx, evidence)
+
     ledgers = {
         "accumulation": [c.to_dict() for c in acc_led],
         "distribution": [c.to_dict() for c in dist_led],
@@ -368,6 +481,8 @@ def decide(context: Union[Context, dict], of: dict, events: List[dict],
         "ledgers": ledgers,                 # F1: sổ cái đóng góp từng điểm số
         "score_confidence": score_confidence,
         "evidence": evidence,               # F2: Evidence Engine (✓/✗ + confidence)
+        "hypotheses": hypotheses,           # F3: giả thuyết song song + xác suất
+        "decision": decision_out,           # F3: State/Institution/Trend/Risk/Action/Reason
         "evidence_chain": evidence_chain,
         "report": report,
         "n_events": len(events),
