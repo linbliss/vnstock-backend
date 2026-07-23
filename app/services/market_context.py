@@ -23,6 +23,9 @@ from typing import Dict, List, Optional
 @dataclass
 class Context:
     trend: str = "unknown"           # uptrend|downtrend|sideway|unknown
+    regime: str = "unknown"          # trending_up|trending_down|sideway|unknown — TRẠNG THÁI
+    #                                  thị trường (Layer 0). Quyết định trọng số detector ở
+    #                                  Decision Engine: absorption trong sideway ≠ trong uptrend.
     ma_state: str = ""               # vd "MA20>MA50>MA100"
     location: str = "mid"            # support|resistance|inside_va|at_poc|breakout|mid
     vwap_side: str = "at"            # above|below|at
@@ -240,9 +243,11 @@ def build_context(ticker: str, ticks: List[dict], of: Optional[dict] = None,
     location = _location(price, support, resistance, poc, va_low, va_high, recent_high)
     session_phase = _session_phase(last_ts)
     foreign_dir, dealer_dir = _foreign_dealer_dir(tk) if with_foreign else (0.0, 0.0)
+    regime = {"uptrend": "trending_up", "downtrend": "trending_down",
+              "sideway": "sideway"}.get(trend, "unknown")
 
     return Context(
-        trend=trend, ma_state=ma_state, location=location, vwap_side=vwap_side,
+        trend=trend, regime=regime, ma_state=ma_state, location=location, vwap_side=vwap_side,
         session_phase=session_phase, foreign_dir=foreign_dir, dealer_dir=dealer_dir,
         price=price, ma20=m20, ma50=m50, ma100=m100,
         support=support, resistance=resistance,

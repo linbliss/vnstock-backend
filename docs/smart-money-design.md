@@ -373,7 +373,47 @@ Mục tiêu: mỗi kết luận trả lời được "TẠI SAO?". Không thêm 
 |---|---|---|
 | **F1** | **Contribution Ledger** — mỗi điểm = danh sách +/− (nguồn, nhãn, điểm, reliability) + confidence per-score | ✅ |
 | F2 | Evidence Engine — ✓/✗ ngôn ngữ người cho mỗi kết luận | ⏳ |
-| F3 | Decision Engine — State/Institution/Trend/Risk/Action(định tính+vùng giá)/Reason | ⏳ |
+| F3 | **Decision = Rule-based Inference**: Score+Context+Regime+Evidence+Conflict+Memory → Hypotheses + State/Risk/Action(định tính+vùng giá)/Reason | ⏳ |
+
+### Kiến trúc suy luận (Signal → Evidence → Hypothesis → Decision)
+
+Nâng mục tiêu từ "cộng điểm" → hệ suy luận. Các thành phần là MỞ RỘNG, không refactor lớn
+(mối nối đã có sẵn):
+
+| Thành phần | Mối nối sẵn có | Trạng thái |
+|---|---|---|
+| Regime (market state) | Context có trend/MA → thêm `Context.regime` | ✅ seam (weights F3) |
+| Context→inference (reliability theo vị trí) | `_mk(rel_mult)` — hấp thụ tại hỗ trợ rel↑, tại kháng cự rel↓ | ✅ |
+| Conflict Resolution | Ledger tách pro/con → conflict = mức đối kháng, phạt confidence | ✅ |
+| Hypothesis Engine | Ledger đã nhóm theo giả thuyết (gom/xả/breakout) → chuẩn hoá xác suất | ⏳ F3 |
+| Smart Money Memory | **`smart_money_events` đã persist mỗi phiên** → chỉ thêm hàm đọc/tổng hợp | ⏳ (interface) |
+| Decision Inference | `decide()` là orchestrator → thêm input có default | ⏳ F3 |
+
+**Hợp đồng dữ liệu (định nghĩa nay, impl F3/sau):**
+
+```python
+# Hypothesis Engine (F3)
+@dataclass
+class Hypothesis: name: str; probability: float; drivers: list[str]; regime_fit: float
+# decide() → {"hypotheses": [Hypothesis...], "primary": name}  (softmax trên điểm nhóm)
+
+# Smart Money Memory (sau) — đọc từ smart_money_events + shark_score đã lưu
+def recent_summary(ticker, sessions=5) -> {
+  "absorption_buy": int, "cluster": int, "poc_trend": "up|down|flat",
+  "foreign_streak": int, "phase_history": [str], ...}
+# → input cho Hypothesis (tín hiệu đơn lẻ vs quá trình kéo dài) + Conflict giữa phiên
+```
+
+### ✅ F1.5 — Reasoning seams (#3 #4 #5 xong)
+
+- **#4 Regime**: `Context.regime ∈ {trending_up, trending_down, sideway}` (Layer 0, từ trend/MA).
+- **#5 Context-reliability**: `_mk(rel_mult)` — hấp thụ tại hỗ trợ ×1.18, tại kháng cự ×0.72;
+  cung tại kháng cự ×1.18; cụm mua tại hỗ trợ ×1.12. Nghiệm thu: hấp thụ HDB@support rel
+  **0.95** vs STB@resistance rel **0.59**.
+- **#3 Conflict**: từ 6 tín hiệu hướng (cvd/flow/absorp−supply/foreign/cluster/diverg) →
+  `conflict = 2·min(pos,neg)/(pos+neg)`; phạt `confidence ×(1−0.35·conflict)`. Nghiệm thu:
+  HDB conflict 94(Cao)→conf 58%; STB conflict 0(Thấp)→conf 84%. Frontend: badge regime +
+  "Mâu thuẫn {mức}" ở header Smart Money.
 | F4 | Story Engine — kể chuyện dòng tiền theo thời gian + Smart Money Story | ⏳ |
 | F5 | Large Order aggregates (#9) | ⏳ |
 | F6 | Presentation — hover breakdown, dashboard mới, typography | ⏳ (một phần: bấm điểm số xem ledger) |

@@ -73,9 +73,12 @@ class Contribution:
                 "polarity": self.polarity, "reliability": self.reliability}
 
 
-def _mk(source: str, label: str, points: float) -> Contribution:
+def _mk(source: str, label: str, points: float, rel_mult: float = 1.0) -> Contribution:
+    """rel_mult = hệ số NGỮ CẢNH nhân vào reliability (#5): hấp thụ tại hỗ trợ đáng tin hơn
+    tại kháng cự → cùng một loại tín hiệu nhưng độ tin khác nhau tuỳ vị trí."""
+    rel = _clamp(RELIABILITY.get(source, 0.6) * rel_mult, 0.3, 0.95)
     return Contribution(source, label, round(points, 1),
-                        "pro" if points >= 0 else "con", RELIABILITY.get(source, 0.6))
+                        "pro" if points >= 0 else "con", round(rel, 3))
 
 
 def _score_from(contribs: List[Contribution], base: float = 0.0):
@@ -170,6 +173,13 @@ def decide(context: Union[Context, dict], of: dict, events: List[dict],
     dv_pos, dv_neg = max(0.0, diverg), max(0.0, -diverg)
     loc_vi = {"support": "hỗ trợ", "resistance": "kháng cự", "breakout": "breakout",
               "inside_va": "vùng giá trị", "at_poc": "POC", "mid": "vùng trung gian"}.get(location, location)
+    # #5 Hệ số reliability theo NGỮ CẢNH: cùng tín hiệu, vị trí khác → độ tin khác.
+    at_support = location in ("support", "inside_va", "at_poc")
+    at_resist = location in ("resistance", "breakout")
+    m_absorp = 1.18 if at_support else (0.72 if at_resist else 1.0)   # hấp thụ đáng tin tại hỗ trợ
+    m_supply = 1.18 if at_resist else (0.72 if at_support else 1.0)   # cung đáng tin tại kháng cự
+    m_clbuy = 1.12 if at_support else 1.0
+    m_clsell = 1.12 if at_resist else 1.0
 
     # ── INSTITUTION ACTIVITY (mức độ hoạt động tổ chức) ──
     n_big = lo.get("count", 0) or 0
@@ -188,8 +198,8 @@ def decide(context: Union[Context, dict], of: dict, events: List[dict],
     base_factor = 1.0 if (trend in ("sideway", "downtrend") and
                           location in ("support", "inside_va", "at_poc")) else 0.35
     acc_l = [
-        _mk("absorption", f"{ec['absorption_buy']} lần hấp thụ mua" + (f" tại {loc_vi}" if location in ("support", "inside_va", "at_poc") else ""), 100 * 0.28 * a_pos),
-        _mk("cluster", f"{ec['cluster_buy']} cụm lệnh tổ chức mua", 100 * 0.16 * c_pos),
+        _mk("absorption", f"{ec['absorption_buy']} lần hấp thụ mua" + (f" tại {loc_vi}" if at_support else ""), 100 * 0.28 * a_pos, rel_mult=m_absorp),
+        _mk("cluster", f"{ec['cluster_buy']} cụm lệnh tổ chức mua", 100 * 0.16 * c_pos, rel_mult=m_clbuy),
         _mk("foreign", "Khối ngoại mua ròng", 100 * 0.14 * f_pos),
         _mk("flow", "Lực mua chủ động tăng", 100 * 0.12 * fl_pos),
         _mk("delta", "Delta cải thiện cuối phiên", 100 * 0.10 * (1.0 if delta_recent > 0 else 0.0)),
@@ -198,7 +208,7 @@ def decide(context: Union[Context, dict], of: dict, events: List[dict],
         # phản chứng (con)
         _mk("foreign", "Khối ngoại bán ròng", -100 * 0.14 * f_neg),
         _mk("poc", "POC dịch xuống", -100 * 0.10 * _poc_sig(poc_shift, up=False)),
-        _mk("supply", "Có cung chủ động chặn", -100 * 0.12 * s_pos),
+        _mk("supply", "Có cung chủ động chặn", -100 * 0.12 * s_pos, rel_mult=m_supply),
         _mk("trend", "Xu hướng giảm còn hiệu lực", -100 * 0.08 * (1.0 if trend == "downtrend" else 0.0)),
     ]
     accumulation_score, acc_conf, acc_led = _score_from(acc_l)
@@ -209,14 +219,14 @@ def decide(context: Union[Context, dict], of: dict, events: List[dict],
                          location in ("resistance", "breakout")) else 0.35
     foreign_dist = f_neg * (1.0 - absorbed)                       # ngoại bán được hấp thụ → không tính
     dist_l = [
-        _mk("supply", "Cung chủ động (giá không lên)", 100 * 0.30 * s_pos),
-        _mk("cluster", f"{ec['cluster_sell']} cụm lệnh tổ chức bán", 100 * 0.16 * c_neg),
+        _mk("supply", "Cung chủ động (giá không lên)", 100 * 0.30 * s_pos, rel_mult=m_supply),
+        _mk("cluster", f"{ec['cluster_sell']} cụm lệnh tổ chức bán", 100 * 0.16 * c_neg, rel_mult=m_clsell),
         _mk("foreign", "Khối ngoại bán ròng (không được hấp thụ)", 100 * 0.16 * foreign_dist),
         _mk("divergence", "CVD phân kỳ giảm", 100 * 0.14 * dv_neg),
         _mk("poc", "POC dịch xuống", 100 * 0.08 * _poc_sig(poc_shift, up=False)),
         _mk("location", f"Xả tại {loc_vi}", 100 * 0.08 * (top_factor * s_pos)),
         # phản chứng (con)
-        _mk("absorption", "Lực bán đang được hấp thụ", -100 * 0.18 * a_pos),
+        _mk("absorption", "Lực bán đang được hấp thụ", -100 * 0.18 * a_pos, rel_mult=m_absorp),
         _mk("foreign", "Khối ngoại mua ròng", -100 * 0.10 * f_pos),
     ]
     distribution_score, dist_conf, dist_led = _score_from(dist_l)
@@ -243,10 +253,19 @@ def decide(context: Union[Context, dict], of: dict, events: List[dict],
                                  breakout_score, bull_strength, bear_strength, absorp,
                                  supply, diverg, institution_activity, vol_trend)
 
-    # ── Smart money confidence: đủ dữ liệu × độ tin của điểm CHI PHỐI (gom vs xả) ──
+    # ── #3 CONFLICT: tín hiệu đối kháng cùng mạnh → mâu thuẫn cao → confidence giảm ──
+    _csig = [(cvd_norm, 0.70), (flow, 0.70), (absorp - supply, 0.82),
+             (foreign, 0.75), (cluster, 0.85), (diverg, 0.65)]
+    cpos = sum(max(0.0, v) * r for v, r in _csig)
+    cneg = sum(max(0.0, -v) * r for v, r in _csig)
+    conflict = (2 * min(cpos, cneg) / (cpos + cneg)) if (cpos + cneg) > 0 else 0.0
+    conflict_level = "Cao" if conflict >= 0.6 else ("Trung bình" if conflict >= 0.3 else "Thấp")
+
+    # ── Smart money confidence: đủ dữ liệu × độ tin điểm CHI PHỐI × (1 − phạt mâu thuẫn) ──
     data_suff = _clamp(n_ticks / 500.0, 0, 1)
     dom_conf = acc_conf if accumulation_score >= distribution_score else dist_conf
-    smart_money_confidence = round(100 * _clamp(0.40 * data_suff + 0.60 * dom_conf, 0, 1))
+    smart_money_confidence = round(100 * _clamp((0.40 * data_suff + 0.60 * dom_conf) *
+                                                (1.0 - 0.35 * conflict), 0, 1))
 
     ledgers = {
         "accumulation": [c.to_dict() for c in acc_led],
@@ -285,6 +304,9 @@ def decide(context: Union[Context, dict], of: dict, events: List[dict],
         "bear_strength": bear_strength,
         "market_control": market_control,
         "smart_money_confidence": smart_money_confidence,
+        "conflict": round(100 * conflict),
+        "conflict_level": conflict_level,
+        "regime": cx.get("regime", "unknown"),
         "wyckoff_phase": phase,
         "phase_note": phase_note,
         "components": components,
