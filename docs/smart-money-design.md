@@ -372,7 +372,7 @@ Mục tiêu: mỗi kết luận trả lời được "TẠI SAO?". Không thêm 
 | Phase | Nội dung | Trạng thái |
 |---|---|---|
 | **F1** | **Contribution Ledger** — mỗi điểm = danh sách +/− (nguồn, nhãn, điểm, reliability) + confidence per-score | ✅ |
-| F2 | Evidence Engine — ✓/✗ ngôn ngữ người cho mỗi kết luận | ⏳ |
+| F2 | Evidence Engine — ✓/✗ ngôn ngữ người cho mỗi kết luận | ✅ |
 | F3 | **Decision = Rule-based Inference**: Score+Context+Regime+Evidence+Conflict+Memory → Hypotheses + State/Risk/Action(định tính+vùng giá)/Reason | ⏳ |
 
 ### Kiến trúc suy luận (Signal → Evidence → Hypothesis → Decision)
@@ -430,6 +430,18 @@ def recent_summary(ticker, sessions=5) -> {
   Money → xổ "Vì sao?" (danh sách +/− + reliability).
 - Nghiệm thu 23/07: STB Acc=48 (+14.7 cụm tổ chức mua, +14.5 hấp thụ mua, −4.6 cung chặn),
   Dist=5 (−9.3 đang được hấp thụ). Điểm = Σ points (đã kiểm).
+
+### ✅ F2 — Evidence Engine (xong)
+
+`decision._evidence_engine`: gom sổ cái của HƯỚNG CHI PHỐI (lean gom/xả/trung tính) thành
+✓ thuận / ✗ nghịch bằng ngôn ngữ người + bằng chứng ngữ cảnh bổ sung (VWAP acceptance,
+breakout chưa xác nhận), kèm confidence (đã phạt conflict). Bỏ đóng góp "nền" (offset cấu
+trúc). Output `evidence{conclusion, lean, supporting[], contradicting[], confidence}`.
+Frontend: card "Bằng chứng" ✓/✗ ở tab Smart Money.
+
+Nghiệm thu 23/07: STB Markup — ✓ 9 cụm tổ chức mua, ✓ 2 hấp thụ mua, ✗ cung chặn, ✗ giá
+dưới VWAP (conf 74%). HDB Trung tính — ✓ nền tích luỹ tại hỗ trợ, ✓ hấp thụ, ✓ giá giữ
+trên VWAP, ✗ breakout chưa xác nhận (conf 60%).
 
 ### 🔨 Phase D — sau (backtest event-level + benchmark version)
 

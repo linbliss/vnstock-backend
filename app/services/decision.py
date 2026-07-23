@@ -115,6 +115,49 @@ def _poc_sig(poc_shift: float, up: bool) -> float:
     return _clamp(max(0.0, v) * 20.0, 0.0, 1.0)
 
 
+def _evidence_engine(lean: str, phase: str, acc_led: List[Contribution],
+                     dist_led: List[Contribution], acc_conf: float, dist_conf: float,
+                     breakout_score: int, cx: dict, conflict: float) -> dict:
+    """F2 — Evidence Engine: gom sổ cái của HƯỚNG CHI PHỐI thành ✓ (thuận) / ✗ (nghịch)
+    bằng ngôn ngữ người, kèm bằng chứng NGỮ CẢNH bổ sung (VWAP, breakout) + confidence.
+    Đây là đầu vào cho Hypothesis/Decision (F3)."""
+    bearish = lean == "distribution"
+    led = dist_led if bearish else acc_led
+    base_conf = dist_conf if bearish else acc_conf
+
+    def _row(c: Contribution) -> dict:
+        return {"label": c.label, "points": c.points, "reliability": c.reliability}
+
+    # Bỏ đóng góp "nền" (base) — là offset cấu trúc, không phải bằng chứng dòng tiền.
+    supporting = [_row(c) for c in led if c.points > 0 and c.source != "base"]
+    contradicting = [_row(c) for c in led if c.points < 0 and c.source != "base"]
+
+    # Bằng chứng ngữ cảnh bổ sung (không nằm trong ledger điểm)
+    vs = cx.get("vwap_side")
+    if vs == "above":
+        (contradicting if bearish else supporting).append(
+            {"label": "Giá giữ trên VWAP", "points": None, "reliability": RELIABILITY["flow"]})
+    elif vs == "below":
+        (supporting if bearish else contradicting).append(
+            {"label": "Giá dưới VWAP", "points": None, "reliability": RELIABILITY["flow"]})
+    if not bearish and breakout_score < 45:
+        contradicting.append({"label": "Breakout chưa xác nhận", "points": None,
+                              "reliability": RELIABILITY["location"]})
+
+    supporting.sort(key=lambda r: -(abs(r["points"]) if r["points"] else 0))
+    contradicting.sort(key=lambda r: -(abs(r["points"]) if r["points"] else 0))
+    lean_vi = {"accumulation": "Nghiêng TÍCH LUỸ", "distribution": "Nghiêng PHÂN PHỐI",
+               "neutral": "Chưa rõ hướng"}.get(lean, lean)
+    return {
+        "conclusion": phase,
+        "lean": lean,
+        "lean_label": lean_vi,
+        "supporting": supporting,
+        "contradicting": contradicting,
+        "confidence": round(100 * base_conf * (1.0 - 0.25 * conflict)),
+    }
+
+
 def decide(context: Union[Context, dict], of: dict, events: List[dict],
            vol_trend: float = 0.0, poc_shift: float = 0.0,
            delta_recent: float = 0.0, n_ticks: int = 0) -> dict:
@@ -253,6 +296,14 @@ def decide(context: Union[Context, dict], of: dict, events: List[dict],
                                  breakout_score, bull_strength, bear_strength, absorp,
                                  supply, diverg, institution_activity, vol_trend)
 
+    # Hướng chi phối (gom / xả / trung tính) — cho Evidence Engine
+    if accumulation_score >= distribution_score + 8:
+        lean = "accumulation"
+    elif distribution_score >= accumulation_score + 8:
+        lean = "distribution"
+    else:
+        lean = "neutral"
+
     # ── #3 CONFLICT: tín hiệu đối kháng cùng mạnh → mâu thuẫn cao → confidence giảm ──
     _csig = [(cvd_norm, 0.70), (flow, 0.70), (absorp - supply, 0.82),
              (foreign, 0.75), (cluster, 0.85), (diverg, 0.65)]
@@ -266,6 +317,10 @@ def decide(context: Union[Context, dict], of: dict, events: List[dict],
     dom_conf = acc_conf if accumulation_score >= distribution_score else dist_conf
     smart_money_confidence = round(100 * _clamp((0.40 * data_suff + 0.60 * dom_conf) *
                                                 (1.0 - 0.35 * conflict), 0, 1))
+
+    # ── F2 Evidence Engine: ✓/✗ cho kết luận chi phối ──
+    evidence = _evidence_engine(lean, phase, acc_led, dist_led, acc_conf, dist_conf,
+                                breakout_score, cx, conflict)
 
     ledgers = {
         "accumulation": [c.to_dict() for c in acc_led],
@@ -312,6 +367,7 @@ def decide(context: Union[Context, dict], of: dict, events: List[dict],
         "components": components,
         "ledgers": ledgers,                 # F1: sổ cái đóng góp từng điểm số
         "score_confidence": score_confidence,
+        "evidence": evidence,               # F2: Evidence Engine (✓/✗ + confidence)
         "evidence_chain": evidence_chain,
         "report": report,
         "n_events": len(events),
