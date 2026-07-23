@@ -363,7 +363,35 @@ Type-check + build frontend PASS. Cần deploy backend để có dữ liệu.
   nhãn giá POC/VWAP + trục thời gian). `SMGauge` bán nguyệt "Cán cân dòng tiền" (Xả◄►Gom
   = accumulation−distribution) trong tab Smart Money.
 
-### 🔨 Phase D — kế tiếp (backtest event-level + benchmark version)
+---
+
+## Smart Money v2 — Explainable AI (từ "hiển thị kết quả" → "giải thích quyết định")
+
+Mục tiêu: mỗi kết luận trả lời được "TẠI SAO?". Không thêm indicator. Lộ trình:
+
+| Phase | Nội dung | Trạng thái |
+|---|---|---|
+| **F1** | **Contribution Ledger** — mỗi điểm = danh sách +/− (nguồn, nhãn, điểm, reliability) + confidence per-score | ✅ |
+| F2 | Evidence Engine — ✓/✗ ngôn ngữ người cho mỗi kết luận | ⏳ |
+| F3 | Decision Engine — State/Institution/Trend/Risk/Action(định tính+vùng giá)/Reason | ⏳ |
+| F4 | Story Engine — kể chuyện dòng tiền theo thời gian + Smart Money Story | ⏳ |
+| F5 | Large Order aggregates (#9) | ⏳ |
+| F6 | Presentation — hover breakdown, dashboard mới, typography | ⏳ (một phần: bấm điểm số xem ledger) |
+
+### ✅ F1 — Contribution Ledger (xong)
+
+`decision.py`: chấm điểm chuyển từ tổng-ẩn sang **sổ cái đóng góp**.
+- `Contribution{source, label, points(+/−), polarity, reliability}`; `RELIABILITY` per-detector
+  (cluster 0.85 > absorption 0.82 > … > poc 0.55 > vol 0.50) — #6 Confidence Engine.
+- Mỗi điểm (accumulation/distribution/breakout/institution/trend): `score = clamp(Σ points)`,
+  `confidence = Σ|points|·reliability / Σ|points|`. Thêm số hạng PHẠT (foreign bán, POC
+  xuống, cung chặn, trend yếu) → điểm có cả (−), thực tế hơn.
+- Output thêm `ledgers` + `score_confidence`. Frontend: bấm mỗi thanh điểm ở tab Smart
+  Money → xổ "Vì sao?" (danh sách +/− + reliability).
+- Nghiệm thu 23/07: STB Acc=48 (+14.7 cụm tổ chức mua, +14.5 hấp thụ mua, −4.6 cung chặn),
+  Dist=5 (−9.3 đang được hấp thụ). Điểm = Σ points (đã kiểm).
+
+### 🔨 Phase D — sau (backtest event-level + benchmark version)
 
 Tổng quát hoá `shark_backtest`: persist đã có (`smart_money_events`) → group theo
 `event.type × context-bucket` → forward return T+h trừ baseline, t-stat, edge, win-rate,

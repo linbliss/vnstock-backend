@@ -14,6 +14,7 @@ distribution → đóng góp của foreign vào distribution bị GATE bởi m�
 """
 from __future__ import annotations
 import math
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 
 from app.services.market_context import Context
@@ -47,6 +48,68 @@ def _agg_events(events: List[dict]) -> dict:
         d["n"] += 1
         d["best"] = max(d["best"], float(e.get("confidence") or 0.0))
     return g
+
+
+# ── Explainability (F1): sổ cái đóng góp + độ tin theo detector ───────────────────────
+# Reliability = độ tin CẤU TRÚC của mỗi loại tín hiệu (không phải confidence từng event).
+# Cụm lệnh tổ chức / hấp thụ đáng tin hơn một nhịp Delta nhỏ hay POC dịch nhẹ.
+RELIABILITY = {
+    "cluster": 0.85, "absorption": 0.82, "supply": 0.82, "foreign": 0.75,
+    "large": 0.72, "trend": 0.70, "flow": 0.70, "base": 0.68, "location": 0.66,
+    "divergence": 0.65, "delta": 0.63, "dealer": 0.55, "poc": 0.55, "vol": 0.50,
+}
+
+
+@dataclass
+class Contribution:
+    source: str          # khoá reliability
+    label: str           # ngôn ngữ người ("6 lần hấp thụ mua tại hỗ trợ")
+    points: float        # +/− điểm đóng góp
+    polarity: str        # pro | con
+    reliability: float
+
+    def to_dict(self) -> dict:
+        return {"source": self.source, "label": self.label, "points": self.points,
+                "polarity": self.polarity, "reliability": self.reliability}
+
+
+def _mk(source: str, label: str, points: float) -> Contribution:
+    return Contribution(source, label, round(points, 1),
+                        "pro" if points >= 0 else "con", RELIABILITY.get(source, 0.6))
+
+
+def _score_from(contribs: List[Contribution], base: float = 0.0):
+    """(score 0-100, confidence 0-1, ledger đã lọc & sắp). Bỏ đóng góp < 0.5 điểm.
+    confidence = bình quân reliability có trọng số theo |điểm| → điểm do bằng chứng
+    độ-tin-cao chi phối thì confidence cao."""
+    cs = [c for c in contribs if abs(c.points) >= 0.5]
+    score = int(_clamp(round(base + sum(c.points for c in cs)), 0, 100))
+    tot = sum(abs(c.points) for c in cs)
+    conf = (sum(abs(c.points) * c.reliability for c in cs) / tot) if tot else 0.5
+    cs.sort(key=lambda c: abs(c.points), reverse=True)
+    return score, round(conf, 3), cs
+
+
+def _event_counts(events: List[dict]) -> dict:
+    c = {"absorption_buy": 0, "absorption_sell": 0, "cluster_buy": 0,
+         "cluster_sell": 0, "divergence_bull": 0, "divergence_bear": 0}
+    for e in events:
+        t, s = e.get("type", ""), e.get("strength") or 0
+        if t == "absorption" and s > 0:
+            c["absorption_buy"] += 1
+        elif t == "supply_absorption":
+            c["absorption_sell"] += 1
+        elif t == "institution_cluster":
+            c["cluster_buy" if s >= 0 else "cluster_sell"] += 1
+        elif t == "cvd_divergence":
+            c["divergence_bull" if s > 0 else "divergence_bear"] += 1
+    return c
+
+
+def _poc_sig(poc_shift: float, up: bool) -> float:
+    """POC shift thực tế rất nhỏ (±0.03) → khuếch đại về 0..1."""
+    v = poc_shift if up else -poc_shift
+    return _clamp(max(0.0, v) * 20.0, 0.0, 1.0)
 
 
 def decide(context: Union[Context, dict], of: dict, events: List[dict],
@@ -88,38 +151,75 @@ def decide(context: Union[Context, dict], of: dict, events: List[dict],
     # ── Trend quality từ xếp lớp MA ──
     m20, m50, m100 = cx.get("ma20"), cx.get("ma50"), cx.get("ma100")
     trend_quality = 0
+    trend_led: List[Contribution] = []
     if m20 and m50 and m100:
         sep = abs(m20 - m100) / m100
         aligned = (m20 > m50 > m100) or (m20 < m50 < m100)
         trend_quality = round(100 * _clamp(sep * 12.0, 0, 1) * (1.0 if aligned else 0.5))
+        trend_led = [_mk("trend", f"MA {cx.get('ma_state', '')}"
+                         + (" (xếp lớp rõ)" if aligned else " (đan xen)"), trend_quality)]
+    trend_conf = RELIABILITY["trend"] if trend_quality else 0.5
 
-    # ── Institution activity ──
+    # Chuẩn bị: số lượng event (cho nhãn) + tín hiệu dương/âm
+    ec = _event_counts(events)
+    a_pos, s_pos = max(0.0, absorp), max(0.0, supply)
+    c_pos, c_neg = max(0.0, cluster), max(0.0, -cluster)
+    f_pos, f_neg = max(0.0, foreign), max(0.0, -foreign)
+    d_pos = max(0.0, dealer)
+    fl_pos = max(0.0, flow)
+    dv_pos, dv_neg = max(0.0, diverg), max(0.0, -diverg)
+    loc_vi = {"support": "hỗ trợ", "resistance": "kháng cự", "breakout": "breakout",
+              "inside_va": "vùng giá trị", "at_poc": "POC", "mid": "vùng trung gian"}.get(location, location)
+
+    # ── INSTITUTION ACTIVITY (mức độ hoạt động tổ chức) ──
     n_big = lo.get("count", 0) or 0
-    big_density = _clamp(n_big / max(1, n_ticks) * 30, 0, 1)         # lệnh lớn/ tổng khớp
+    big_density = _clamp(n_big / max(1, n_ticks) * 30, 0, 1)
     cluster_act = _sat(sum(abs(e.get("strength") or 0) * (e.get("confidence") or 0)
                            for e in events if e.get("type") == "institution_cluster"), 2.0)
-    foreign_act = (abs(foreign) + abs(dealer)) / 2
-    institution_activity = round(100 * _clamp(0.45 * cluster_act + 0.30 * big_density +
-                                              0.25 * foreign_act, 0, 1))
+    inst_l = [
+        _mk("cluster", f"{ec['cluster_buy'] + ec['cluster_sell']} cụm lệnh tổ chức", 100 * 0.45 * cluster_act),
+        _mk("large", f"Mật độ lệnh lớn ({n_big} lệnh)", 100 * 0.30 * big_density),
+        _mk("foreign", "Cường độ khối ngoại", 100 * 0.15 * abs(foreign)),
+        _mk("dealer", "Cường độ tự doanh", 100 * 0.10 * abs(dealer)),
+    ]
+    institution_activity, inst_conf, inst_led = _score_from(inst_l)
 
-    # ── ACCUMULATION: gom âm thầm (nền sideway/đáy, hấp thụ bullish, ngoại mua) ──
+    # ── ACCUMULATION: gom âm thầm (hấp thụ, cụm mua, ngoại mua) − phản chứng ──
     base_factor = 1.0 if (trend in ("sideway", "downtrend") and
                           location in ("support", "inside_va", "at_poc")) else 0.35
-    acc_raw = (0.34 * max(0.0, absorp) + 0.18 * max(0.0, cluster) +
-               0.18 * max(0.0, foreign) + 0.08 * max(0.0, dealer) +
-               0.10 * max(0.0, diverg) + 0.12 * base_factor)
-    accumulation_score = round(100 * _clamp(acc_raw, 0, 1))
+    acc_l = [
+        _mk("absorption", f"{ec['absorption_buy']} lần hấp thụ mua" + (f" tại {loc_vi}" if location in ("support", "inside_va", "at_poc") else ""), 100 * 0.28 * a_pos),
+        _mk("cluster", f"{ec['cluster_buy']} cụm lệnh tổ chức mua", 100 * 0.16 * c_pos),
+        _mk("foreign", "Khối ngoại mua ròng", 100 * 0.14 * f_pos),
+        _mk("flow", "Lực mua chủ động tăng", 100 * 0.12 * fl_pos),
+        _mk("delta", "Delta cải thiện cuối phiên", 100 * 0.10 * (1.0 if delta_recent > 0 else 0.0)),
+        _mk("base", f"Nền tích luỹ tại {loc_vi}" if base_factor >= 1.0 else "Vị trí chưa lý tưởng để gom", 100 * 0.12 * base_factor),
+        _mk("dealer", "Tự doanh mua ròng", 100 * 0.08 * d_pos),
+        # phản chứng (con)
+        _mk("foreign", "Khối ngoại bán ròng", -100 * 0.14 * f_neg),
+        _mk("poc", "POC dịch xuống", -100 * 0.10 * _poc_sig(poc_shift, up=False)),
+        _mk("supply", "Có cung chủ động chặn", -100 * 0.12 * s_pos),
+        _mk("trend", "Xu hướng giảm còn hiệu lực", -100 * 0.08 * (1.0 if trend == "downtrend" else 0.0)),
+    ]
+    accumulation_score, acc_conf, acc_led = _score_from(acc_l)
 
-    # ── DISTRIBUTION: xả tại đỉnh — GATE foreign/cluster bởi absorption (mấu chốt STB) ──
-    absorbed = max(0.0, absorp)                      # ngoại bán mà được hấp thụ → không phải xả
+    # ── DISTRIBUTION: xả tại đỉnh — GATE bởi absorption (mấu chốt STB) ──
+    absorbed = a_pos
     top_factor = 1.0 if (trend in ("uptrend", "sideway") and
                          location in ("resistance", "breakout")) else 0.35
-    foreign_dist = max(0.0, -foreign) * (1.0 - absorbed)
-    cluster_dist = max(0.0, -cluster)
-    dist_raw = (0.34 * supply + 0.16 * cluster_dist +
-                0.16 * foreign_dist + 0.16 * max(0.0, -diverg) +
-                0.06 * max(0.0, -poc_shift) + 0.12 * top_factor * supply)
-    distribution_score = round(100 * _clamp(dist_raw, 0, 1))
+    foreign_dist = f_neg * (1.0 - absorbed)                       # ngoại bán được hấp thụ → không tính
+    dist_l = [
+        _mk("supply", "Cung chủ động (giá không lên)", 100 * 0.30 * s_pos),
+        _mk("cluster", f"{ec['cluster_sell']} cụm lệnh tổ chức bán", 100 * 0.16 * c_neg),
+        _mk("foreign", "Khối ngoại bán ròng (không được hấp thụ)", 100 * 0.16 * foreign_dist),
+        _mk("divergence", "CVD phân kỳ giảm", 100 * 0.14 * dv_neg),
+        _mk("poc", "POC dịch xuống", 100 * 0.08 * _poc_sig(poc_shift, up=False)),
+        _mk("location", f"Xả tại {loc_vi}", 100 * 0.08 * (top_factor * s_pos)),
+        # phản chứng (con)
+        _mk("absorption", "Lực bán đang được hấp thụ", -100 * 0.18 * a_pos),
+        _mk("foreign", "Khối ngoại mua ròng", -100 * 0.10 * f_pos),
+    ]
+    distribution_score, dist_conf, dist_led = _score_from(dist_l)
 
     # ── BREAKOUT probability ──
     if location == "breakout":
@@ -128,25 +228,38 @@ def decide(context: Union[Context, dict], of: dict, events: List[dict],
         loc_factor = 0.6
     else:
         loc_factor = 0.15
-    brk_raw = (0.38 * loc_factor + 0.24 * max(0.0, flow) +
-               0.18 * max(0.0, cluster) + 0.12 * max(0.0, poc_shift) +
-               0.08 * max(0.0, vol_trend))
-    breakout_score = round(100 * _clamp(brk_raw, 0, 1))
+    brk_l = [
+        _mk("location", f"Vị trí {loc_vi}", 100 * 0.34 * loc_factor),
+        _mk("flow", "Dòng tiền mua áp đảo", 100 * 0.22 * fl_pos),
+        _mk("cluster", "Cụm tổ chức mua", 100 * 0.16 * c_pos),
+        _mk("poc", "POC dịch lên", 100 * 0.12 * _poc_sig(poc_shift, up=True)),
+        _mk("vol", "Thanh khoản mở rộng", 100 * 0.10 * max(0.0, vol_trend)),
+        _mk("supply", "Có cung chặn tại vùng cao", -100 * 0.10 * s_pos),
+    ]
+    breakout_score, brk_conf, brk_led = _score_from(brk_l)
 
     # ── Wyckoff MỞ RỘNG ──
     phase, phase_note = _wyckoff(trend, location, accumulation_score, distribution_score,
                                  breakout_score, bull_strength, bear_strength, absorp,
                                  supply, diverg, institution_activity, vol_trend)
 
-    # ── Smart money confidence: đủ dữ liệu × chất lượng bằng chứng ──
+    # ── Smart money confidence: đủ dữ liệu × độ tin của điểm CHI PHỐI (gom vs xả) ──
     data_suff = _clamp(n_ticks / 500.0, 0, 1)
-    ev_conf = 0.0
-    if events:
-        top = sorted(events, key=lambda e: abs(e.get("strength") or 0) * (e.get("confidence") or 0),
-                     reverse=True)[:5]
-        ev_conf = sum(e.get("confidence") or 0 for e in top) / len(top)
-    smart_money_confidence = round(100 * _clamp(0.45 * data_suff + 0.55 * ev_conf, 0, 1))
+    dom_conf = acc_conf if accumulation_score >= distribution_score else dist_conf
+    smart_money_confidence = round(100 * _clamp(0.40 * data_suff + 0.60 * dom_conf, 0, 1))
 
+    ledgers = {
+        "accumulation": [c.to_dict() for c in acc_led],
+        "distribution": [c.to_dict() for c in dist_led],
+        "breakout": [c.to_dict() for c in brk_led],
+        "institution": [c.to_dict() for c in inst_led],
+        "trend": [c.to_dict() for c in trend_led],
+    }
+    score_confidence = {
+        "accumulation": round(100 * acc_conf), "distribution": round(100 * dist_conf),
+        "breakout": round(100 * brk_conf), "institution": round(100 * inst_conf),
+        "trend": round(100 * trend_conf),
+    }
     components = {
         "absorption": round(absorp, 3), "supply": round(supply, 3),
         "cluster": round(cluster, 3), "divergence": round(diverg, 3),
@@ -175,6 +288,8 @@ def decide(context: Union[Context, dict], of: dict, events: List[dict],
         "wyckoff_phase": phase,
         "phase_note": phase_note,
         "components": components,
+        "ledgers": ledgers,                 # F1: sổ cái đóng góp từng điểm số
+        "score_confidence": score_confidence,
         "evidence_chain": evidence_chain,
         "report": report,
         "n_events": len(events),
