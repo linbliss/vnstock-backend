@@ -28,6 +28,13 @@ def shark_tape(
     return shark_monitor.get_tape(ticker, limit, big_value, window_min)
 
 
+@router.get("/orderflow/{ticker}")
+def shark_orderflow(ticker: str):
+    """Order Flow Analyzer: CVD, Volume Profile, VWAP, lệnh lớn (ngưỡng thích ứng),
+    absorption, iceberg (thử nghiệm) — tính trên tape đã cache của phiên."""
+    return shark_monitor.get_orderflow(ticker)
+
+
 @router.get("/history/{ticker}")
 def shark_history_one(
     ticker: str,

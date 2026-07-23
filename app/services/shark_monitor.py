@@ -476,6 +476,31 @@ def _recompute_score(tk: str) -> None:
             pass
 
 
+_of_cache: Dict[str, dict] = {}   # tk -> {data, sig:(n,last_ts), date}
+
+
+def get_orderflow(ticker: str) -> dict:
+    """Order Flow Analyzer cho 1 mã — CHỈ ĐỌC tape đã cache (không gọi API), tính O(n)
+    + cache theo chữ ký tape (n, last_ts) → tape không đổi thì trả lại kết quả cũ."""
+    from app.services import order_flow
+    tk = ticker.upper()
+    _touch(tk, deep=True)          # cần tape đầy đủ → coi như màn chi tiết
+    c = _ensure_loaded(tk)
+    _clean_tape(c)
+    ticks = c.get("ticks", [])
+    if not ticks:
+        return {"ticker": tk, "empty": True}
+    sig = (len(ticks), ticks[-1]["ts"])
+    date = c.get("date") or _today()
+    prev = _of_cache.get(tk)
+    if prev and prev["date"] == date and prev["sig"] == sig:
+        return prev["data"]
+    data = order_flow.analyze(ticks)
+    data["ticker"] = tk
+    _of_cache[tk] = {"data": data, "sig": sig, "date": date}
+    return data
+
+
 def _cached_score(tk: str) -> Optional[dict]:
     """Điểm đã tính ngầm còn hợp lệ (đúng phiên) trong RAM."""
     sc = _score_cache.get(tk)
