@@ -35,6 +35,13 @@ def shark_orderflow(ticker: str):
     return shark_monitor.get_orderflow(ticker)
 
 
+@router.get("/context/{ticker}")
+def shark_context(ticker: str, with_foreign: bool = Query(True)):
+    """Layer 0 — Context Engine: trend/MA, vị trí (S/R, POC, VA, VWAP), pha phiên,
+    hướng khối ngoại/tự doanh. Ngữ cảnh để Layer 2/3 diễn giải event dòng tiền."""
+    return shark_monitor.get_context(ticker, with_foreign=with_foreign)
+
+
 @router.get("/health/{ticker}")
 def shark_tape_health(ticker: str, cross_check: bool = Query(False)):
     """Phase 0 — độ tin của trường `side` (nền của CVD/imbalance/absorption):

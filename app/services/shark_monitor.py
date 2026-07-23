@@ -501,6 +501,22 @@ def get_orderflow(ticker: str) -> dict:
     return data
 
 
+def get_context(ticker: str, with_foreign: bool = True) -> dict:
+    """LAYER 0 — Context Engine cho 1 mã (đọc tape cache + OHLCV ngày + dòng tiền ngày).
+    Tái dùng order flow đã cache (get_orderflow) để khỏi tính lại VWAP/Volume Profile."""
+    from app.services import market_context
+    tk = ticker.upper()
+    of = get_orderflow(tk)               # đã cache theo chữ ký tape
+    c = _ensure_loaded(tk)
+    ticks = c.get("ticks", [])
+    ctx = market_context.build_context(tk, ticks, of=of, with_foreign=with_foreign)
+    d = ctx.to_dict()
+    d["ticker"] = tk
+    d["empty"] = not bool(ticks)
+    d["date"] = c.get("date") or _today()
+    return d
+
+
 def tape_health(ticks: List[dict]) -> dict:
     """PHASE 0 — đo ĐỘ TIN của trường `side` (nền móng của CVD/imbalance/absorption).
 
