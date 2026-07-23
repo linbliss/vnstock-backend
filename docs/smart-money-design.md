@@ -279,4 +279,39 @@ Context giờ nắm đúng thông tin engine cũ mù → nền để Layer 2/3 d
 **Còn nợ sang Phase B**: gắn `side_source` vào tick; xử lý auction (ATO/ATC) nhất quán ở
 Layer 1; detector emit `Event` rồi `save_events`.
 
-### 🔨 Phase B — kế tiếp (detector graded + hợp nhất absorption)
+### ✅ Phase B — Detector graded Layer 2 (xong)
+
+Module `patterns.py` — mỗi detector là hàm thuần `(ticks, context, ...) -> List[Event]`:
+
+- **Cửa sổ THEO THỜI GIAN** (`time_windows`, mặc định 5') thay tick cố định (giải W3) —
+  số cửa sổ co theo độ dài phiên, không theo mật độ khớp.
+- **`detect_absorption` — impact-residual, graded, thích ứng theo mã** (giải W2/W9):
+  ước lượng độ nhạy giá–imbalance `k` của CHÍNH mã trong phiên → residual = chg−k·imb →
+  z-score. Bán áp đảo mà giá giữ hơn dự báo → `absorption` (bullish); mua áp đảo mà giá
+  không lên → `supply_absorption` (bearish). Giá giảm NHẸ hơn mô hình vẫn tính hấp thụ.
+- **`detect_divergence`** — phân kỳ giá/CVD phần cuối phiên bằng **tương quan hạng**
+  (Spearman, bền hơn max/min của bản cũ).
+- **`detect_institution_cluster`** — chỉ báo cụm lệnh lớn **BẤT THƯỜNG** (≥ P75 số lệnh
+  lớn/cửa sổ), confidence theo cường độ tương đối (không 'always-on' như đòi ≥3 tuyệt đối).
+- Mỗi event mang **context TẠI THỜI ĐIỂM** (`_ctx_at`: location tính theo giá lúc đó —
+  một lệnh sáng ở support khác chiều ở resistance) + strength + confidence + evidence.
+- `detect_all` orchestrator; `shark_monitor.get_events` (build context → detect → persist
+  `smart_money_events`); `GET /api/shark/events/{ticker}`.
+
+Nghiệm thu (dữ liệu 23/07, `net = Σ strength·confidence`):
+
+| Mã | net | Đọc | Khớp kỳ vọng |
+|---|---|---|---|
+| STB | **+3.4** | buy-absorption + cluster mua tại uptrend | ✓ Institutional Absorption (bullish) |
+| HDB | **+0.5** | trung tính, cụm mua nhẹ tại support | ✓ Accumulation chưa hướng |
+| VIC | +1.6 | cluster mua mạnh + supply_absorption cùng lúc | ✓ cung gặp cầu tại kháng cự |
+
+**Còn nợ**: detector Distribution/Exhaustion/VWAP-accept (Phase B.2 hoặc gộp vào Layer 3);
+per-event context hiện chỉ đổi `location` (trend/S-R giữ mức phiên — chấp nhận được vì
+trend theo ngày).
+
+### 🔨 Phase C — kế tiếp (Decision Engine + Smart Money Report)
+
+Gộp events + context → `accumulation_score`, `distribution_score`, `breakout_score`,
+`trend_quality`, `institution_activity`, `smart_money_confidence`, `wyckoff_phase`,
+`conclusion` (text) + `evidence_chain`. Minh bạch, tự giải thích.

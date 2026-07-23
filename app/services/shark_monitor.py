@@ -517,6 +517,32 @@ def get_context(ticker: str, with_foreign: bool = True) -> dict:
     return d
 
 
+def get_events(ticker: str, persist: bool = True) -> dict:
+    """LAYER 2 — phát hiện sự kiện dòng tiền CÓ NGỮ CẢNH cho 1 mã.
+    Đọc tape cache → order flow (ngưỡng lệnh lớn thích ứng) → context → detectors.
+    persist=True: lưu event vào smart_money_events (cho backtest event-level)."""
+    from app.services import order_flow, market_context, patterns
+    tk = ticker.upper()
+    of = get_orderflow(tk)
+    if of.get("empty"):
+        return {"ticker": tk, "empty": True, "events": []}
+    c = _ensure_loaded(tk)
+    ticks = c.get("ticks", [])
+    big_thr = float((of.get("large_orders") or {}).get("threshold_p97") or 0.0)
+    ctx = market_context.build_context(tk, ticks, of=of)
+    evs = patterns.detect_all(ticks, ctx, big_thr=big_thr)
+    ev_dicts = [e.to_dict() for e in evs]
+    date = c.get("date") or _today()
+    if persist and ev_dicts:
+        try:
+            tape_store.save_events(tk, date, ev_dicts, algo_version=patterns.ALGO_VERSION)
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️  save_events {tk}: {e}", flush=True)
+    return {"ticker": tk, "empty": False, "date": date,
+            "context": ctx.to_dict(), "n_events": len(ev_dicts),
+            "algo_version": patterns.ALGO_VERSION, "events": ev_dicts}
+
+
 def tape_health(ticks: List[dict]) -> dict:
     """PHASE 0 — đo ĐỘ TIN của trường `side` (nền móng của CVD/imbalance/absorption).
 

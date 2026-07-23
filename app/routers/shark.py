@@ -35,6 +35,13 @@ def shark_orderflow(ticker: str):
     return shark_monitor.get_orderflow(ticker)
 
 
+@router.get("/events/{ticker}")
+def shark_events(ticker: str, persist: bool = Query(True)):
+    """Layer 2 — sự kiện dòng tiền có ngữ cảnh (absorption/supply/divergence/cluster),
+    mỗi event kèm strength, confidence, context, evidence. persist=lưu để backtest."""
+    return shark_monitor.get_events(ticker, persist=persist)
+
+
 @router.get("/context/{ticker}")
 def shark_context(ticker: str, with_foreign: bool = Query(True)):
     """Layer 0 — Context Engine: trend/MA, vị trí (S/R, POC, VA, VWAP), pha phiên,
