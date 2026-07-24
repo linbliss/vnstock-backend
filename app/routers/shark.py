@@ -49,6 +49,13 @@ def shark_events(ticker: str, persist: bool = Query(True)):
     return shark_monitor.get_events(ticker, persist=persist)
 
 
+@router.get("/market-context/{ticker}")
+def shark_market_context(ticker: str, sessions: int = Query(5, ge=1, le=20)):
+    """② Market Context (Intraday): regime, 5 phiên gần nhất, dòng tiền ngoại/tự doanh,
+    xu hướng POC & hấp thụ nhiều phiên (Smart Money Memory)."""
+    return shark_monitor.get_market_context(ticker, sessions=sessions)
+
+
 @router.get("/context/{ticker}")
 def shark_context(ticker: str, with_foreign: bool = Query(True)):
     """Layer 0 — Context Engine: trend/MA, vị trí (S/R, POC, VA, VWAP), pha phiên,

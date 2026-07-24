@@ -517,6 +517,40 @@ def get_context(ticker: str, with_foreign: bool = True) -> dict:
     return d
 
 
+def get_market_context(ticker: str, sessions: int = 5) -> dict:
+    """② Market Context — bối cảnh NHIỀU PHIÊN cho màn Intraday: regime, 5 phiên gần nhất,
+    dòng tiền ngoại/tự doanh, xu hướng POC & hấp thụ. Đọc dữ liệu đã lưu + shark_history."""
+    from datetime import timedelta
+    from app.services import smart_money_memory, shark_history, market_context
+    tk = ticker.upper()
+    mem = smart_money_memory.recent_summary(tk, sessions)
+    try:
+        regime = market_context.build_context(tk, [], with_foreign=False).regime  # từ OHLCV, không cần tape
+    except Exception:  # noqa: BLE001
+        regime = "unknown"
+
+    foreign = {"net": 0.0, "dir": "flat", "label": "—"}
+    dealer = {"net": 0.0, "dir": "flat", "label": "—"}
+    sess_prices: list = []
+    try:
+        end = _today(); start = (datetime.now() - timedelta(days=20)).strftime("%Y-%m-%d")
+        h = shark_history.get_history(tk, start, end)
+        days = (h.get("days") or [])[-sessions:]
+
+        def _flow(net):
+            return {"net": net, "dir": "buy" if net > 0 else ("sell" if net < 0 else "flat"),
+                    "label": "Mua ròng" if net > 0 else ("Bán ròng" if net < 0 else "Cân bằng")}
+        foreign = _flow(sum(d.get("foreign_net", 0) for d in days))
+        dealer = _flow(sum(d.get("prop_net", 0) for d in days))
+        sess_prices = [{"date": d.get("date"), "close": d.get("close"),
+                        "change_pct": d.get("change_pct")} for d in days]
+    except Exception:  # noqa: BLE001
+        pass
+
+    return {"ticker": tk, "regime": regime, "memory": mem,
+            "foreign": foreign, "dealer": dealer, "sessions": sess_prices}
+
+
 def get_decision(ticker: str, persist: bool = True) -> dict:
     """LAYER 3 — Decision Engine: gộp events + context + metrics → Smart Money Report.
     Đọc tape cache; tự dựng extras (vol_trend ngày, dịch POC nửa phiên, delta gần đây)."""
@@ -566,8 +600,16 @@ def get_decision(ticker: str, persist: bool = True) -> dict:
     if len(ser) >= 5:
         delta_recent = ser[-1]["cvd"] - ser[max(0, int(len(ser) * 0.8))]["cvd"]
 
+    # Memory (nhiều phiên) → nhích giả thuyết (seam #6)
+    mem_bias = {}
+    try:
+        from app.services import smart_money_memory
+        mem_bias = smart_money_memory.decision_bias(smart_money_memory.recent_summary(tk))
+    except Exception:  # noqa: BLE001
+        pass
+
     state = decision.decide(ctx, of, evs, vol_trend=vol_trend, poc_shift=poc_shift,
-                            delta_recent=delta_recent, n_ticks=len(ticks))
+                            delta_recent=delta_recent, n_ticks=len(ticks), memory=mem_bias)
     state["ticker"] = tk
     state["empty"] = False
     state["date"] = date

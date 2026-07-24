@@ -129,6 +129,30 @@ def load_events(ticker: str, trade_date: str, algo_version: int = 1) -> list:
     return out
 
 
+def list_event_dates(ticker: str, limit: int = 5, algo_version: int = 1) -> list:
+    """Các phiên GẦN NHẤT có event đã lưu (cho Smart Money Memory nhiều phiên). DESC."""
+    init_db()
+    with _lock, _conn() as c:
+        rows = c.execute(
+            "SELECT DISTINCT trade_date FROM smart_money_events "
+            "WHERE ticker=? AND algo_version=? ORDER BY trade_date DESC LIMIT ?",
+            (ticker.upper(), algo_version, limit),
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+def list_tape_dates(ticker: str, limit: int = 5) -> list:
+    """Các phiên gần nhất có TAPE đã lưu (để tính POC theo phiên). DESC."""
+    init_db()
+    with _lock, _conn() as c:
+        rows = c.execute(
+            "SELECT trade_date FROM intraday_tape WHERE ticker=? "
+            "ORDER BY trade_date DESC LIMIT ?",
+            (ticker.upper(), limit),
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
 def save_score(ticker: str, trade_date: str, signal: dict,
                big_value: float, complete: bool = False) -> None:
     """Lưu điểm Shark đã tính cho (mã, ngày)."""
