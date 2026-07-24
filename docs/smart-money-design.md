@@ -503,6 +503,29 @@ Dọn phân cấp thông tin để đọc nhanh 30s (#11) + bỏ trùng lặp (f
 
 Còn có thể làm pass 2 nếu cần: footprint hover chi tiết (delta/buy/sell), compact mode.
 
+### ✅ UI v3 — Intraday Analysis một màn (gộp Smart Money + Order Flow theo luồng suy luận)
+
+Giao diện phản ánh đúng pipeline **Kết luận → Bằng chứng → Chi tiết**. Bỏ tách tab Smart
+Money/Order Flow (Order Flow là *nguồn Evidence*, không ngang hàng Decision). Còn **2 tab**:
+Intraday Analysis (1 màn cuộn, 7 mục) + Theo kỳ (nhiều phiên).
+
+7 mục (top-down, có nav nhảy mục):
+1. **Executive Summary** — DecisionCard (khuyến nghị/rủi ro/giả thuyết/lý do).
+2. **Market Context** — regime + 5 phiên + foreign/dealer + **POC Trend + Absorption Trend**
+   (từ **Memory Engine** mới). Chi tiết → tab Theo kỳ.
+3. **Smart Money Decision** — gauge + rating + điểm số (bấm→ledger) + evidence tóm tắt.
+4. **Evidence Dashboard** — lưới card GỌN (VWAP/CVD/Δ/POC/VA/ngoại/dealer/hấp thụ/cụm/
+   iceberg/lệnh lớn) — dữ kiện, không kết luận.
+5. **Timeline (Story)** — câu chuyện dòng tiền (StoryCard) — đứng TRƯỚC Order Flow.
+6. **Order Flow Detail** — **collapse mặc định** (Progressive Disclosure): OrderFlowPanel +
+   Time&Sales + Sổ lệnh.
+7. **Explainability** — collapse: bằng chứng ✓/✗ đầy đủ + sổ cái + conflict + confidence + lý do.
+
+Backend: chỉ THÊM Memory Engine (`smart_money_memory.py`) + `GET /api/shark/market-context/
+{ticker}` (đọc `smart_money_events`+tape đã persist) + nối `memory` bias vào `decide()`.
+Frontend: 1 hook mới `useSharkMarketContext`; tái dùng DecisionCard/StoryCard/OrderFlowPanel/
+gauge/rating/ledger; gỡ SmartMoneyPanel + IntradayDetail (dead). Nền tối `.sm-card`.
+
 ### 🔨 Phase D — sau (backtest event-level + benchmark version)
 
 Tổng quát hoá `shark_backtest`: persist đã có (`smart_money_events`) → group theo
