@@ -120,7 +120,8 @@ def _evi_score(evlist: List[dict], want_supports: set, want_sign: float):
                                "pro", round(e.get("reliability") or 0.6, 3)))
     score = int(_clamp(round(sum(c.points for c in cs)), 0, 100))
     tot = sum(abs(c.points) for c in cs)
-    conf = (sum(abs(c.points) * c.reliability for c in cs) / tot) if tot else 0.5
+    # I5: ledger rỗng = KHÔNG có thông tin → conf thấp (0.3), không phải "50% trung lập"
+    conf = (sum(abs(c.points) * c.reliability for c in cs) / tot) if tot else 0.3
     cs.sort(key=lambda c: abs(c.points), reverse=True)
     return score, round(conf, 3), cs
 
@@ -134,7 +135,7 @@ BRK_BUDGET = {"cvd_flow": 18, "large_order_bias": 18, "cluster": 14, "value_area
 def _score_pack(cs: List[Contribution], base: float = 0.0):
     score = int(_clamp(round(base + sum(c.points for c in cs)), 0, 100))
     tot = sum(abs(c.points) for c in cs)
-    conf = (sum(abs(c.points) * c.reliability for c in cs) / tot) if tot else 0.5
+    conf = (sum(abs(c.points) * c.reliability for c in cs) / tot) if tot else 0.3   # I5
     cs.sort(key=lambda c: abs(c.points), reverse=True)
     return score, round(conf, 3), cs
 
@@ -324,7 +325,7 @@ _HYP_VI = {"accumulation": "Tích luỹ", "distribution": "Phân phối", "marku
 
 
 def _hypotheses(evlist: List[dict], regime: str, conflict: float,
-                memory: Optional[dict] = None) -> List[dict]:
+                memory: Optional[dict] = None, coverage: int = 100) -> List[dict]:
     """P3 Hypothesis Engine — sinh giả thuyết TỪ NHÓM EVIDENCE (theo `supports`), không
     từ điểm tổng. Mỗi evidence dồn "lực ủng hộ" = budget·|direction|·reliability vào các
     giả thuyết nó khai báo. Regime + memory là prior nhẹ. Softmax → xác suất; drivers =
@@ -340,13 +341,15 @@ def _hypotheses(evlist: List[dict], regime: str, conflict: float,
             raw[vi] += w
             if len(drivers[vi]) < 2:
                 drivers[vi].append(e.get("claim", ""))
-    # Prior theo regime (nhẹ) + memory (nhiều phiên)
+    # Prior theo regime (nhẹ) + memory (nhiều phiên). I5: ngày bằng chứng mỏng thì prior
+    # co lại — không để "đang uptrend" tự nó đẻ ra Markup 40%+ khi không có evidence.
+    pscale = 0.4 + 0.6 * _clamp(coverage / 100.0, 0, 1)
     if regime == "trending_up":
-        raw["Markup"] += 18
+        raw["Markup"] += 18 * pscale
     elif regime == "trending_down":
-        raw["Markdown"] += 18
+        raw["Markdown"] += 18 * pscale
     elif regime == "sideway":
-        raw["Tích luỹ"] += 8
+        raw["Tích luỹ"] += 8 * pscale
     if memory:
         raw["Tích luỹ"] += max(0.0, memory.get("accum_bias", 0.0))
         raw["Phân phối"] += max(0.0, memory.get("distrib_bias", 0.0))
@@ -522,17 +525,20 @@ def decide(context: Union[Context, dict], of: dict, events: List[dict],
     else:
         lean = "neutral"
 
-    # ── #3 CONFLICT: tín hiệu đối kháng cùng mạnh → mâu thuẫn cao → confidence giảm ──
+    # ── #3 CONFLICT (legacy, chỉ giữ để debug/đối chiếu): tính trên metric thô — có
+    # netting che mâu thuẫn (absorp−supply triệt tiêu trong flow) + phạt oan foreign
+    # đã được gate. I5: mạch chính chuyển sang conflict_ev (từ evidence). ──
     _csig = [(cvd_norm, 0.70), (flow, 0.70), (absorp - supply, 0.82),
              (foreign, 0.75), (cluster, 0.85), (diverg, 0.65)]
     cpos = sum(max(0.0, v) * r for v, r in _csig)
     cneg = sum(max(0.0, -v) * r for v, r in _csig)
-    conflict = (2 * min(cpos, cneg) / (cpos + cneg)) if (cpos + cneg) > 0 else 0.0
-    conflict_level = "Cao" if conflict >= 0.6 else ("Trung bình" if conflict >= 0.3 else "Thấp")
+    conflict_raw = (2 * min(cpos, cneg) / (cpos + cneg)) if (cpos + cneg) > 0 else 0.0
 
     # ── I2/I3: coverage · verdict per trục · conflict_ev · clarity (từ kho evidence) ──
     coverage = _coverage(evlist)
     conflict_ev = _conflict_ev(evlist)
+    conflict = conflict_ev            # I5: mâu thuẫn chính thức = evidence-based
+    conflict_level = "Cao" if conflict >= 0.6 else ("Trung bình" if conflict >= 0.3 else "Thấp")
 
     def _has_signal(want_supports: set, sign: float) -> bool:
         return any(e.get("role") == "signal"
@@ -547,6 +553,14 @@ def decide(context: Union[Context, dict], of: dict, events: List[dict],
         "distribution": _axis_verdict(distribution_score, accumulation_score, coverage,
                                       _has_signal(DIST_SUPPORTS, -1.0)),
     }
+
+    # ── I5: blend COVERAGE vào độ tin từng điểm — 1 evidence tốt duy nhất không còn cho
+    # "confidence 85%" trên nền gần như không có thông tin. conf' = conf·(0.5+0.5·coverage).
+    cov_f = 0.5 + 0.5 * _clamp(coverage / 100.0, 0, 1)
+    acc_conf = round(acc_conf * cov_f, 3)
+    dist_conf = round(dist_conf * cov_f, 3)
+    brk_conf = round(brk_conf * cov_f, 3)
+    inst_conf = round(inst_conf * cov_f, 3)
 
     # ── Smart money confidence: đủ dữ liệu × độ tin điểm CHI PHỐI × (1 − phạt mâu thuẫn) ──
     data_suff = _clamp(n_ticks / 500.0, 0, 1)
@@ -563,7 +577,7 @@ def decide(context: Union[Context, dict], of: dict, events: List[dict],
 
     # ── F3 Hypothesis + Decision (rule-based inference, KHÔNG chỉ cộng điểm) ──
     regime = cx.get("regime", "unknown")
-    hypotheses = _hypotheses(evlist, regime, conflict, memory)   # P3: từ nhóm evidence
+    hypotheses = _hypotheses(evlist, regime, conflict, memory, coverage)   # P3: từ nhóm evidence
     decision_out = _decision(hypotheses, regime, bull_strength, bear_strength,
                              institution_activity, trend_quality, conflict,
                              smart_money_confidence, cx, evidence)
@@ -610,9 +624,10 @@ def decide(context: Union[Context, dict], of: dict, events: List[dict],
         "bear_strength": bear_strength,
         "market_control": market_control,
         "smart_money_confidence": smart_money_confidence,
-        "conflict": round(100 * conflict),
+        "conflict": round(100 * conflict),         # I5: = conflict_ev (evidence-based)
         "conflict_level": conflict_level,
-        "conflict_ev": round(100 * conflict_ev),   # I3: mâu thuẫn từ evidence (khử phạt oan + đếm trùng)
+        "conflict_ev": round(100 * conflict_ev),
+        "conflict_raw": round(100 * conflict_raw), # legacy (metric thô) — giữ để đối chiếu
         "market_clarity": market_clarity,          # I3: phiên có "đọc được" không (0-100)
         "clarity_level": clarity_level,
         "clarity_note": clarity_note,
