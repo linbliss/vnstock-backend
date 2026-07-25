@@ -581,6 +581,36 @@ Mạch hoàn chỉnh: **Metrics → Evidence → Hypothesis → Decision → Sto
 
 **P2.1**: institution_activity + breakout_score cũng dựng từ evidence (`_evi_institution`, `_evi_breakout`) → **cả 5 điểm 100% evidence-based**. breakout = vị trí (cơ học) + evidence bullish markup/breakout + thanh khoản.
 
+### ✅ I1–I7 — Nâng chất lượng suy luận (review Fable 5, 2026-07-25, xong)
+
+Ba "vết nứt kế thừa" được vá + 4 năng lực mới. Kiểm chứng bằng golden snapshot (tape thật
+24/07 STB/HDB/VIC đóng băng từ server): I1–I4 điểm số bất biến bit-by-bit; I5 dịch có chủ đích.
+
+- **I1**: `_evidence_engine` dựng ✓/✗ TRỰC TIẾP từ kho evidence — sửa lỗi sau P2 ledger chỉ
+  còn "pro" khiến danh sách ✗ (contradicting) gần như rỗng vĩnh viễn.
+- **I2**: `score_meta` = {coverage 0-100, opposition, verdict} per trục gom/xả — phân biệt
+  **"thiếu bằng chứng" ≠ "bị phủ định" ≠ "tranh chấp"** (Accumulation 35 có hai nghĩa khác nhau).
+- **I3**: `conflict_ev` tính từ EVIDENCE (không phải metric thô): tôn trọng foreign-gate
+  (hết phạt oan), cap đồng thuận cùng HỌ evidence (location/flow/participants/behavior) để
+  khử pseudo-consensus. + `market_clarity` 0-100: phiên có ĐỌC ĐƯỢC không (thấp+conflict cao
+  = tranh chấp; thấp+conflict thấp = thiếu thông tin).
+- **I4**: `Evidence.role = signal|context` — hành vi rời rạc (absorption/supply/cluster/
+  large/divergence) vs bối cảnh liên tục; trục chỉ có context → cảnh báo "thiếu tín hiệu hành vi".
+- **I5** (migration, có dịch số): conflict chính thức = conflict_ev (giữ `conflict_raw`);
+  score_confidence × (0.5+0.5·coverage) — hết "85% tin cậy trên 1 evidence"; ledger rỗng
+  conf 0.3 (không phải 0.5); prior regime co theo coverage. Nghiệm thu: HDB conflict 11→81
+  (phiên 2 chiều thật — 3 hấp thụ + 3 cung — bị netting `absorp−supply` trong flow che mất),
+  VIC 58→94 (cung ép tại kháng cự vs bối cảnh bull), confidence giảm tương ứng, 5 điểm chính
+  + Wyckoff phase bất biến cả 3 mã.
+- **I6**: `story.chain` — mạch nhân-quả theo thời gian THẬT (áp lực đầu phiên → hấp thụ/cung
+  có giờ → POC/VA → chủ thể lớn → cuối phiên → kết luận xác suất); wording "sau đó/đi kèm".
+- **I7**: `decision.headroom` (dư địa ↑/↓ từ S/R gần nhất — hình học, không phải mục tiêu giá),
+  `conviction` (độ hấp dẫn cơ hội = xác suất giả thuyết × dư địa THEO HƯỚNG × clarity — TÁCH
+  khỏi confidence), `recommendation` tham khảo theo giả thuyết (phần mềm dùng cá nhân).
+- Frontend: verdict chip + coverage cạnh Điểm số; Clarity trong Executive; tag hành vi/bối
+  cảnh trong Evidence Dashboard; mạch suy luận (chain) trong Story; conviction + dư địa +
+  khuyến nghị trong DecisionCard.
+
 ### 🔨 Phase D — sau (backtest event-level + benchmark version)
 
 Tổng quát hoá `shark_backtest`: persist đã có (`smart_money_events`) → group theo
