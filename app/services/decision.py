@@ -378,7 +378,7 @@ _BEARISH_HYP = {"Phân phối", "Markdown", "Cao trào mua"}
 
 def _decision(hyps: List[dict], regime: str, bull: int, bear: int, inst: int,
               trend_quality: int, conflict: float, confidence: int, cx: dict,
-              evidence: dict) -> dict:
+              evidence: dict, clarity: int = 50) -> dict:
     """F3 Decision — suy luận từ nhiều đầu vào (KHÔNG chỉ cộng điểm): giả thuyết + regime
     + conflict + context → State/Institution/Trend/Risk/Action(định tính+vùng giá)/Reason."""
     primary = hyps[0] if hyps else {"name": "Chưa rõ", "probability": 0}
@@ -428,10 +428,56 @@ def _decision(hyps: List[dict], regime: str, bull: int, bear: int, inst: int,
     if conflict >= 0.6:
         bits.append("Tín hiệu mâu thuẫn cao → độ tin giảm, cần thêm xác nhận.")
 
+    # ── I7: Dư địa tham chiếu (hình học từ S/R) + Conviction + Khuyến nghị THAM KHẢO ──
+    price = cx.get("price")
+    up_pct = round((res - price) / price * 100, 1) if (price and res and res > price) else 0.0
+    down_pct = round((price - sup) / price * 100, 1) if (price and sup and sup < price) else 0.0
+    ratio = round(up_pct / down_pct, 2) if down_pct > 0 else None
+    hr_label = ("—" if ratio is None else
+                "Dư địa lên rộng" if ratio >= 2 else
+                "Cân bằng" if ratio >= 0.8 else "Dư địa lên hẹp")
+    headroom = {"up_pct": up_pct, "down_pct": down_pct, "ratio": ratio, "label": hr_label}
+
+    # Conviction = độ hấp dẫn của việc HÀNH ĐỘNG theo giả thuyết chính (khác Confidence =
+    # độ tin của suy luận): xác suất giả thuyết + dư địa THEO HƯỚNG giả thuyết + clarity.
+    bullish_hyp = pname in ("Tích luỹ", "Markup", "Rũ hàng (Shakeout)")
+    bearish_hyp = pname in _BEARISH_HYP
+    if bullish_hyp or bearish_hyp:
+        geo = (ratio or 0.0) if bullish_hyp else ((1.0 / ratio) if ratio else 0.0)
+        conv_num = (0.45 * pprob / 100.0 + 0.30 * _clamp(geo / 3.0, 0, 1)
+                    + 0.25 * clarity / 100.0)
+        conv_level = "Cao" if conv_num >= 0.60 else ("Trung bình" if conv_num >= 0.40 else "Thấp")
+        conv_note = (f"Xác suất {pname} {pprob}% · dư địa {'lên' if bullish_hyp else 'xuống'} "
+                     f"{up_pct if bullish_hyp else down_pct}% · phiên {'rõ' if clarity >= 55 else 'nhiễu'}")
+    else:
+        conv_num, conv_level, conv_note = 0.0, "—", "Chưa có giả thuyết đủ rõ để đánh giá cơ hội"
+    conviction = {"level": conv_level, "score": round(100 * conv_num), "note": conv_note}
+
+    # Khuyến nghị THAM KHẢO (dùng cá nhân) — template theo giả thuyết + vùng giá
+    _sup = f"{sup:.2f}" if sup else "hỗ trợ"
+    _res = f"{res:.2f}" if res else "kháng cự"
+    if pname in ("Tích luỹ", "Rũ hàng (Shakeout)"):
+        rec = (f"Theo dõi vùng gom quanh {_sup}; cân nhắc giải ngân thăm dò khi giá giữ trên {_sup} "
+               f"và có thêm phiên hấp thụ; gia tăng khi vượt {_res} kèm thanh khoản.")
+    elif pname == "Markup":
+        rec = (f"Xu hướng tăng còn hiệu lực — ưu tiên nắm giữ; cân nhắc gia tăng khi vượt {_res} "
+               f"kèm thanh khoản; hạ tỷ trọng nếu thủng {_sup}.")
+    elif pname in ("Phân phối", "Cao trào mua"):
+        rec = (f"Cảnh giác — cân nhắc chốt dần vào nhịp hồi khi giá còn trên {_sup}; "
+               f"tránh mua đuổi; thủng {_sup} là tín hiệu thoát.")
+    elif pname == "Markdown":
+        rec = f"Ưu tiên đứng ngoài; chỉ quan sát trở lại khi có tích luỹ quanh {_sup}."
+    else:
+        rec = "Chưa đủ cơ sở hành động — tiếp tục quan sát."
+    if clarity < 40:
+        rec = "Bức tranh phiên chưa rõ (clarity thấp) — hạn chế hành động mạnh. " + rec
+    rec = "Tham khảo: " + rec
+
     return {
         "state": state, "institution": institution, "trend": trend_label,
         "risk_level": risk_level, "action": action,
         "reference_zones": reference_zones, "reason": " ".join(bits),
+        "headroom": headroom, "conviction": conviction, "recommendation": rec,
     }
 
 
@@ -580,7 +626,7 @@ def decide(context: Union[Context, dict], of: dict, events: List[dict],
     hypotheses = _hypotheses(evlist, regime, conflict, memory, coverage)   # P3: từ nhóm evidence
     decision_out = _decision(hypotheses, regime, bull_strength, bear_strength,
                              institution_activity, trend_quality, conflict,
-                             smart_money_confidence, cx, evidence)
+                             smart_money_confidence, cx, evidence, market_clarity)
 
     # ── F4/P4 Story Engine: kể chuyện dòng tiền + Smart Money Story (đọc từ EVIDENCE) ──
     from app.services import story as _story

@@ -106,7 +106,80 @@ def build_story(series: List[dict], events: List[dict], cx: dict, evidence: List
                        "bear" if decision.get("state") in ("Phân phối", "Giảm giá", "Cao trào mua") else "neutral"))
 
     narrative = _smart_money_story(cx, evidence, decision, hypotheses)
-    return {"beats": beats, "narrative": narrative}
+    chain = _causal_chain(series, events, evidence, hypotheses)
+    return {"beats": beats, "narrative": narrative, "chain": chain}
+
+
+def _causal_chain(series: List[dict], events: List[dict], evidence: List[dict],
+                  hypotheses: List[dict]) -> List[dict]:
+    """I6 — Chuỗi diễn biến NHÂN-QUẢ (theo thời gian thật, mỗi bước neo vào dữ liệu):
+    'bán chủ động mạnh → giá không giảm → hấp thụ xuất hiện → POC giữ → ngoại mua ròng
+    → xác suất Markup tăng'. Wording 'sau đó/đi kèm' — trình tự & nhất quán, KHÔNG khẳng
+    định nhân quả tuyệt đối. Mỗi bước: {text, tone}."""
+    steps: List[dict] = []
+    ev_by_kind = {e.get("kind"): e for e in (evidence or [])}
+
+    # 1) Áp lực chủ động đầu phiên (dữ liệu segment thật)
+    if series:
+        dcvd0, dp0 = _seg(series, 0.0, 0.35)
+        if dcvd0 < 0:
+            if dp0 >= -0.2:
+                steps.append({"text": "Bên bán chủ động chiếm ưu thế đầu phiên", "tone": "bear"})
+                steps.append({"text": (f"nhưng giá vẫn TĂNG ({dp0:+.2f}%) — lực bán bị nuốt trọn"
+                                       if dp0 > 0.3 else
+                                       f"nhưng giá KHÔNG giảm tương ứng ({dp0:+.2f}%)"), "tone": "bull"})
+            else:
+                steps.append({"text": f"Bên bán chủ động ép giá đầu phiên ({dp0:+.2f}%)", "tone": "bear"})
+        elif dcvd0 > 0:
+            if dp0 <= 0.2:
+                steps.append({"text": "Bên mua chủ động áp đảo đầu phiên", "tone": "bull"})
+                steps.append({"text": f"nhưng giá KHÔNG bứt lên tương ứng ({dp0:+.2f}%)", "tone": "bear"})
+            else:
+                steps.append({"text": f"Bên mua chủ động dẫn dắt, giá nhích lên ({dp0:+.2f}%)", "tone": "bull"})
+
+    # 2) Hành vi hấp thụ / cung (event thật, có giờ)
+    abs_evs = [e for e in events if e.get("type") == "absorption" and (e.get("strength") or 0) > 0]
+    sup_evs = [e for e in events if e.get("type") == "supply_absorption"]
+    if abs_evs:
+        steps.append({"text": f"sau đó xuất hiện hấp thụ lực bán ({len(abs_evs)} lần, "
+                              f"từ {_hhmm(abs_evs[0].get('ts', ''))})", "tone": "bull"})
+    if sup_evs:
+        steps.append({"text": f"đi kèm cung chủ động chặn giá ({len(sup_evs)} lần, "
+                              f"từ {_hhmm(sup_evs[0].get('ts', ''))})", "tone": "bear"})
+
+    # 3) Chấp nhận giá (POC / Value Area — evidence đã diễn giải)
+    poc_e = ev_by_kind.get("poc_position") or ev_by_kind.get("value_area")
+    if poc_e:
+        d = poc_e.get("direction") or 0.0
+        steps.append({"text": ("vùng giá trị vẫn được giữ (giá trên POC)" if d >= 0
+                               else "giá bị đẩy xuống dưới vùng giá trị"),
+                      "tone": "bull" if d >= 0 else "bear"})
+
+    # 4) Chủ thể lớn (cụm tổ chức, khối ngoại — claim đã context-conditioned)
+    cl_e = ev_by_kind.get("cluster")
+    if cl_e and abs(cl_e.get("direction") or 0) > 0.05:
+        steps.append({"text": cl_e.get("claim", ""),
+                      "tone": "bull" if (cl_e.get("direction") or 0) > 0 else "bear"})
+    ff = ev_by_kind.get("foreign_flow")
+    if ff:
+        steps.append({"text": ff.get("claim", ""),
+                      "tone": "bull" if (ff.get("direction") or 0) >= 0 else "bear"})
+
+    # 5) Cuối phiên
+    if series:
+        dcvd1, _ = _seg(series, 0.75, 1.0)
+        if abs(dcvd1) > 1:
+            steps.append({"text": ("cuối phiên cầu chủ động mạnh lên" if dcvd1 > 0
+                                   else "cuối phiên cung chủ động gia tăng"),
+                          "tone": "bull" if dcvd1 > 0 else "bear"})
+
+    # 6) Kết luận xác suất
+    if hypotheses:
+        p = hypotheses[0]
+        tone = "bull" if p["name"] in ("Tích luỹ", "Markup", "Rũ hàng (Shakeout)") else \
+               "bear" if p["name"] in ("Phân phối", "Markdown", "Cao trào mua") else "neutral"
+        steps.append({"text": f"⇒ nghiêng về {p['name']} ({p['probability']}%)", "tone": tone})
+    return steps[:8]
 
 
 def _smart_money_story(cx: dict, evidence: List[dict], decision: dict, hypotheses: List[dict]) -> str:
