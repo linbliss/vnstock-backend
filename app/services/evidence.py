@@ -18,6 +18,15 @@ from typing import Dict, List, Optional
 ACC, DIST, MARKUP, MARKDOWN, SHAKEOUT, CLIMAX = \
     "accumulation", "distribution", "markup", "markdown", "shakeout", "climax"
 
+# I4 — Vai trò evidence: SIGNAL = hành vi dòng tiền rời rạc (tự nó tạo thesis);
+# CONTEXT = bối cảnh liên tục (chỉ khuếch đại/giảm độ tin của signal). Một trục điểm
+# chỉ toàn context-evidence nghĩa là "có bối cảnh thuận nhưng CHƯA có hành vi xác nhận".
+ROLE_SIGNAL = {"absorption", "supply", "cluster", "large_order_bias", "divergence"}
+
+
+def role_of(kind: str) -> str:
+    return "signal" if kind in ROLE_SIGNAL else "context"
+
 
 @dataclass
 class Evidence:
@@ -30,7 +39,9 @@ class Evidence:
     context_used: List[str] = field(default_factory=list)  # context nào đã dùng để suy
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        d["role"] = role_of(self.kind)   # I4: signal | context
+        return d
 
 
 def _clamp(v: float, lo: float, hi: float) -> float:

@@ -173,6 +173,90 @@ def _evi_breakout(evlist: List[dict], location: str, flow: float, vol_trend: flo
     return _score_pack(cs)
 
 
+# ── I2/I3: coverage · verdict · conflict_ev · clarity ─────────────────────────────────
+# Họ evidence TƯƠNG QUAN — đồng thuận trong cùng họ bị CAP để không tạo pseudo-consensus
+# (price_vs_vwap / poc / VA cùng đo vị trí giá: 3 evidence "đồng ý" ≈ 1 quan sát độc lập).
+EVIDENCE_FAMILY = {
+    "price_vs_vwap": "location", "poc_position": "location", "value_area": "location",
+    "cvd_flow": "flow", "divergence": "flow",
+    "large_order_bias": "participants", "cluster": "participants",
+    "foreign_flow": "participants", "dealer_flow": "participants",
+    "absorption": "behavior", "supply": "behavior",
+}
+_FAMILY_CAP = 22.0          # ≈ khối lượng 1 evidence mạnh nhất (26·0.9·0.82)
+_COVERAGE_NORM = 40.0       # tổng khối lượng evidence của một phiên "đầy thông tin"
+
+
+def _ev_mass(e: dict) -> float:
+    """Khối lượng thông tin của 1 evidence = budget·|direction|·reliability."""
+    return (EVIDENCE_BUDGET.get(e.get("kind", ""), 10)
+            * abs(e.get("direction") or 0.0) * (e.get("reliability") or 0.6))
+
+
+def _coverage(evlist: List[dict]) -> int:
+    """I2 — Coverage 0-100: ĐÃ QUAN SÁT được bao nhiêu bằng chứng (bất kể hướng).
+    Phân biệt 'điểm thấp vì thiếu thông tin' với 'điểm thấp vì bị phủ định'."""
+    mass = sum(_ev_mass(e) for e in evlist)
+    return round(100 * _clamp(mass / _COVERAGE_NORM, 0, 1))
+
+
+def _axis_verdict(score: int, opposition: int, coverage: int, has_signal: bool) -> dict:
+    """Verdict cho 1 trục điểm (gom/xả): thiếu bằng chứng ≠ bị phủ định ≠ tranh chấp."""
+    if coverage < 30:
+        key, vi = "insufficient", "Thiếu bằng chứng"
+    elif score >= 30 and opposition >= max(20, 0.6 * score):
+        key, vi = "contested", "Tranh chấp"
+    elif score >= 45:
+        key, vi = "supported", "Được ủng hộ"
+    elif score < 30 and opposition >= 30:
+        key, vi = "refuted", "Bị phủ định"
+    else:
+        key, vi = "weak", "Tín hiệu yếu"
+    only_context = (score >= 20) and not has_signal
+    if only_context:
+        vi += " (chỉ có bối cảnh, thiếu tín hiệu hành vi)"
+    return {"opposition": opposition, "verdict": key, "verdict_label": vi,
+            "only_context": only_context}
+
+
+def _conflict_ev(evlist: List[dict]) -> float:
+    """I3 — Mâu thuẫn tính TỪ EVIDENCE (đã diễn giải theo context, tôn trọng gating —
+    foreign bán-được-hấp-thụ chỉ còn direction -0.10 nên KHÔNG bị phạt oan như bản
+    metric thô). Đồng thuận cùng họ bị cap để khử đếm trùng tín hiệu tương quan."""
+    fam_pos: Dict[str, float] = {}
+    fam_neg: Dict[str, float] = {}
+    for e in evlist:
+        d = e.get("direction") or 0.0
+        if abs(d) < 0.03:
+            continue
+        f = EVIDENCE_FAMILY.get(e.get("kind", ""), "other")
+        m = _ev_mass(e)
+        if d > 0:
+            fam_pos[f] = fam_pos.get(f, 0.0) + m
+        else:
+            fam_neg[f] = fam_neg.get(f, 0.0) + m
+    pos = sum(min(v, _FAMILY_CAP) for v in fam_pos.values())
+    neg = sum(min(v, _FAMILY_CAP) for v in fam_neg.values())
+    return (2 * min(pos, neg) / (pos + neg)) if (pos + neg) > 0 else 0.0
+
+
+def _clarity(conflict_ev: float, coverage: int, data_suff: float, has_evidence: bool):
+    """I3 — Market Clarity 0-100: phiên hôm nay CÓ ĐỌC ĐƯỢC không (không phải bull/bear).
+    Thấp + conflict cao = phiên TRANH CHẤP; thấp + conflict thấp = phiên THIẾU THÔNG TIN."""
+    agreement = (1.0 - conflict_ev) if has_evidence else 0.0
+    clarity = round(100 * _clamp(0.45 * agreement + 0.30 * coverage / 100.0
+                                 + 0.25 * data_suff, 0, 1))
+    level = "Dễ đọc" if clarity >= 65 else ("Bình thường" if clarity >= 40 else "Khó đọc")
+    if clarity < 45:
+        note = ("Phiên tranh chấp — hai phe đối kháng, tín hiệu nhiễu" if conflict_ev >= 0.45
+                else "Phiên thiếu thông tin — bằng chứng mỏng, không nên suy diễn mạnh")
+    elif conflict_ev >= 0.45:
+        note = "Đủ dữ liệu nhưng hai phe còn giằng co"
+    else:
+        note = "Bức tranh dòng tiền tương đối nhất quán"
+    return clarity, level, note
+
+
 def _event_counts(events: List[dict]) -> dict:
     c = {"absorption_buy": 0, "absorption_sell": 0, "cluster_buy": 0,
          "cluster_sell": 0, "divergence_bull": 0, "divergence_bear": 0}
@@ -195,34 +279,30 @@ def _poc_sig(poc_shift: float, up: bool) -> float:
     return _clamp(max(0.0, v) * 20.0, 0.0, 1.0)
 
 
-def _evidence_engine(lean: str, phase: str, acc_led: List[Contribution],
-                     dist_led: List[Contribution], acc_conf: float, dist_conf: float,
-                     breakout_score: int, cx: dict, conflict: float) -> dict:
-    """F2 — Evidence Engine: gom sổ cái của HƯỚNG CHI PHỐI thành ✓ (thuận) / ✗ (nghịch)
-    bằng ngôn ngữ người, kèm bằng chứng NGỮ CẢNH bổ sung (VWAP, breakout) + confidence.
-    Đây là đầu vào cho Hypothesis/Decision (F3)."""
-    bearish = lean == "distribution"
-    led = dist_led if bearish else acc_led
-    base_conf = dist_conf if bearish else acc_conf
+def _evidence_engine(lean: str, phase: str, evlist: List[dict], base_conf: float,
+                     breakout_score: int, conflict: float) -> dict:
+    """F2 — Evidence Engine (I1): dựng ✓ (thuận) / ✗ (nghịch) TRỰC TIẾP từ kho evidence
+    (không lọc ledger — sau P2 ledger chỉ còn 'pro' nên lọc ledger sẽ mất phía nghịch).
+    Trọng số hàng = budget·|direction|·reliability; hướng thuận/nghịch xét TƯƠNG ĐỐI
+    so với lean chi phối. Đây là đầu vào cho Hypothesis/Decision (F3)."""
+    orient = -1.0 if lean == "distribution" else 1.0
 
-    def _row(c: Contribution) -> dict:
-        return {"label": c.label, "points": c.points, "reliability": c.reliability}
+    supporting: List[dict] = []
+    contradicting: List[dict] = []
+    for e in evlist:
+        d = e.get("direction") or 0.0
+        if abs(d) < 0.03:
+            continue
+        rel = e.get("reliability") or 0.6
+        w = EVIDENCE_BUDGET.get(e.get("kind", ""), 10) * abs(d) * rel
+        row = {"label": e.get("claim", ""), "points": round(w, 1),
+               "reliability": round(rel, 3), "role": e.get("role", "context")}
+        (supporting if d * orient > 0 else contradicting).append(row)
 
-    # Bỏ đóng góp "nền" (base) — là offset cấu trúc, không phải bằng chứng dòng tiền.
-    supporting = [_row(c) for c in led if c.points > 0 and c.source != "base"]
-    contradicting = [_row(c) for c in led if c.points < 0 and c.source != "base"]
-
-    # Bằng chứng ngữ cảnh bổ sung (không nằm trong ledger điểm)
-    vs = cx.get("vwap_side")
-    if vs == "above":
-        (contradicting if bearish else supporting).append(
-            {"label": "Giá giữ trên VWAP", "points": None, "reliability": RELIABILITY["flow"]})
-    elif vs == "below":
-        (supporting if bearish else contradicting).append(
-            {"label": "Giá dưới VWAP", "points": None, "reliability": RELIABILITY["flow"]})
-    if not bearish and breakout_score < 45:
+    # Bằng chứng ngữ cảnh bổ sung (không phải evidence kind)
+    if lean != "distribution" and breakout_score < 45:
         contradicting.append({"label": "Breakout chưa xác nhận", "points": None,
-                              "reliability": RELIABILITY["location"]})
+                              "reliability": RELIABILITY["location"], "role": "context"})
 
     supporting.sort(key=lambda r: -(abs(r["points"]) if r["points"] else 0))
     contradicting.sort(key=lambda r: -(abs(r["points"]) if r["points"] else 0))
@@ -450,15 +530,36 @@ def decide(context: Union[Context, dict], of: dict, events: List[dict],
     conflict = (2 * min(cpos, cneg) / (cpos + cneg)) if (cpos + cneg) > 0 else 0.0
     conflict_level = "Cao" if conflict >= 0.6 else ("Trung bình" if conflict >= 0.3 else "Thấp")
 
+    # ── I2/I3: coverage · verdict per trục · conflict_ev · clarity (từ kho evidence) ──
+    coverage = _coverage(evlist)
+    conflict_ev = _conflict_ev(evlist)
+
+    def _has_signal(want_supports: set, sign: float) -> bool:
+        return any(e.get("role") == "signal"
+                   and (set(e.get("supports") or []) & want_supports)
+                   and (e.get("direction") or 0.0) * sign > 0.02 for e in evlist)
+
+    score_meta = {
+        "coverage": coverage,
+        "evidence_mass": round(sum(_ev_mass(e) for e in evlist), 1),
+        "accumulation": _axis_verdict(accumulation_score, distribution_score, coverage,
+                                      _has_signal(ACC_SUPPORTS, +1.0)),
+        "distribution": _axis_verdict(distribution_score, accumulation_score, coverage,
+                                      _has_signal(DIST_SUPPORTS, -1.0)),
+    }
+
     # ── Smart money confidence: đủ dữ liệu × độ tin điểm CHI PHỐI × (1 − phạt mâu thuẫn) ──
     data_suff = _clamp(n_ticks / 500.0, 0, 1)
     dom_conf = acc_conf if accumulation_score >= distribution_score else dist_conf
     smart_money_confidence = round(100 * _clamp((0.40 * data_suff + 0.60 * dom_conf) *
                                                 (1.0 - 0.35 * conflict), 0, 1))
 
-    # ── F2 Evidence Engine: ✓/✗ cho kết luận chi phối ──
-    evidence = _evidence_engine(lean, phase, acc_led, dist_led, acc_conf, dist_conf,
-                                breakout_score, cx, conflict)
+    market_clarity, clarity_level, clarity_note = _clarity(
+        conflict_ev, coverage, data_suff, bool(evlist))
+
+    # ── F2 Evidence Engine: ✓/✗ cho kết luận chi phối (I1: dựng từ kho evidence) ──
+    base_conf = dist_conf if lean == "distribution" else acc_conf
+    evidence = _evidence_engine(lean, phase, evlist, base_conf, breakout_score, conflict)
 
     # ── F3 Hypothesis + Decision (rule-based inference, KHÔNG chỉ cộng điểm) ──
     regime = cx.get("regime", "unknown")
@@ -511,6 +612,11 @@ def decide(context: Union[Context, dict], of: dict, events: List[dict],
         "smart_money_confidence": smart_money_confidence,
         "conflict": round(100 * conflict),
         "conflict_level": conflict_level,
+        "conflict_ev": round(100 * conflict_ev),   # I3: mâu thuẫn từ evidence (khử phạt oan + đếm trùng)
+        "market_clarity": market_clarity,          # I3: phiên có "đọc được" không (0-100)
+        "clarity_level": clarity_level,
+        "clarity_note": clarity_note,
+        "score_meta": score_meta,                  # I2: coverage + opposition + verdict per trục
         "regime": cx.get("regime", "unknown"),
         "wyckoff_phase": phase,
         "phase_note": phase_note,
