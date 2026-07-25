@@ -93,6 +93,38 @@ def _score_from(contribs: List[Contribution], base: float = 0.0):
     return score, round(conf, 3), cs
 
 
+# ── P2: dựng điểm TỪ EVIDENCE (thay vì metric thô) ────────────────────────────────────
+# Budget điểm tối đa mỗi loại evidence trên trục gom/xả (đã cân để điểm ~ tương đương cũ).
+EVIDENCE_BUDGET = {
+    "absorption": 26, "supply": 26, "large_order_bias": 24, "cvd_flow": 20, "cluster": 20,
+    "foreign_flow": 18, "divergence": 16, "price_vs_vwap": 12, "poc_position": 10,
+    "value_area": 10, "dealer_flow": 8,
+}
+# Evidence khai báo `supports` bằng khoá giả thuyết → gom về trục gom (bullish) / xả (bearish)
+ACC_SUPPORTS = {"accumulation", "shakeout", "markup"}
+DIST_SUPPORTS = {"distribution", "climax", "markdown"}
+
+
+def _evi_score(evlist: List[dict], want_supports: set, want_sign: float):
+    """Điểm = clamp(Σ budget·direction·reliability) trên các evidence ỦNG HỘ trục này.
+    want_sign +1 (trục bullish: gom) / −1 (trục bearish: xả). Trả (score, conf, ledger)."""
+    cs: List[Contribution] = []
+    for e in evlist:
+        if not (set(e.get("supports") or []) & want_supports):
+            continue
+        signed = (e.get("direction") or 0.0) * want_sign   # >0 nếu evidence hợp hướng score
+        if signed <= 0.02:
+            continue
+        pts = EVIDENCE_BUDGET.get(e.get("kind", ""), 10) * signed * (e.get("reliability") or 0.6)
+        cs.append(Contribution(e.get("kind", ""), e.get("claim", ""), round(pts, 1),
+                               "pro", round(e.get("reliability") or 0.6, 3)))
+    score = int(_clamp(round(sum(c.points for c in cs)), 0, 100))
+    tot = sum(abs(c.points) for c in cs)
+    conf = (sum(abs(c.points) * c.reliability for c in cs) / tot) if tot else 0.5
+    cs.sort(key=lambda c: abs(c.points), reverse=True)
+    return score, round(conf, 3), cs
+
+
 def _event_counts(events: List[dict]) -> dict:
     c = {"absorption_buy": 0, "absorption_sell": 0, "cluster_buy": 0,
          "cluster_sell": 0, "divergence_bull": 0, "divergence_bear": 0}
@@ -341,42 +373,13 @@ def decide(context: Union[Context, dict], of: dict, events: List[dict],
     ]
     institution_activity, inst_conf, inst_led = _score_from(inst_l)
 
-    # ── ACCUMULATION: gom âm thầm (hấp thụ, cụm mua, ngoại mua) − phản chứng ──
-    base_factor = 1.0 if (trend in ("sideway", "downtrend") and
-                          location in ("support", "inside_va", "at_poc")) else 0.35
-    acc_l = [
-        _mk("absorption", f"{ec['absorption_buy']} lần hấp thụ mua" + (f" tại {loc_vi}" if at_support else ""), 100 * 0.28 * a_pos, rel_mult=m_absorp),
-        _mk("cluster", f"{ec['cluster_buy']} cụm lệnh tổ chức mua", 100 * 0.16 * c_pos, rel_mult=m_clbuy),
-        _mk("foreign", "Khối ngoại mua ròng", 100 * 0.14 * f_pos),
-        _mk("flow", "Lực mua chủ động tăng", 100 * 0.12 * fl_pos),
-        _mk("delta", "Delta cải thiện cuối phiên", 100 * 0.10 * (1.0 if delta_recent > 0 else 0.0)),
-        _mk("base", f"Nền tích luỹ tại {loc_vi}" if base_factor >= 1.0 else "Vị trí chưa lý tưởng để gom", 100 * 0.12 * base_factor),
-        _mk("dealer", "Tự doanh mua ròng", 100 * 0.08 * d_pos),
-        # phản chứng (con)
-        _mk("foreign", "Khối ngoại bán ròng", -100 * 0.14 * f_neg),
-        _mk("poc", "POC dịch xuống", -100 * 0.10 * _poc_sig(poc_shift, up=False)),
-        _mk("supply", "Có cung chủ động chặn", -100 * 0.12 * s_pos, rel_mult=m_supply),
-        _mk("trend", "Xu hướng giảm còn hiệu lực", -100 * 0.08 * (1.0 if trend == "downtrend" else 0.0)),
-    ]
-    accumulation_score, acc_conf, acc_led = _score_from(acc_l)
-
-    # ── DISTRIBUTION: xả tại đỉnh — GATE bởi absorption (mấu chốt STB) ──
-    absorbed = a_pos
-    top_factor = 1.0 if (trend in ("uptrend", "sideway") and
-                         location in ("resistance", "breakout")) else 0.35
-    foreign_dist = f_neg * (1.0 - absorbed)                       # ngoại bán được hấp thụ → không tính
-    dist_l = [
-        _mk("supply", "Cung chủ động (giá không lên)", 100 * 0.30 * s_pos, rel_mult=m_supply),
-        _mk("cluster", f"{ec['cluster_sell']} cụm lệnh tổ chức bán", 100 * 0.16 * c_neg, rel_mult=m_clsell),
-        _mk("foreign", "Khối ngoại bán ròng (không được hấp thụ)", 100 * 0.16 * foreign_dist),
-        _mk("divergence", "CVD phân kỳ giảm", 100 * 0.14 * dv_neg),
-        _mk("poc", "POC dịch xuống", 100 * 0.08 * _poc_sig(poc_shift, up=False)),
-        _mk("location", f"Xả tại {loc_vi}", 100 * 0.08 * (top_factor * s_pos)),
-        # phản chứng (con)
-        _mk("absorption", "Lực bán đang được hấp thụ", -100 * 0.18 * a_pos, rel_mult=m_absorp),
-        _mk("foreign", "Khối ngoại mua ròng", -100 * 0.10 * f_pos),
-    ]
-    distribution_score, dist_conf, dist_led = _score_from(dist_l)
+    # ── P2: ACCUMULATION & DISTRIBUTION dựng TỪ EVIDENCE (không cộng metric thô) ──
+    # Mỗi đóng góp trong ledger LÀ một Evidence đã diễn giải theo context (kho evidence chung).
+    from app.services import evidence as _evmod
+    evlist = _evmod.derive_evidence(of, cx, events)
+    absorbed = a_pos    # còn dùng cho _decision/story
+    accumulation_score, acc_conf, acc_led = _evi_score(evlist, ACC_SUPPORTS, +1.0)
+    distribution_score, dist_conf, dist_led = _evi_score(evlist, DIST_SUPPORTS, -1.0)
 
     # ── BREAKOUT probability ──
     if location == "breakout":
@@ -459,7 +462,7 @@ def decide(context: Union[Context, dict], of: dict, events: List[dict],
         "absorption": round(absorp, 3), "supply": round(supply, 3),
         "cluster": round(cluster, 3), "divergence": round(diverg, 3),
         "flow": round(flow, 3), "foreign_dir": foreign, "dealer_dir": dealer,
-        "foreign_dist_gated": round(foreign_dist, 3), "cvd_norm": round(cvd_norm, 3),
+        "cvd_norm": round(cvd_norm, 3),
         "large_net": round(lo_net, 3), "poc_shift": round(poc_shift, 3),
     }
     report = _report(context=cx, of=of, phase=phase, phase_note=phase_note,
@@ -486,8 +489,9 @@ def decide(context: Union[Context, dict], of: dict, events: List[dict],
         "wyckoff_phase": phase,
         "phase_note": phase_note,
         "components": components,
-        "ledgers": ledgers,                 # F1: sổ cái đóng góp từng điểm số
+        "ledgers": ledgers,                 # F1: sổ cái đóng góp từng điểm số (nay TỪ evidence)
         "score_confidence": score_confidence,
+        "evidence_layer": evlist,           # P2: kho evidence (metric đã diễn giải theo context)
         "evidence": evidence,               # F2: Evidence Engine (✓/✗ + confidence)
         "hypotheses": hypotheses,           # F3: giả thuyết song song + xác suất
         "decision": decision_out,           # F3: State/Institution/Trend/Risk/Action/Reason

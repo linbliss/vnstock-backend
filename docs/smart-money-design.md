@@ -536,7 +536,7 @@ nơi mọi metric được diễn giải THEO CONTEXT (direction KHÔNG cố đ�
 | Phase | Nội dung | Trạng thái |
 |---|---|---|
 | **P1** | `evidence.py` (`Evidence` + `derive_evidence`) + endpoint debug — CHƯA nối Decision | ✅ |
-| P2 | `decide()` dựng Contribution Ledger TỪ Evidence | ⏳ |
+| P2 | `decide()` dựng Contribution Ledger TỪ Evidence (acc/dist) | ✅ |
 | P3 | Hypotheses từ nhóm Evidence (`supports`) | ⏳ |
 | P4 | Story narrative đọc từ Evidence | ⏳ |
 | P5 | Frontend: EvidenceDashboard hiện Evidence-claim (context) | ⏳ |
@@ -550,6 +550,19 @@ cluster, divergence, foreign_flow (GATE bởi hấp thụ), dealer_flow. **Direc
 quyết định** (vd Large Buy tại kháng cự + được hấp thụ → "institutional absorption", không
 phải distribution; Price>VWAP tại kháng cự → "chưa chắc bullish"). `GET /api/shark/evidence/
 {ticker}` (debug). Chưa nối vào Decision → 0 rủi ro.
+
+### ✅ P2 — Decision (acc/dist) dựng từ Evidence (xong)
+
+`decide()`: `accumulation_score` & `distribution_score` giờ tính bằng `_evi_score(evlist,
+supports, sign)` — mỗi đóng góp trong ledger LÀ một Evidence (claim theo context, points =
+budget·direction·reliability). Gom theo `supports`: ACC/SHAKEOUT/MARKUP → trục gom;
+DIST/CLIMAX/MARKDOWN → trục xả. Output thêm `evidence_layer`. breakout/institution/trend
+tạm giữ cách cũ (P2.1 sau nếu cần). `_hypotheses`/conflict/story vẫn dùng signals + scores
+(P3 sẽ cho hypotheses từ evidence).
+
+Dịch chuyển điểm (đã lường trước, hướng cân bằng/trung thực hơn): STB Acc 48→24 (phiên có
+cung thật tại kháng cự) → giả thuyết thận trọng hơn; VIC vẫn Markup 80%; HDB ~ giữ. Wyckoff
+logic KHÔNG đổi.
 
 ### 🔨 Phase D — sau (backtest event-level + benchmark version)
 
