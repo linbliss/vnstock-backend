@@ -992,7 +992,7 @@ def _parse_ts(ts: str) -> Optional[datetime]:
 BIG_PCTILE = 97.0
 BIG_MIN_VND = 200_000_000
 BIG_MAX_VND = 5_000_000_000
-SCORE_VERSION = 2          # đổi công thức ⇒ cache điểm cũ không còn so sánh được
+SCORE_VERSION = 3          # đổi công thức ⇒ cache điểm cũ không còn so sánh được
 
 
 def _adaptive_big_value(ticks: List[dict]) -> float:
@@ -1202,6 +1202,66 @@ def _behavior(ticks: List[dict], big_value: float, exchange: str = "HOSE") -> di
             "reversal": round(reversal, 3), "flags": flags}
 
 
+# ── Shark Score v3 (S1): hấp thụ/cung đo bằng CÙNG cảm biến với Intraday Analysis ─────
+# (patterns.detect_absorption — impact-residual, thích ứng theo mã) để hai màn hình kể
+# MỘT câu chuyện. Component absorption cũ của _behavior đo cả-phiên-một-cục nên gần như
+# không bao giờ kích hoạt (đo được 0.00 trên STB/HDB/VIC 24/07 dù Layer 2 thấy 5/6/2
+# event) → 24% trọng số chết + Shark Point mù bên CUNG (VIC "Gom 27" trong khi tape có
+# 2 nhịp cung ép tại kháng cự). Context trung tính, không I/O: strength/confidence của
+# detector KHÔNG phụ thuộc location (chỉ nhãn vị trí phụ thuộc — ở đây không dùng).
+_absev_memo: Dict[str, tuple] = {}   # tk -> (n, last_ts, absorp, supply, n_ab, n_sup, ok)
+
+
+def _absorption_events(tk: str, ticks: List[dict], big_value: float):
+    """(absorp 0..1, supply 0..1, n_ab, n_sup, ok). ok=False khi tape còn quá mỏng để
+    detector chạy (đầu phiên) → caller fallback công thức _behavior cũ."""
+    import math as _math
+    n = len(ticks)
+    last_ts = ticks[-1]["ts"] if ticks else ""
+    m = _absev_memo.get(tk)
+    if m and m[0] == n and m[1] == last_ts:
+        return m[2], m[3], m[4], m[5], m[6]
+    absorp = supply = 0.0
+    n_ab = n_sup = 0
+    ok = False
+    try:
+        from app.services import patterns as _patterns
+        from app.services.market_context import Context as _Ctx
+        evs = _patterns.detect_absorption(ticks, _Ctx(), big_value)
+        ab = sum(e.strength * e.confidence for e in evs if e.type == "absorption" and e.strength > 0)
+        sp = sum(-e.strength * e.confidence for e in evs if e.type == "supply_absorption")
+        n_ab = sum(1 for e in evs if e.type == "absorption")
+        n_sup = sum(1 for e in evs if e.type == "supply_absorption")
+        absorp = _math.tanh(ab / 1.5)          # cùng thang với decision.decide
+        supply = _math.tanh(sp / 1.5)
+        # detect_absorption trả [] cả khi <6 cửa sổ usable lẫn khi thật sự không có
+        # hấp thụ: tape đủ dày mà rỗng = "không có hấp thụ" THẬT (ok=True);
+        # tape mỏng = chưa biết (ok=False → fallback).
+        ok = n >= 200 or bool(evs)
+    except Exception:  # noqa: BLE001
+        ok = False
+    _absev_memo[tk] = (n, last_ts, absorp, supply, n_ab, n_sup, ok)
+    return absorp, supply, n_ab, n_sup, ok
+
+
+# S4: hysteresis nhãn — vào Gom/Xả ở |25|, chỉ thoát khi tụt dưới |20| (hết nhấp nháy
+# Gom↔Trung tính khi điểm live dao động quanh ngưỡng). Reset theo ngày.
+_label_memo: Dict[str, tuple] = {}   # tk -> (date, label)
+
+
+def _label_of(tk: str, score: int, date: str) -> str:
+    prev = _label_memo.get(tk)
+    prev_label = prev[1] if prev and prev[0] == date else None
+    if prev_label == "Gom hàng":
+        label = "Gom hàng" if score >= 20 else ("Xả hàng" if score <= -25 else "Trung tính")
+    elif prev_label == "Xả hàng":
+        label = "Xả hàng" if score <= -20 else ("Gom hàng" if score >= 25 else "Trung tính")
+    else:
+        label = "Gom hàng" if score >= 25 else ("Xả hàng" if score <= -25 else "Trung tính")
+    _label_memo[tk] = (date, label)
+    return label
+
+
 def _metrics(ticker: str, ticks: List[dict], big_value: float, window_min: int) -> dict:
     tk = ticker.upper()
     # Người dùng để MẶC ĐỊNH → dùng ngưỡng THÍCH ỨNG theo mã; nếu tự đặt ngưỡng ở
@@ -1240,30 +1300,46 @@ def _metrics(ticker: str, ticks: List[dict], big_value: float, window_min: int) 
     # PHÂN KỲ lớn/nhỏ — thành phần độc lập, trước đây không hề đo
     dv = _divergence(ticks, big_value)
 
-    # Shark Score v2 — bỏ ĐA CỘNG TUYẾN.
-    # Bản cũ đặt 0.28 big_dir + 0.18 imbalance + 0.16 manip = 0.62 trọng số lên ba
-    # cách viết của CÙNG một đại lượng "hướng dòng tiền" (đo được corr(big_dir,
-    # imbalance) = +0.92). Nay gộp nhóm cùng phương thành MỘT "flow", nhường trọng
-    # số cho phân kỳ + hấp thụ (hai tín hiệu thực sự độc lập).
+    # Shark Score v3 — đồng bộ cảm biến với Intraday Analysis (S1) + gate hấp thụ (S2)
+    # + shrink đầu phiên (S3). v2 đã bỏ đa cộng tuyến (flow gộp big_dir/imbalance);
+    # v3 vá tiếp: component absorption của _behavior đo cả-phiên nên gần như luôn 0
+    # → thay bằng absorp−supply từ detector impact-residual (lần đầu Shark Point
+    # NHÌN THẤY bên cung — hết cảnh "Gom hàng" trong khi tape đầy cung ép).
     flow = 0.45 * big_dir + 0.35 * imbalance + 0.20 * w_imbalance
+
+    absorp_ev, supply_ev, n_ab, n_sup, ev_ok = _absorption_events(tk, ticks, big_value)
+    abs_comp = _clamp(absorp_ev - supply_ev, -1, 1) if ev_ok else beh["absorption"]
+
+    # S2 — GATE (context-conditioning như evidence layer): dòng bán đang BỊ HẤP THỤ
+    # thì không để flow âm triệt tiêu tín hiệu gom; đối xứng cho cung khi flow dương.
+    flow_eff = flow
+    if ev_ok:
+        if flow < 0 and absorp_ev > 0.30:
+            flow_eff = flow * (1 - 0.7 * absorp_ev)
+        elif flow > 0 and supply_ev > 0.30:
+            flow_eff = flow * (1 - 0.7 * supply_ev)
+
     score = 100.0 * (
-        0.30 * flow +                                  # hướng dòng tiền (đã gộp)
-        0.28 * _clamp(dv["divergence"] / 1.2, -1, 1) +  # phân kỳ lớn/nhỏ (MỚI)
-        0.24 * beh["absorption"] +                     # hấp thụ (độc lập)
+        0.30 * flow_eff +                              # hướng dòng tiền (đã gate)
+        0.28 * _clamp(dv["divergence"] / 1.2, -1, 1) +  # phân kỳ lớn/nhỏ
+        0.24 * abs_comp +                              # hấp thụ − cung (impact-residual)
         0.10 * beh["manip"] +                          # rũ/kéo (đã siết)
         0.08 * beh["reversal"]                         # spring / upthrust
     )
+    # S3 — shrink đầu phiên: <300 tick điểm chưa đáng tin, co về 0 theo sqrt
+    score *= min(1.0, len(ticks) / 300.0) ** 0.5
     score = round(_clamp(score, -100, 100))
 
-    if score >= 25:
-        label = "Gom hàng"
-    elif score <= -25:
-        label = "Xả hàng"
-    else:
-        label = "Trung tính"
+    session_date = (ticks[-1]["ts"] or "")[:10]
+    label = _label_of(tk, score, session_date)         # S4: hysteresis ±5
 
     # Cờ phân kỳ — diễn giải trực tiếp "tiền lớn gom / nhỏ lẻ bán"
     patterns = list(beh["flags"])
+    # v3: cờ hấp thụ/cung từ detector (thay cho cờ _behavior gần như không bao giờ bật)
+    if ev_ok and supply_ev >= 0.35:
+        patterns.insert(0, f"Cung chủ động ép giá ×{n_sup}")
+    if ev_ok and absorp_ev >= 0.35:
+        patterns.insert(0, f"Hấp thụ lực bán ×{n_ab} (tay to đỡ giá)")
     if dv["divergence_valid"] and dv["divergence"] >= 0.35:
         patterns.insert(0, f"Tiền lớn gom, nhỏ lẻ bán (phân kỳ {dv['divergence']:+.2f})")
     elif dv["divergence_valid"] and dv["divergence"] <= -0.35:
@@ -1306,7 +1382,13 @@ def _metrics(ticker: str, ticks: List[dict], big_value: float, window_min: int) 
         "manip": beh["manip"],
         "reversal": beh["reversal"],
         "patterns": patterns,
-        # Thành phần MỚI (v2) — hướng dòng tiền đã gộp + phân kỳ lớn/nhỏ
+        # Thành phần v3 — hấp thụ/cung từ impact-residual + flow đã gate
+        "absorption_ev": round(absorp_ev, 3),
+        "supply_ev": round(supply_ev, 3),
+        "n_absorption": n_ab,
+        "n_supply": n_sup,
+        "flow_eff": round(flow_eff, 3),
+        # Thành phần v2 — hướng dòng tiền đã gộp + phân kỳ lớn/nhỏ
         "flow": round(flow, 3),
         "big_dir": dv["big_dir"],
         "small_dir": dv["small_dir"],
