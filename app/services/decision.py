@@ -190,36 +190,48 @@ def _evidence_engine(lean: str, phase: str, acc_led: List[Contribution],
     }
 
 
-def _hypotheses(regime: str, location: str, acc: int, dist: int, brk: int, inst: int,
-                absorp: float, supply: float, diverg: float, cluster: float, flow: float,
-                conflict: float, memory: Optional[dict] = None) -> List[dict]:
-    """F3 Hypothesis Engine — sinh nhiều giả thuyết SONG SONG rồi softmax → xác suất.
-    Tái dùng điểm/tín hiệu đã có (không detector mới). Regime chi phối trọng số:
-    absorption trong sideway ≠ trong uptrend. `memory` (nếu có) nhích giả thuyết theo
-    diễn biến nhiều phiên — hiện là seam (None → bỏ qua)."""
-    at_support = location in ("support", "inside_va", "at_poc")
-    at_resist = location in ("resistance", "breakout")
-    raw = {
-        "Tích luỹ": acc * (1.15 if regime in ("sideway", "trending_down") else 0.9)
-                    + (15 if at_support else 0) - 0.4 * dist,
-        "Phân phối": dist * (1.15 if regime in ("trending_up", "sideway") else 0.9)
-                     + (15 if at_resist else 0) + 20 * max(0.0, -diverg) - 0.4 * acc,
-        "Markup": (58 if regime == "trending_up" else 12) + 0.4 * brk + 0.25 * acc + 18 * max(0.0, flow),
-        "Markdown": (58 if regime == "trending_down" else 8) + 0.4 * dist - 22 * flow,
-        "Rũ hàng (Shakeout)": (24 if at_support else 4)
-                              + 45 * absorp * (1.0 if regime in ("sideway", "trending_down") else 0.5),
-        "Cao trào mua": (18 if (regime == "trending_up" and at_resist) else 0)
-                        + 30 * supply + 25 * max(0.0, -diverg) + 0.25 * inst,
-        "Chưa rõ": 22 + 45 * conflict,
-    }
-    if memory:                                   # seam: nhích theo quá trình nhiều phiên
-        raw["Tích luỹ"] += memory.get("accum_bias", 0.0)
-        raw["Phân phối"] += memory.get("distrib_bias", 0.0)
-    raw = {k: max(0.0, v) for k, v in raw.items()}
+# Khoá giả thuyết (canonical trong evidence.supports) → nhãn hiển thị
+_HYP_VI = {"accumulation": "Tích luỹ", "distribution": "Phân phối", "markup": "Markup",
+           "markdown": "Markdown", "shakeout": "Rũ hàng (Shakeout)", "climax": "Cao trào mua"}
+
+
+def _hypotheses(evlist: List[dict], regime: str, conflict: float,
+                memory: Optional[dict] = None) -> List[dict]:
+    """P3 Hypothesis Engine — sinh giả thuyết TỪ NHÓM EVIDENCE (theo `supports`), không
+    từ điểm tổng. Mỗi evidence dồn "lực ủng hộ" = budget·|direction|·reliability vào các
+    giả thuyết nó khai báo. Regime + memory là prior nhẹ. Softmax → xác suất; drivers =
+    chính các evidence đã ủng hộ."""
+    raw = {v: 0.0 for v in _HYP_VI.values()}
+    drivers: Dict[str, List[str]] = {v: [] for v in _HYP_VI.values()}
+    for e in evlist:
+        w = EVIDENCE_BUDGET.get(e.get("kind", ""), 10) * abs(e.get("direction") or 0.0) * (e.get("reliability") or 0.6)
+        for canon in (e.get("supports") or []):
+            vi = _HYP_VI.get(canon)
+            if not vi:
+                continue
+            raw[vi] += w
+            if len(drivers[vi]) < 2:
+                drivers[vi].append(e.get("claim", ""))
+    # Prior theo regime (nhẹ) + memory (nhiều phiên)
+    if regime == "trending_up":
+        raw["Markup"] += 18
+    elif regime == "trending_down":
+        raw["Markdown"] += 18
+    elif regime == "sideway":
+        raw["Tích luỹ"] += 8
+    if memory:
+        raw["Tích luỹ"] += max(0.0, memory.get("accum_bias", 0.0))
+        raw["Phân phối"] += max(0.0, memory.get("distrib_bias", 0.0))
+    total = sum(raw.values())
+    # "Chưa rõ" là PHẦN DƯ nhỏ: chỉ nổi lên khi bằng chứng mỏng; mâu thuẫn cao đã hạ
+    # confidence ở nơi khác, KHÔNG để nuốt giả thuyết dẫn đầu.
+    unknown = 8 + 18 * conflict + (32 if total < 14 else 0)
+    items = [(k, max(0.0, v)) for k, v in raw.items()] + [("Chưa rõ", unknown)]
     T = 18.0
-    exps = {k: math.exp(v / T) for k, v in raw.items()}
+    exps = {k: math.exp(v / T) for k, v in items}
     tot = sum(exps.values()) or 1.0
-    hyps = [{"name": k, "probability": round(100 * e / tot)} for k, e in exps.items()]
+    hyps = [{"name": k, "probability": round(100 * e / tot), "drivers": drivers.get(k, [])}
+            for k, e in exps.items()]
     hyps.sort(key=lambda h: -h["probability"])
     return [h for h in hyps if h["probability"] >= 3][:5]
 
@@ -431,20 +443,15 @@ def decide(context: Union[Context, dict], of: dict, events: List[dict],
 
     # ── F3 Hypothesis + Decision (rule-based inference, KHÔNG chỉ cộng điểm) ──
     regime = cx.get("regime", "unknown")
-    hypotheses = _hypotheses(regime, location, accumulation_score, distribution_score,
-                             breakout_score, institution_activity, absorp, supply, diverg,
-                             cluster, flow, conflict, memory)
+    hypotheses = _hypotheses(evlist, regime, conflict, memory)   # P3: từ nhóm evidence
     decision_out = _decision(hypotheses, regime, bull_strength, bear_strength,
                              institution_activity, trend_quality, conflict,
                              smart_money_confidence, cx, evidence)
 
-    # ── F4 Story Engine: kể chuyện dòng tiền + Smart Money Story ──
+    # ── F4/P4 Story Engine: kể chuyện dòng tiền + Smart Money Story (đọc từ EVIDENCE) ──
     from app.services import story as _story
     story = _story.build_story(
-        of.get("series") or [], events, cx,
-        {"absorp": absorp, "supply": supply, "cluster": cluster, "flow": flow,
-         "foreign": foreign, "poc_shift": poc_shift, "diverg": diverg},
-        decision_out, hypotheses)
+        of.get("series") or [], events, cx, evlist, decision_out, hypotheses)
 
     ledgers = {
         "accumulation": [c.to_dict() for c in acc_led],

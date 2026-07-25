@@ -537,9 +537,9 @@ nơi mọi metric được diễn giải THEO CONTEXT (direction KHÔNG cố đ�
 |---|---|---|
 | **P1** | `evidence.py` (`Evidence` + `derive_evidence`) + endpoint debug — CHƯA nối Decision | ✅ |
 | P2 | `decide()` dựng Contribution Ledger TỪ Evidence (acc/dist) | ✅ |
-| P3 | Hypotheses từ nhóm Evidence (`supports`) | ⏳ |
-| P4 | Story narrative đọc từ Evidence | ⏳ |
-| P5 | Frontend: EvidenceDashboard hiện Evidence-claim (context) | ⏳ |
+| P3 | Hypotheses từ nhóm Evidence (`supports`) | ✅ |
+| P4 | Story narrative đọc từ Evidence | ✅ |
+| P5 | Frontend: EvidenceDashboard hiện Evidence-claim (context) | ✅ |
 
 ### ✅ P1 — Evidence layer (xong, chưa nối Decision)
 
@@ -563,6 +563,21 @@ tạm giữ cách cũ (P2.1 sau nếu cần). `_hypotheses`/conflict/story vẫn
 Dịch chuyển điểm (đã lường trước, hướng cân bằng/trung thực hơn): STB Acc 48→24 (phiên có
 cung thật tại kháng cự) → giả thuyết thận trọng hơn; VIC vẫn Markup 80%; HDB ~ giữ. Wyckoff
 logic KHÔNG đổi.
+
+### ✅ P3/P4/P5 — Hypotheses + Story + Frontend từ Evidence (xong)
+
+- **P3**: `_hypotheses(evlist, regime, conflict, memory)` — giả thuyết sinh TỪ nhóm Evidence
+  (theo `supports`), lực ủng hộ = budget·|direction|·reliability; regime+memory là prior nhẹ;
+  "Chưa rõ" chỉ là PHẦN DƯ (unknown=8+18·conflict), không nuốt giả thuyết dẫn đầu. drivers =
+  chính các evidence. Nghiệm thu: STB Markup 44% (contested, conf 55%), VIC Markup 68% (conf
+  80%), HDB tie Tích luỹ/Markup.
+- **P4**: `story._smart_money_story` kể lại CHÍNH các Evidence (claim) thuận/nghịch mạnh nhất
+  + foreign-gate + kết luận giả thuyết — không diễn giải lại metric thô.
+- **P5**: `EvidenceDashboard` dẫn đầu bằng **Evidence đã diễn giải** (2 cột thuận/nghịch,
+  claim + thanh hướng + reliability); số liệu thô xuống dưới, **KHÔNG tô hướng** (hết coi
+  metric là kết luận). `evidence_layer` trong output decision.
+
+Mạch hoàn chỉnh: **Metrics → Evidence → Hypothesis → Decision → Story** đọc chung 1 kho Evidence.
 
 ### 🔨 Phase D — sau (backtest event-level + benchmark version)
 

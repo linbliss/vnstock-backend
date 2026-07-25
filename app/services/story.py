@@ -39,7 +39,7 @@ def _beat(time: str, text: str, tone: str) -> dict:
     return {"time": time, "text": text, "tone": tone}   # tone: bull|bear|neutral
 
 
-def build_story(series: List[dict], events: List[dict], cx: dict, signals: dict,
+def build_story(series: List[dict], events: List[dict], cx: dict, evidence: List[dict],
                 decision: dict, hypotheses: List[dict]) -> dict:
     beats: List[dict] = []
 
@@ -105,55 +105,36 @@ def build_story(series: List[dict], events: List[dict], cx: dict, signals: dict,
                        "bull" if decision.get("state") in ("Tích luỹ", "Tăng giá", "Rũ hàng") else
                        "bear" if decision.get("state") in ("Phân phối", "Giảm giá", "Cao trào mua") else "neutral"))
 
-    narrative = _smart_money_story(cx, signals, decision, hypotheses)
+    narrative = _smart_money_story(cx, evidence, decision, hypotheses)
     return {"beats": beats, "narrative": narrative}
 
 
-def _smart_money_story(cx: dict, sig: dict, decision: dict, hypotheses: List[dict]) -> str:
-    """Đoạn văn tổng hợp hành vi tiền lớn — giọng chuyên gia."""
-    absorp = sig.get("absorp", 0.0); supply = sig.get("supply", 0.0)
-    cluster = sig.get("cluster", 0.0); flow = sig.get("flow", 0.0)
-    foreign = sig.get("foreign", 0.0); poc_shift = sig.get("poc_shift", 0.0)
-    vwap_side = cx.get("vwap_side", "at")
-    loc = _LOC_VI.get(cx.get("location", "mid"), "vùng trung gian")
+def _smart_money_story(cx: dict, evidence: List[dict], decision: dict, hypotheses: List[dict]) -> str:
+    """Đoạn văn tổng hợp — KỂ LẠI CHÍNH CÁC EVIDENCE (đã diễn giải theo context), không
+    diễn giải lại metric thô. Chọn bằng chứng thuận/nghịch mạnh nhất + kết luận giả thuyết."""
     parts: List[str] = []
+    ev = [e for e in (evidence or []) if abs(e.get("direction") or 0) * (e.get("reliability") or 0) > 0.05]
+    ev.sort(key=lambda e: abs(e.get("direction") or 0) * (e.get("reliability") or 0), reverse=True)
+    bull = [e for e in ev if (e.get("direction") or 0) > 0]
+    bear = [e for e in ev if (e.get("direction") or 0) < 0]
 
-    # Hành vi tiền lớn: đẩy giá hay hấp thụ?
-    if absorp >= 0.35 and cluster > 0 and flow < 0.5:
-        parts.append(f"Dòng tiền lớn hôm nay không mua đẩy giá, mà hấp thụ lượng bán chủ động tại {loc}.")
-    elif flow >= 0.5 and cluster > 0:
-        parts.append("Dòng tiền lớn chủ động mua đẩy giá lên.")
-    elif supply >= 0.4:
-        parts.append(f"Xuất hiện cung chủ động lớn tại {loc} — dấu hiệu phân phối cần theo dõi.")
-    else:
-        parts.append("Dòng tiền lớn chưa thể hiện ý đồ rõ ràng trong phiên.")
+    if bull:
+        parts.append("Bằng chứng thuận: " + "; ".join(e["claim"] for e in bull[:2]) + ".")
+    if bear:
+        parts.append("Bằng chứng nghịch: " + "; ".join(e["claim"] for e in bear[:2]) + ".")
+    if not bull and not bear:
+        parts.append("Chưa có bằng chứng dòng tiền đủ rõ trong phiên.")
 
-    # Khối ngoại vs giá
-    if foreign < -0.15:
-        if absorp >= 0.35:
-            parts.append("Khối ngoại bán ròng mạnh nhưng giá chỉ giảm nhẹ — lực bán đang được hấp thụ.")
-        else:
-            parts.append("Khối ngoại bán ròng gây áp lực lên giá.")
-    elif foreign > 0.15:
-        parts.append("Khối ngoại mua ròng hỗ trợ xu hướng.")
+    # Foreign gate (nếu có evidence foreign_flow đã diễn giải)
+    ff = next((e for e in ev if e.get("kind") == "foreign_flow"), None)
+    if ff:
+        parts.append(ff["claim"] + ".")
 
-    # POC / VWAP
-    if poc_shift > 0.01:
-        parts.append("POC dịch lên cho thấy vùng giá trị đang cải thiện.")
-    elif poc_shift < -0.01:
-        parts.append("POC dịch xuống — vùng giá trị chưa cải thiện.")
-    else:
-        parts.append("POC gần như đi ngang, vùng giá trị chưa cải thiện.")
-    if vwap_side == "above":
-        parts.append("VWAP vẫn được giữ.")
-    elif vwap_side == "below":
-        parts.append("Giá đang nằm dưới VWAP.")
-
-    # Kết luận theo giả thuyết
+    # Kết luận theo giả thuyết (từ evidence)
     if len(hypotheses) >= 2:
         p, s = hypotheses[0], hypotheses[1]
-        parts.append(f"Do đó xác suất đây là giai đoạn **{p['name']} ({p['probability']}%)** "
-                     f"cao hơn {s['name']} ({s['probability']}%).")
+        parts.append(f"Tổng hợp lại, khả năng cao nhất là **{p['name']} ({p['probability']}%)**, "
+                     f"trên {s['name']} ({s['probability']}%).")
     elif hypotheses:
         p = hypotheses[0]
         parts.append(f"Nghiêng về giả thuyết **{p['name']} ({p['probability']}%)**.")
