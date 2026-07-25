@@ -125,6 +125,54 @@ def _evi_score(evlist: List[dict], want_supports: set, want_sign: float):
     return score, round(conf, 3), cs
 
 
+# P2.1: institution & breakout cũng dựng từ evidence
+INST_BUDGET = {"cluster": 42, "large_order_bias": 34, "foreign_flow": 16, "dealer_flow": 10}
+BRK_BUDGET = {"cvd_flow": 18, "large_order_bias": 18, "cluster": 14, "value_area": 16,
+              "price_vs_vwap": 8, "poc_position": 8}
+
+
+def _score_pack(cs: List[Contribution], base: float = 0.0):
+    score = int(_clamp(round(base + sum(c.points for c in cs)), 0, 100))
+    tot = sum(abs(c.points) for c in cs)
+    conf = (sum(abs(c.points) * c.reliability for c in cs) / tot) if tot else 0.5
+    cs.sort(key=lambda c: abs(c.points), reverse=True)
+    return score, round(conf, 3), cs
+
+
+def _evi_institution(evlist: List[dict]):
+    """Mức độ hoạt động tổ chức = ĐỘ LỚN evidence cụm/lệnh lớn/ngoại/tự doanh (không hướng)."""
+    cs: List[Contribution] = []
+    for e in evlist:
+        k = e.get("kind", "")
+        if k not in INST_BUDGET:
+            continue
+        pts = INST_BUDGET[k] * abs(e.get("direction") or 0.0) * (e.get("reliability") or 0.6)
+        if pts >= 0.5:
+            cs.append(Contribution(k, e.get("claim", ""), round(pts, 1), "pro",
+                                   round(e.get("reliability") or 0.6, 3)))
+    return _score_pack(cs)
+
+
+def _evi_breakout(evlist: List[dict], location: str, flow: float, vol_trend: float, loc_vi: str):
+    """Xác suất breakout = vị trí (cơ học) + evidence bullish ủng hộ markup/breakout + thanh khoản."""
+    loc_factor = 1.0 if location == "breakout" else (0.6 if location == "resistance" and flow > 0 else 0.15)
+    cs: List[Contribution] = [Contribution("location", f"Vị trí {loc_vi}",
+                              round(100 * 0.32 * loc_factor, 1), "pro", 0.66)]
+    for e in evlist:
+        k = e.get("kind", "")
+        d = e.get("direction") or 0.0
+        if k not in BRK_BUDGET or d <= 0.02:
+            continue
+        if not (set(e.get("supports") or []) & {"markup", "breakout"}):
+            continue
+        cs.append(Contribution(k, e.get("claim", ""), round(BRK_BUDGET[k] * d * (e.get("reliability") or 0.6), 1),
+                               "pro", round(e.get("reliability") or 0.6, 3)))
+    if vol_trend > 0.02:
+        cs.append(Contribution("vol", "Thanh khoản mở rộng (nhiều phiên)",
+                               round(100 * 0.10 * min(1.0, vol_trend), 1), "pro", 0.5))
+    return _score_pack(cs)
+
+
 def _event_counts(events: List[dict]) -> dict:
     c = {"absorption_buy": 0, "absorption_sell": 0, "cluster_buy": 0,
          "cluster_sell": 0, "divergence_bull": 0, "divergence_bear": 0}
@@ -372,43 +420,14 @@ def decide(context: Union[Context, dict], of: dict, events: List[dict],
     m_clbuy = 1.12 if at_support else 1.0
     m_clsell = 1.12 if at_resist else 1.0
 
-    # ── INSTITUTION ACTIVITY (mức độ hoạt động tổ chức) ──
-    n_big = lo.get("count", 0) or 0
-    big_density = _clamp(n_big / max(1, n_ticks) * 30, 0, 1)
-    cluster_act = _sat(sum(abs(e.get("strength") or 0) * (e.get("confidence") or 0)
-                           for e in events if e.get("type") == "institution_cluster"), 2.0)
-    inst_l = [
-        _mk("cluster", f"{ec['cluster_buy'] + ec['cluster_sell']} cụm lệnh tổ chức", 100 * 0.45 * cluster_act),
-        _mk("large", f"Mật độ lệnh lớn ({n_big} lệnh)", 100 * 0.30 * big_density),
-        _mk("foreign", "Cường độ khối ngoại", 100 * 0.15 * abs(foreign)),
-        _mk("dealer", "Cường độ tự doanh", 100 * 0.10 * abs(dealer)),
-    ]
-    institution_activity, inst_conf, inst_led = _score_from(inst_l)
-
-    # ── P2: ACCUMULATION & DISTRIBUTION dựng TỪ EVIDENCE (không cộng metric thô) ──
-    # Mỗi đóng góp trong ledger LÀ một Evidence đã diễn giải theo context (kho evidence chung).
+    # ── P2/P2.1: MỌI điểm dựng TỪ EVIDENCE (kho evidence chung, không cộng metric thô) ──
     from app.services import evidence as _evmod
     evlist = _evmod.derive_evidence(of, cx, events)
     absorbed = a_pos    # còn dùng cho _decision/story
+    institution_activity, inst_conf, inst_led = _evi_institution(evlist)
     accumulation_score, acc_conf, acc_led = _evi_score(evlist, ACC_SUPPORTS, +1.0)
     distribution_score, dist_conf, dist_led = _evi_score(evlist, DIST_SUPPORTS, -1.0)
-
-    # ── BREAKOUT probability ──
-    if location == "breakout":
-        loc_factor = 1.0
-    elif location == "resistance" and flow > 0:
-        loc_factor = 0.6
-    else:
-        loc_factor = 0.15
-    brk_l = [
-        _mk("location", f"Vị trí {loc_vi}", 100 * 0.34 * loc_factor),
-        _mk("flow", "Dòng tiền mua áp đảo", 100 * 0.22 * fl_pos),
-        _mk("cluster", "Cụm tổ chức mua", 100 * 0.16 * c_pos),
-        _mk("poc", "POC dịch lên", 100 * 0.12 * _poc_sig(poc_shift, up=True)),
-        _mk("vol", "Thanh khoản mở rộng", 100 * 0.10 * max(0.0, vol_trend)),
-        _mk("supply", "Có cung chặn tại vùng cao", -100 * 0.10 * s_pos),
-    ]
-    breakout_score, brk_conf, brk_led = _score_from(brk_l)
+    breakout_score, brk_conf, brk_led = _evi_breakout(evlist, location, flow, vol_trend, loc_vi)
 
     # ── Wyckoff MỞ RỘNG ──
     phase, phase_note = _wyckoff(trend, location, accumulation_score, distribution_score,

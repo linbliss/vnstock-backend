@@ -579,6 +579,8 @@ logic KHÔNG đổi.
 
 Mạch hoàn chỉnh: **Metrics → Evidence → Hypothesis → Decision → Story** đọc chung 1 kho Evidence.
 
+**P2.1**: institution_activity + breakout_score cũng dựng từ evidence (`_evi_institution`, `_evi_breakout`) → **cả 5 điểm 100% evidence-based**. breakout = vị trí (cơ học) + evidence bullish markup/breakout + thanh khoản.
+
 ### 🔨 Phase D — sau (backtest event-level + benchmark version)
 
 Tổng quát hoá `shark_backtest`: persist đã có (`smart_money_events`) → group theo
