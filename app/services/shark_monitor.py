@@ -517,6 +517,24 @@ def get_context(ticker: str, with_foreign: bool = True) -> dict:
     return d
 
 
+def get_evidence(ticker: str) -> dict:
+    """P1 — LAYER 1.5 debug: metrics + context + events → EVIDENCE (diễn giải theo context).
+    CHƯA nối vào Decision; dùng để duyệt chất lượng Evidence trước khi tiến hoá."""
+    from app.services import market_context, patterns, evidence as evmod
+    tk = ticker.upper()
+    of = get_orderflow(tk)
+    if of.get("empty"):
+        return {"ticker": tk, "empty": True, "evidence": []}
+    c = _ensure_loaded(tk)
+    ticks = c.get("ticks", [])
+    big_thr = float((of.get("large_orders") or {}).get("threshold_p97") or 0.0)
+    ctx = market_context.build_context(tk, ticks, of=of)
+    evs = [e.to_dict() for e in patterns.detect_all(ticks, ctx, big_thr=big_thr)]
+    evidence = evmod.derive_evidence(of, ctx.to_dict(), evs)
+    return {"ticker": tk, "empty": False, "date": c.get("date") or _today(),
+            "context": ctx.to_dict(), "n_evidence": len(evidence), "evidence": evidence}
+
+
 def get_market_context(ticker: str, sessions: int = 5) -> dict:
     """② Market Context — bối cảnh NHIỀU PHIÊN cho màn Intraday: regime, 5 phiên gần nhất,
     dòng tiền ngoại/tự doanh, xu hướng POC & hấp thụ. Đọc dữ liệu đã lưu + shark_history."""

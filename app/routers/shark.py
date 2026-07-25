@@ -49,6 +49,13 @@ def shark_events(ticker: str, persist: bool = Query(True)):
     return shark_monitor.get_events(ticker, persist=persist)
 
 
+@router.get("/evidence/{ticker}")
+def shark_evidence(ticker: str):
+    """P1 (Inference) — Evidence layer debug: metric + context → evidence có diễn giải,
+    direction theo context. Chưa nối vào Decision."""
+    return shark_monitor.get_evidence(ticker)
+
+
 @router.get("/market-context/{ticker}")
 def shark_market_context(ticker: str, sessions: int = Query(5, ge=1, le=20)):
     """② Market Context (Intraday): regime, 5 phiên gần nhất, dòng tiền ngoại/tự doanh,

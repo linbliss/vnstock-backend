@@ -526,6 +526,31 @@ Backend: chỉ THÊM Memory Engine (`smart_money_memory.py`) + `GET /api/shark/m
 Frontend: 1 hook mới `useSharkMarketContext`; tái dùng DecisionCard/StoryCard/OrderFlowPanel/
 gauge/rating/ledger; gỡ SmartMoneyPanel + IntradayDetail (dead). Nền tối `.sm-card`.
 
+---
+
+## Inference Evolution — Metrics → Evidence → Hypothesis → Decision
+
+Chuyển từ "explainable scoring" → Inference System thật: chèn lớp **Evidence** phổ quát,
+nơi mọi metric được diễn giải THEO CONTEXT (direction KHÔNG cố định).
+
+| Phase | Nội dung | Trạng thái |
+|---|---|---|
+| **P1** | `evidence.py` (`Evidence` + `derive_evidence`) + endpoint debug — CHƯA nối Decision | ✅ |
+| P2 | `decide()` dựng Contribution Ledger TỪ Evidence | ⏳ |
+| P3 | Hypotheses từ nhóm Evidence (`supports`) | ⏳ |
+| P4 | Story narrative đọc từ Evidence | ⏳ |
+| P5 | Frontend: EvidenceDashboard hiện Evidence-claim (context) | ⏳ |
+
+### ✅ P1 — Evidence layer (xong, chưa nối Decision)
+
+`evidence.py`: `Evidence{kind, raw, claim, direction(-1..1 THEO CONTEXT), reliability,
+supports[], context_used[]}`. `derive_evidence(of, context, events)` → ~11 loại evidence:
+price_vs_vwap, cvd_flow, large_order_bias, poc_position, value_area, absorption, supply,
+cluster, divergence, foreign_flow (GATE bởi hấp thụ), dealer_flow. **Direction do context
+quyết định** (vd Large Buy tại kháng cự + được hấp thụ → "institutional absorption", không
+phải distribution; Price>VWAP tại kháng cự → "chưa chắc bullish"). `GET /api/shark/evidence/
+{ticker}` (debug). Chưa nối vào Decision → 0 rủi ro.
+
 ### 🔨 Phase D — sau (backtest event-level + benchmark version)
 
 Tổng quát hoá `shark_backtest`: persist đã có (`smart_money_events`) → group theo
