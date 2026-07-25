@@ -79,7 +79,14 @@ def check_trend_template(df: pd.DataFrame, rs_rating: float = 0.0,
     ma50  = float(pd.Series(close).rolling(50).mean().iloc[-1])
     ma150 = float(pd.Series(close).rolling(150).mean().iloc[-1])
     ma200 = float(pd.Series(close).rolling(200).mean().iloc[-1])
-    ma200_1m_ago = float(pd.Series(close).rolling(200).mean().iloc[-22])  # ~1 tháng
+    # B5: iloc[-22] của rolling(200) là NaN khi lịch sử 200-221 phiên → c2 luôn False
+    # oan cho mã niêm yết ~10 tháng. Dùng chuỗi MA200 ĐÃ CÓ GIÁ TRỊ, lùi tối đa 22
+    # phiên (ít hơn nếu chuỗi ngắn — vẫn đo được "MA200 đang hướng lên").
+    _ma200_s = pd.Series(close).rolling(200).mean().dropna()
+    if len(_ma200_s) >= 5:
+        ma200_1m_ago = float(_ma200_s.iloc[-min(22, len(_ma200_s))])
+    else:
+        ma200_1m_ago = float('inf')   # không đủ dữ liệu đánh giá hướng → c2 False
 
     # 52 tuần — dùng high/low thật (không phải close) để khớp Minervini gốc
     high_52w = float(np.max(high[-252:]))
@@ -204,21 +211,23 @@ def compute_rs_score(stock_close: pd.Series, index_close: Optional[pd.Series] = 
                 pass   # rơi xuống fallback tuyệt đối
 
         def period_return(s: pd.Series, days: int) -> float:
-            if len(s) < days:
-                return 0.0
             return float((s.iloc[-1] / s.iloc[-days] - 1) * 100)
 
-        stock_returns = [period_return(stock_close, p) for p in [63, 126, 189, 252]]
-
-        if idx_close is not None:
-            idx_returns = [period_return(idx_close, p) for p in [63, 126, 189, 252]]
-            relative = [s - i for s, i in zip(stock_returns, idx_returns)]
-        else:
-            # Fallback: dùng absolute return (chỉ khi không có index data — không khuyến nghị)
-            relative = stock_returns
-
+        # B6: chỉ tính các kỳ CÓ ĐỦ dữ liệu rồi CHUẨN HOÁ LẠI trọng số. Trước đây
+        # kỳ thiếu bị gán return 0 (coi như "bằng index") → mã niêm yết <12 tháng
+        # bị kéo tụt điểm oan so với mã đủ lịch sử. Mã đủ 252 phiên: kết quả y hệt cũ.
+        periods = [63, 126, 189, 252]
         weights = [0.4, 0.2, 0.2, 0.2]
-        return sum(r * w for r, w in zip(relative, weights))
+        total, wsum = 0.0, 0.0
+        for p, w in zip(periods, weights):
+            if len(stock_close) < p or (idx_close is not None and len(idx_close) < p):
+                continue
+            r = period_return(stock_close, p)
+            if idx_close is not None:
+                r -= period_return(idx_close, p)
+            total += r * w
+            wsum += w
+        return total / wsum if wsum > 0 else 0.0
     except Exception:
         return 0.0
 
@@ -365,7 +374,13 @@ def compute_rs_line(stock_close: pd.Series, index_close: pd.Series, length: int 
         if len(stock_close) < length + 5 or len(index_close) < length + 5:
             return 50.0
 
-        # Ch�� dùng 60 phiên gần nh���t (đủ cho SMA(20) + buffer)
+        # B7: align THEO NGÀY trước (như compute_rs_line_breakout) — mã có phiên ngừng
+        # giao dịch sẽ lệch phiên nếu tail-align, RS value so sai ngày.
+        stock_close, index_close = _align_by_date(stock_close, index_close)
+        if len(index_close) < length + 5 or len(stock_close) < length + 5:
+            return 50.0
+
+        # Chỉ dùng 60 phiên gần nhất (đủ cho SMA(20) + buffer)
         lookback = length * 3  # 60 phiên cho length=20
         stock = stock_close.iloc[-lookback:].reset_index(drop=True).astype(float)
         index = index_close.iloc[-lookback:].reset_index(drop=True).astype(float)
@@ -534,22 +549,28 @@ def _zigzag_swings(
                 trend = 'up'
 
     # ── Tail: append tentative pivot (swing đang hình thành chưa confirmed) ──
-    # Cho phép walker tạo contraction cuối nếu đủ duration & higher-lows
+    # Cho phép walker tạo contraction cuối nếu đủ duration & higher-lows.
+    # B3: trả kèm trạng thái đuôi để detect_vcp đánh dấu T cuối là "forming"
+    # (đáy còn tentative — sẽ dịch chuyển các phiên tới nếu pullback tiếp diễn).
+    tail = {"end_trend": trend, "tail_idx": -1}
     if trend == 'up':
         # Currently in uptrend, track running high — append as last swing high
         if not swing_highs or swing_highs[-1][0] != cur_high_idx:
             swing_highs.append((cur_high_idx, cur_high_price))
+        tail["tail_idx"] = cur_high_idx
     elif trend == 'down':
         if not swing_lows or swing_lows[-1][0] != cur_low_idx:
             swing_lows.append((cur_low_idx, cur_low_price))
+        tail["tail_idx"] = cur_low_idx
 
-    return swing_highs, swing_lows
+    return swing_highs, swing_lows, tail
 
 
 # Backward compat alias — nếu code khác còn dùng tên cũ
 def _find_swing_points(high: np.ndarray, low: np.ndarray, order: int = 5) -> tuple:
     """DEPRECATED — gọi _zigzag_swings (threshold mặc định 2%)."""
-    return _zigzag_swings(high, low, threshold_pct=2.0)
+    sh, sl, _tail = _zigzag_swings(high, low, threshold_pct=2.0)
+    return sh, sl
 
 
 def _filter_to_recent_cluster(
@@ -746,7 +767,14 @@ def _find_contractions(
     if not swing_highs or not swing_lows:
         return []
 
-    REBOUND_PCT = 0.05   # 5% rebound — bắt cả contractions nông hơn (HPG)
+    # B1 (review 2026-07-26): ngưỡng rebound TƯƠNG ĐỐI theo độ sâu đang rơi.
+    # Ngưỡng 5% tuyệt đối cũ khiến cú rơi 25% có 2 nhịp hồi 6% (dead-cat, lower-high
+    # + higher-low) bị TÁCH thành 2-3 "T" — máy thấy VCP đẹp, mắt người thấy 1 cú rơi.
+    # _merge không cứu được vì chỉ merge khi Lower-Low. Nay: hồi phải ≥ 40% biên độ
+    # đã rơi (đồng bộ triết lý 40%-of-range của _merge_continued_drops) mới tính là
+    # nhịp co mới; sàn 5% giữ cho contraction nông (HPG).
+    REBOUND_PCT = 0.05   # sàn tuyệt đối
+    REBOUND_FRAC = 0.40  # tỉ lệ tối thiểu so với độ sâu đang rơi
 
     events = (
         [(i, p, 'H') for i, p in swing_highs] +
@@ -819,11 +847,12 @@ def _find_contractions(
                 _finalize()
                 pending_high = (idx, price)
             else:
-                # H thấp hơn pending — kiểm tra soft recovery
+                # H thấp hơn pending — kiểm tra soft recovery (ngưỡng TƯƠNG ĐỐI, B1)
                 if running_min is not None:
                     rebound_pct = (price - running_min[1]) / running_min[1] if running_min[1] > 0 else 0
+                    drop_so_far = (pending_high[1] - running_min[1]) / pending_high[1] if pending_high[1] > 0 else 0
                     duration    = running_min[0] - pending_high[0]
-                    if rebound_pct > REBOUND_PCT and duration >= 2:
+                    if rebound_pct > max(REBOUND_PCT, REBOUND_FRAC * drop_so_far) and duration >= 2:
                         _finalize()
                         pending_high = (idx, price)
                 # else: H thấp hơn pending, chưa có running_min — bỏ qua
@@ -873,6 +902,7 @@ def _empty_vcp_result(stage: str, **extra) -> Dict:
         "stage_strict": stage,
         "stage_loose": stage,
         "contractions": [],
+        "warnings": [],
         "base_start_date": None,
         "pivot_date": None,
     }
@@ -1230,7 +1260,7 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None,
     # SWING POINTS + CONTRACTIONS — scan toàn 200 ngày
     # Pipeline diagnostics tracked for debug
     # ══════════════════════════════════════════════════════════════════════
-    swing_highs_raw, swing_lows_raw = _zigzag_swings(b_high, b_low, threshold_pct=zigzag_pct)
+    swing_highs_raw, swing_lows_raw, zz_tail = _zigzag_swings(b_high, b_low, threshold_pct=zigzag_pct)
 
     # REFINE swing positions: tìm extreme thực (max/min) giữa 2 swings adjacent
     # → H/L không bị "lệch" 2-3 bars do ZigZag confirm timing
@@ -1259,23 +1289,36 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None,
         min_high_ratio=config.cluster_min_high_ratio,
     )
 
+    # B2: ghi LÝ DO cho từng T bị heuristic loại — đưa vào diagnostics để debug
+    # overlay vẽ được "máy đã bỏ gì, vì sao" (thay vì rơi vào 'cluster_other' sai).
+    _dropped_reasons: Dict[tuple, str] = {}
+
     # DROP EARLY shallow T's: VCP đúng có T1 sâu nhất, T_i+1 shallower.
     # Nếu T_1.depth < T_2.depth → T_1 không phải first contraction thật,
     # chỉ là pullback nhỏ trước đó. Drop liên tiếp đến khi T_1 ≥ T_2.
     while len(contractions) >= 2 and contractions[0]["depth"] < contractions[1]["depth"]:
+        c0 = contractions[0]
+        _dropped_reasons[(c0["high_idx"], c0["low_idx"])] = (
+            f"early_shallow ({c0['depth']:.1f}% nông hơn T kế {contractions[1]['depth']:.1f}% — pullback trước base)")
         contractions = contractions[1:]
 
     # DROP VALLEY T's: T_i depth < 0.7 × min(neighbors) → outlier shallow.
     # Ví dụ GMD: T1 (21.56%), T2 (6.91%), T3 (10.01%). T2 là valley
     # giữa T1 và T3, depth nhỏ hơn nhiều → bỏ. Khác T1 sớm: valley có thể
     # ở giữa cluster.
+    # LƯU Ý (B2): xoá valley đồng nghĩa GIẤU một lần chuỗi co không đơn điệu
+    # (T sau valley NỞ RA so với valley) — gating giữ nguyên như cũ, nhưng lý do
+    # được ghi lại + cảnh báo phát ở `warnings` để người dùng biết.
     i = 1
     while i < len(contractions) - 1:
         prev_d = contractions[i - 1]["depth"]
         curr_d = contractions[i]["depth"]
         next_d = contractions[i + 1]["depth"]
         if curr_d < min(prev_d, next_d) * 0.7:
-            contractions.pop(i)
+            cv = contractions.pop(i)
+            _dropped_reasons[(cv["high_idx"], cv["low_idx"])] = (
+                f"valley ({curr_d:.1f}% nông bất thường giữa {prev_d:.1f}% và {next_d:.1f}% — "
+                f"chuỗi co KHÔNG đơn điệu quanh đây)")
             # Không tăng i — kiểm tra lại vị trí hiện tại
         else:
             i += 1
@@ -1284,6 +1327,8 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None,
     # Trước: cắt từ đầu → mất T1 quan trọng (vd GMD T_a depth 21.56%).
     MAX_CONTRACTIONS = 6
     if len(contractions) > MAX_CONTRACTIONS:
+        for cm in contractions[1:-(MAX_CONTRACTIONS - 1)]:
+            _dropped_reasons[(cm["high_idx"], cm["low_idx"])] = "cap_max6 (giữ T1 + 5 T gần nhất)"
         contractions = [contractions[0]] + contractions[-(MAX_CONTRACTIONS - 1):]
     t_count = len(contractions)
 
@@ -1295,8 +1340,10 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None,
         cid = (c["high_idx"], c["low_idx"])
         if cid in final_ids:
             continue
-        # Dropped — xác định lý do
-        if c["low_idx"] < cutoff_idx:
+        # Dropped — xác định lý do (B2: heuristic drops có lý do CHÍNH XÁC)
+        if cid in _dropped_reasons:
+            reason = _dropped_reasons[cid]
+        elif c["low_idx"] < cutoff_idx:
             reason = f"recent_filter (low_idx={c['low_idx']} < cutoff={cutoff_idx})"
         else:
             # Bị cluster filter loại
@@ -1323,6 +1370,43 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None,
             "date_low":   _idx_to_date(base_offset_global + c["low_idx"]),
             "reason":     reason,
         })
+
+    # ── B3: T cuối "đang hình thành" — đáy còn tentative (zigzag kết thúc trong
+    # down-leg, chưa có nhịp hồi xác nhận) → đáy/độ sâu sẽ DỊCH các phiên tới.
+    # Hiển thị nét đứt để người dùng không tưởng nhãn "nhảy" là bug.
+    last_forming = bool(
+        contractions
+        and zz_tail.get("end_trend") == "down"
+        and abs(contractions[-1]["low_idx"] - zz_tail.get("tail_idx", -99)) <= 2
+    )
+
+    # ── B4: WARNINGS — bất biến của một chuỗi VCP đúng; vi phạm = gắn cờ (không
+    # đổi gating). Triết lý giống score_meta bên Smart Money: "thiếu bằng chứng ≠
+    # bị phủ định" — ở đây: "đạt loose ≠ sạch cảnh báo".
+    vcp_warnings: List[str] = []
+    if t_count >= 2 and contractions[-1]["depth"] > contractions[-2]["depth"] * 1.15:
+        vcp_warnings.append(
+            f"Nhịp co cuối NỞ RA ({contractions[-2]['depth']:.1f}% → {contractions[-1]['depth']:.1f}%) "
+            f"— biến động tăng lại cuối nền, cảnh giác phân phối")
+    if any(c["duration"] <= 2 and c["depth"] > 15 for c in contractions):
+        vcp_warnings.append("Có nhịp co sâu >15% chỉ trong ≤2 phiên — biến động dị thường, độ tin T thấp")
+    # Mật độ swing = SỐ ĐO chẩn đoán (xuất ở _diagnostics), KHÔNG phải cảnh báo:
+    # đo thực tế 16-20/20 phiên trên MỌI mã VN với ZigZag 2% → nếu làm cảnh báo sẽ
+    # bật khắp nơi, mất giá trị phân biệt (nhưng chính con số này là bằng chứng nên
+    # cân nhắc bật ATR-normalization).
+    _sw_density = (len(swing_highs_raw) + len(swing_lows_raw)) / max(1, base_window) * 20
+    # "Sâu hơn T1 bị loại": CHỈ các ca thật sự gây trượt nhãn — cùng vùng thời gian
+    # nhưng bị loại vì độ cao (cluster_height), valley, hay cap. Loại vì recent_filter
+    # / cluster_gap = sóng trước tách biệt (hợp lệ, không cảnh báo).
+    _shift_risk_reasons = ("cluster_height", "valley", "cap_max6")
+    if contractions and any(
+        d["depth_pct"] > contractions[0]["depth"]
+        and any(k in (d.get("reason") or "") for k in _shift_risk_reasons)
+        for d in _diag_dropped
+    ):
+        vcp_warnings.append("Có nhịp co SÂU HƠN T1 bị bộ lọc cụm loại — nhãn T có thể lệch so với mắt nhìn (bật Chẩn đoán để soi)")
+    if any("valley" in (d.get("reason") or "") for d in _diag_dropped):
+        vcp_warnings.append("Chuỗi co không đơn điệu (có nhịp nông bất thường bị loại khỏi chấm điểm)")
 
     # Base properties: tính từ FIRST contraction (start of VCP base)
     if t_count >= 1:
@@ -1552,6 +1636,7 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None,
             "passes_strict_reduction": passes_strict,
             "passes_loose_reduction":  passes_loose,
             "higher_low_vs_prev":      bool(c.get("higher_low_vs_prev", True)),
+            "forming":        bool(last_forming and i == t_count - 1),   # B3
             "date_high":      _idx_to_date(gh_idx),
             "date_low":       _idx_to_date(gl_idx),
         })
@@ -1611,6 +1696,7 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None,
 
         # ── Detailed contractions for chart annotations ───────────────────
         "contractions":      contractions_out,
+        "warnings":          vcp_warnings,        # B4: vi phạm bất biến VCP (không đổi gating)
         "base_start_date":   _idx_to_date(base_start_global),
         "pivot_date":        pivot_date,
 
@@ -1618,6 +1704,8 @@ def detect_vcp(df: pd.DataFrame, current_price: float = None,
         "_diagnostics": {
             "raw_swing_highs_count":    len(swing_highs_raw),
             "raw_swing_lows_count":     len(swing_lows_raw),
+            "swing_density_per_20":     round(_sw_density, 1),   # >12 = zigzag nhiễu so với mã
+            "zigzag_pct_used":          round(zigzag_pct, 2),
             "after_walker_count":       len(contractions_walker),
             "after_merge_count":        len(contractions_merged),
             "after_recent_count":       len(contractions_recent),
@@ -1799,9 +1887,11 @@ class ScreenerService:
         # bằng 0 (0 là sự thật của đầu phiên). Không có quote → đành giữ T-1 (không có
         # cách nào biết KL hôm nay), nhưng các mã lọt kết quả đã được subscribe nên
         # lần quét/refresh kế tiếp sẽ có số thật.
+        _vol_last_eod: Optional[float] = None   # B8: volume bar cuối TRƯỚC khi merge intraday
         try:
             q_intra = market_service.quotes.get(ticker)
             if is_trading_hour and q_intra is not None and len(df) > 0:
+                _vol_last_eod = float(df['volume'].iloc[-1])
                 df = df.copy()
                 df.at[df.index[-1], 'volume'] = int(q_intra.get("volume") or 0)
         except Exception as e:
@@ -1855,6 +1945,19 @@ class ScreenerService:
 
         # VCP — current_price cho near_pivot + uptrend check
         vcp = detect_vcp(df, current_price=cur_kvnd)
+
+        # ── B8: VDU / Pocket Pivot phải tính trên volume EOD, KHÔNG dùng volume
+        # intraday đang tích luỹ. Đầu phiên volume hôm nay tất nhiên nhỏ nhất 15
+        # phiên → vdu_today=True GIẢ → +5 điểm early-entry oan cho gần như mọi mã
+        # lúc 9h. Trong phiên: đánh giá 2 tín hiệu này trên bar ĐÃ ĐÓNG (T-1). ──
+        if _vol_last_eod is not None:
+            _vol_eod = df['volume'].astype(float).values.copy()
+            _vol_eod[-1] = _vol_last_eod
+            _close_arr = df['close'].astype(float).values
+            _vma50 = float(pd.Series(_vol_eod).rolling(50).mean().iloc[-1]) if len(_vol_eod) >= 50 \
+                else float(np.mean(_vol_eod))
+            vcp["vdu_today"] = detect_vdu(_vol_eod, _vma50)
+            vcp["pocket_pivot"] = detect_pocket_pivot(_close_arr, _vol_eod)
 
         # Volume MA — frontend cần để hiển thị + filter theo Settings
         vol = df['volume'].values
