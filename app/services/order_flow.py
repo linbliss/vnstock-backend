@@ -123,7 +123,17 @@ def series(ticks: List[dict], n_points: int = 180) -> List[Dict]:
 
 
 # ── [2] Volume Profile theo mức giá ──────────────────────────────────────────────────
-def volume_profile(ticks: List[dict], max_bins: int = 40) -> Dict:
+def volume_profile(ticks: List[dict], max_bins: int = 40,
+                   include_auction: bool = True) -> Dict:
+    """Volume Profile. `include_auction=False` LOẠI khớp định kỳ (side='U': ATO/ATC).
+
+    Vì sao cần tách: một cú khớp định kỳ dồn 7-11% KL cả phiên vào ĐÚNG MỘT mức giá
+    (đo thực tế 24/07) → có thể tự tạo POC giả. POC vốn để đo "vùng giá được thị trường
+    CHẤP NHẬN qua quá trình giao dịch", còn khớp định kỳ là thanh toán một lần → xem
+    diễn biến TRONG PHIÊN nên loại; xem bức tranh dài hạn thì giữ (giá đóng cửa/ATC là
+    mốc tham chiếu thật của tổ chức)."""
+    if not include_auction:
+        ticks = [t for t in ticks if t.get("side") in ("B", "S")]
     if not ticks:
         return {"levels": [], "poc": None, "va_low": None, "va_high": None}
     prices = [t["price"] for t in ticks]
@@ -336,6 +346,10 @@ def analyze(ticks: List[dict]) -> Dict:
     thr = big_thresholds(ticks)
     cvd = cumulative_delta(ticks)
     vp = volume_profile(ticks)
+    # Bản LIÊN TỤC (loại ATO/ATC) — để UI bật/tắt xem POC theo diễn biến trong phiên.
+    # Chỉ tính khi tape THỰC SỰ có khớp định kỳ, tránh nhân đôi payload vô ích.
+    has_auction = any(t.get("side") not in ("B", "S") for t in ticks)
+    vp_cont = volume_profile(ticks, include_auction=False) if has_auction else vp
     return {
         "empty": False,
         "n_ticks": len(ticks),
@@ -344,6 +358,8 @@ def analyze(ticks: List[dict]) -> Dict:
         "cvd_divergence": _divergence(ticks),
         "series": series(ticks),
         "volume_profile": vp,
+        "volume_profile_cont": vp_cont,   # loại khớp định kỳ (ATO/ATC)
+        "has_auction": has_auction,
         "large_orders": large_orders(ticks, thr, poc=vp.get("poc")),
         "absorption": absorption_events(ticks),
         "iceberg": iceberg_candidates(ticks),   # experimental
