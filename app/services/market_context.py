@@ -121,7 +121,7 @@ def _session_phase(ts: str) -> str:
         return "continuous"
     if hhmm < "09:00":
         return "pre"
-    if hhmm < "09:15":
+    if hhmm <= "09:15":       # khớp ATO in dấu 09:15:xx → vẫn là đợt ATO (đối xứng với ATC)
         return "ato"
     if hhmm < "11:30":
         return "continuous"
