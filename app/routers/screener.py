@@ -628,6 +628,15 @@ async def analyze_ticker(ticker: str):
     return result
 
 
+@router.get("/market-regime")
+async def market_regime():
+    """Trạng thái thị trường: VNINDEX vs MA50 (điều kiện tiên quyết cho breakout).
+    up=True khi VNINDEX > MA50. Dùng cho thẻ Kế hoạch vào lệnh trên Chart."""
+    from app.services.alert_engine import _market_regime_ok
+    ok, vnindex, ma50 = await _market_regime_ok()
+    return {"up": bool(ok), "vnindex": round(vnindex, 2), "ma50": round(ma50, 2)}
+
+
 @router.get("/vcp/{ticker}")
 async def vcp_variant(ticker: str, atr: bool = Query(default=True)):
     """VCP tính lại với ATR-normalization bật/tắt (cho nút toggle trên Chart).

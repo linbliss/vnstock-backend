@@ -355,14 +355,21 @@ async def _check_3b(state: _UserState):
     interval   = state.vcp_interval()
     now        = datetime.now()
 
-    # Market regime (soft) — không chặn cảnh báo, chỉ gắn nhãn khi thị trường yếu
+    # Market regime — LỌC MỀM NÂNG CẤP (hướng B): vẫn gửi cảnh báo nhưng nêu rõ điều kiện
+    # thị trường. Backtest (strategy-backtest): breakout+cắt lỗ chỉ dương khi VNINDEX>MA50
+    # (uptrend +1.26%/lệnh), thị trường yếu kỳ vọng ÂM (-0.50 large-cap, -2.67% small/mid).
     regime_line = ""
     if state.regime_warn():
         reg_ok, vnindex, ma50 = await _market_regime_ok()
-        if not reg_ok and ma50 > 0:
+        if ma50 > 0 and not reg_ok:
             regime_line = (
-                f"\n⚠️ <b>Thị trường yếu</b>: VNINDEX {vnindex:,.0f} &lt; MA50 {ma50:,.0f} "
-                f"— breakout rủi ro cao, cân nhắc giảm size"
+                f"\n⚠️ <b>THỊ TRƯỜNG YẾU</b> (VNINDEX {vnindex:,.0f} &lt; MA50 {ma50:,.0f}) "
+                f"— breakout xác suất thấp, backtest kỳ vọng ÂM. Chỉ vào nếu có lý do riêng, size nhỏ."
+            )
+        elif ma50 > 0 and reg_ok:
+            regime_line = (
+                f"\n✅ <b>Thị trường uptrend</b> (VNINDEX {vnindex:,.0f} &gt; MA50 {ma50:,.0f}) "
+                f"— điều kiện tiên quyết cho breakout đã thoả."
             )
 
     for item in state.watchlist_items:
