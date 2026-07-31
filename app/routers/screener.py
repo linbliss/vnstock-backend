@@ -627,6 +627,14 @@ async def analyze_ticker(ticker: str):
         return {"error": f"Không đủ dữ liệu cho {ticker}"}
     return result
 
+
+@router.get("/vcp/{ticker}")
+async def vcp_variant(ticker: str, atr: bool = Query(default=True)):
+    """VCP tính lại với ATR-normalization bật/tắt (cho nút toggle trên Chart).
+    Không cache — chỉ dùng để đánh giá trực quan; Screener chuẩn vẫn ATR tắt."""
+    v = await screener_service.vcp_variant(ticker.upper(), use_atr=atr)
+    return v or {"error": f"Không đủ dữ liệu cho {ticker}"}
+
 # ── Fundamental: static routes TRƯỚC dynamic {ticker} route ──
 
 @router.get("/fundamental/stats")

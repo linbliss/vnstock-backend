@@ -2010,6 +2010,20 @@ class ScreenerService:
                 pass
         return result
 
+    async def vcp_variant(self, ticker: str, use_atr: bool = True) -> Optional[dict]:
+        """VCP ON-DEMAND với/không ATR-normalization — cho nút toggle trên Chart để
+        người dùng ĐÁNH GIÁ trực quan. KHÔNG cache/snapshot (chỉ tính khi bấm), nên
+        không ảnh hưởng kết quả Screener chuẩn (vẫn ATR tắt)."""
+        end = datetime.now().strftime("%Y-%m-%d")
+        await self._ensure_index_data()
+        df = await self._fetch_history_async(ticker.upper(), "2000-01-01", end, is_index=False)
+        if df is None or len(df) < 130:
+            return None
+        quote = market_service.quotes.get(ticker.upper(), {})
+        current_price = float(quote.get("price", df["close"].iloc[-1]))
+        cur_kvnd = current_price / 1000.0 if current_price > 1000 else current_price
+        return detect_vcp(df, current_price=cur_kvnd, config=VCPConfig(use_atr_depth=use_atr))
+
     async def _fetch_history_async(
         self, ticker: str, start: str, end: str, is_index: bool = False
     ) -> Optional[pd.DataFrame]:
