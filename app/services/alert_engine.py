@@ -384,6 +384,7 @@ async def _check_3b(state: _UserState):
             is_vcp    = vc["is_vcp"]
             pivot_buy = vc["pivot_buy"]
             vol_ratio = vc["vol_ratio"]
+            stop_loss = vc.get("stop_loss") or 0.0
         else:
             try:
                 from app.services.screener import screener_service
@@ -394,9 +395,10 @@ async def _check_3b(state: _UserState):
                 is_vcp    = vcp_data.get("is_vcp", False)
                 pivot_buy = float(vcp_data.get("pivot_buy") or 0)
                 vol_ratio = float(vcp_data.get("vol_ratio") or 0)
+                stop_loss = float(vcp_data.get("stop_loss") or 0)   # handle_low×0.985 (nghìn VND)
                 state.vcp_cache[ticker] = {
                     "is_vcp": is_vcp, "pivot_buy": pivot_buy,
-                    "vol_ratio": vol_ratio, "at": now,
+                    "vol_ratio": vol_ratio, "stop_loss": stop_loss, "at": now,
                 }
             except Exception as e:
                 print(f"⚠️  VCP {ticker}: {e}")
@@ -433,17 +435,30 @@ async def _check_3b(state: _UserState):
         crit_text = _fmt_criteria(criteria)
         # Hiển thị Giá và Pivot buy đều theo đơn vị VND (cùng đơn vị)
         pivot_vnd = pivot_buy * 1000
-        # Vị trí so với pivot
-        if diff_pct >= 0:
-            zone = f"⬆️ Vượt pivot {diff_pct:.2f}% (breakout)"
+        # ── Khớp CHIẾN LƯỢC backtest (xem strategy-backtest): CHỈ breakout (giá VƯỢT
+        # pivot) mới là ĐIỂM MUA; còn sát pivot/coiling trung bình LỖ (T+20 -2.15%,
+        # t=-4.50) → hạ cấp thành "CHỜ breakout", KHÔNG gắn nhãn mua. Kèm mức CẮT LỖ
+        # vì edge chỉ tồn tại khi cắt lỗ chặt (stop -5% → kỳ vọng +0.99%/lệnh, payoff 2.77).
+        is_breakout = diff_pct >= 0
+        stop_vnd = (stop_loss * 1000) if stop_loss else (price * 0.93)   # fallback ~-7%
+        stop_pct = (stop_vnd - price) / price * 100 if price else 0.0
+        if is_breakout:
+            header = f"🟢 <b>ĐIỂM MUA breakout – {ticker}</b>"
+            zone = f"⬆️ Vượt pivot {diff_pct:.2f}% kèm volume — breakout xác nhận"
+            action = (f"🛑 Cắt lỗ: <b>{_fp(stop_vnd)}</b> ({stop_pct:.1f}%) — kỷ luật: lỗ nhỏ, "
+                      f"để lời chạy (backtest payoff ~2). Ngừng nếu thủng nền.")
         else:
-            zone = f"⬇️ Dưới pivot {abs(diff_pct):.2f}% (near pivot)"
+            header = f"👀 <b>Sát pivot – {ticker} (CHỜ breakout, chưa mua)</b>"
+            zone = f"⬇️ Dưới pivot {abs(diff_pct):.2f}% — còn trong nền, CHỜ vượt {_fp(pivot_vnd)}"
+            action = ("⏳ Mua khi CÒN coiling/sát pivot trung bình lỗ (backtest). "
+                      "Chỉ vào khi giá VƯỢT pivot kèm thanh khoản.")
         msg = (
-            f"🟢 <b>Điểm mua VCP – {ticker}</b>\n"
+            f"{header}\n"
             f"Giá: <b>{_fp(price)}</b> ({q.get('change_pct', 0):+.2f}%)\n"
             f"Pivot buy: <b>{_fp(pivot_vnd)}</b>\n"
             f"{zone}\n"
             f"Volume: <b>{vol_ratio:.1f}x</b> MA30\n"
+            f"{action}\n"
             f"Lần cảnh báo: {count}/{vcp_max}\n"
             f"\n"
             f"📊 <b>SEPA Score: {score}/8</b>\n"
@@ -454,7 +469,7 @@ async def _check_3b(state: _UserState):
         )
         await send_telegram(msg)
         state.vcp_state[ticker] = {"count": count, "last_sent": now}
-        zone_short = "Breakout" if diff_pct >= 0 else "Near pivot"
+        zone_short = "Breakout" if is_breakout else "Sát pivot (chờ)"
         reason = f"VCP {zone_short} – Giá {_fp(price)}, Pivot {_fp(pivot_vnd)}, Vol {vol_ratio:.1f}x, SEPA {score}/8"
         user_store.log_alert(state.uid, ticker, "3b_vcp", reason, msg)
         print(f"🟢 3B VCP {ticker}: {_fp(price)} pivot={_fp(pivot_buy)} sepa={score}/8")
