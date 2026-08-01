@@ -488,8 +488,10 @@ def _pick_victim(positions, d, pget, mode, min_hold=10):
     if mode == "take_profit":                       # chốt mã LÃI ≥+20% (giữ đủ lâu) lấy vốn
         elig = [x for x in cand if x[1] >= 0.20 and x[2] >= min_hold]
         return max(elig, key=lambda x: x[1])[0] if elig else None
-    # 'weakest': cắt mã THUA (ret<0) đã giữ ≥min_hold — laggard thực sự, không cắt winner
-    elig = [x for x in cand if x[1] < 0 and x[2] >= min_hold]
+    # 'weakest': cắt mã YẾU = mã THUA (ret<0, giữ ≥min_hold) HOẶC 'dead money'
+    # (giữ >20 phiên mà lãi ≤7% — vốn chết, không chạy) → nhường vốn cho mã breakout mới
+    elig = [x for x in cand
+            if (x[1] < 0 and x[2] >= min_hold) or (x[2] > 20 and x[1] <= 0.07)]
     return min(elig, key=lambda x: x[1])[0] if elig else None
 
 
