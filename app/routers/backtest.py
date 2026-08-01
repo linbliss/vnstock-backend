@@ -42,6 +42,10 @@ class BacktestParams(BaseModel):
     regime_filter: str = "off"                       # off | reduce | block
     regime_weak_exposure: float = Field(0.3, ge=0, le=1)
     regime_ma: int = Field(50, ge=10, le=200)
+    entry_plan: str = "full"                         # full | oneil | p337 | half
+    cutloss_plan: str = "single"                     # single | scale_out
+    min_cutloss_pct: float = Field(0.05, gt=0, le=0.5)
+    max_cutloss_pct: float = Field(0.08, gt=0, le=0.5)
 
 
 def _exch_map():

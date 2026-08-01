@@ -269,6 +269,20 @@ DEFAULTS = {
     "regime_filter": "off",     # off | reduce (giảm giải ngân khi yếu) | block (chặn mở mới khi yếu)
     "regime_weak_exposure": 0.3,  # reduce: tỷ lệ vị thế cho phép khi thị trường yếu (0.3 = 30%)
     "regime_ma": 50,            # MA của VNINDEX để xác định uptrend
+    # ── CHIẾN LƯỢC GIẢI NGÂN THEO ĐỢT (scale-in trên đà tăng) ──
+    "entry_plan": "full",       # full | oneil | p337 | half
+    # ── CẮT LỖ TỪNG PHẦN ──
+    "cutloss_plan": "single",   # single | scale_out
+    "min_cutloss_pct": 0.05,    # scale_out: chạm mức lỗ min → bán 50% vị thế
+    "max_cutloss_pct": 0.08,    # scale_out: chạm mức lỗ max → bán hết phần còn lại
+}
+
+# Giải ngân theo đợt: [(mốc lãi % kích hoạt, tỷ trọng lô)] — tổng tỷ trọng = 1.0
+ENTRY_PLANS = {
+    "full":  [(0.0, 1.0)],                          # vào 100% ngay tại breakout
+    "oneil": [(0.0, 0.5), (2.5, 0.3), (5.0, 0.2)],  # O'Neil: 50% pivot, +30%@+2.5%, +20%@+5%
+    "p337":  [(0.0, 0.3), (7.0, 0.3), (14.0, 0.4)],  # 30% / +30%@+7% / +40%@+14%
+    "half":  [(0.0, 0.5), (5.0, 0.5)],              # 50% pivot, 50%@+5%
 }
 
 
@@ -491,6 +505,9 @@ def run_portfolio(sig, get_df, p) -> Dict[str, Any]:
     rf = p.get("regime_filter", "off")                    # off | reduce | block
     wexp = float(p.get("regime_weak_exposure", 0.3))
     regime = _regime_up(get_df, int(p.get("regime_ma", 50))) if rf != "off" else {}
+    ep = ENTRY_PLANS.get(p.get("entry_plan", "full"), ENTRY_PLANS["full"])  # giải ngân theo đợt
+    clp = p.get("cutloss_plan", "single")                 # single | scale_out
+    min_cl, max_cl = float(p.get("min_cutloss_pct", 0.05)), float(p.get("max_cutloss_pct", 0.08))
     MIN_BUY = 1_000_000
 
     by_date: Dict[str, list] = defaultdict(list)
@@ -525,38 +542,74 @@ def run_portfolio(sig, get_df, p) -> Dict[str, Any]:
     positions: Dict[str, dict] = {}
     trades: List[Dict[str, Any]] = []
     equity: List[Dict[str, Any]] = []
-    peak_pos = n_rot = 0
+    peak_pos = n_rot = n_fill = n_pyr = 0
     peak_deployed = 0.0
 
-    def sell(tk, d, px, is_open=False):
+    def sell_frac(tk, d, px, frac, is_open=False):
+        """Bán `frac` (0..1) vị thế. frac=1 → đóng hẳn."""
         nonlocal cash
-        ps = positions.pop(tk)
-        proceeds = ps["shares"] * px * (1 - fee / 2)
-        cost = ps["alloc"] * (1 + fee / 2)
-        net = proceeds - cost
+        ps = positions[tk]
+        frac = min(1.0, max(0.0, frac))
+        sh, al = ps["shares"] * frac, ps["alloc"] * frac
+        proceeds = sh * px * (1 - fee / 2)
+        net = proceeds - al * (1 + fee / 2)
         cash += proceeds
         trades.append({"ticker": tk, "entry_date": ps["entry_date"], "exit_date": d,
-                       "entry": ps["entry"], "exit": px, "net_ret": net / ps["alloc"],
-                       "net_pnl": net, "alloc": ps["alloc"], "hold_days": ps["days"],
+                       "entry": ps["entry"], "exit": px, "net_ret": (net / al) if al else 0.0,
+                       "net_pnl": net, "alloc": al, "hold_days": ps["days"],
                        "adds": ps.get("adds", 0), "year": ps["entry_date"][:4], "open": is_open})
+        if frac >= 0.999 or ps["shares"] - sh <= 1e-9:
+            positions.pop(tk, None)
+        else:
+            ps["shares"] -= sh; ps["alloc"] -= al
+
+    def _hit(o, l, c, level):                              # giá khớp khi chạm mức stop
+        if intraday:
+            if o <= level: return o
+            if l <= level: return level
+            return None
+        return c if c <= level else None
 
     for d in cal:
-        # 1) cập nhật & thoát lệnh
+        # 1) quản lý vị thế: GIẢI NGÂN THEO ĐỢT + CẮT LỖ (từng phần / trailing)
         for tk in list(positions.keys()):
             ps = positions[tk]; row = pget(tk).get(d)
             if not row:
                 continue
             o, h, l, c = row; ps["last_close"] = c; ps["days"] += 1
-            stop = max(ps["entry"] * (1 - init), ps["peak"] * (1 - trail))
-            ex = None
-            if intraday:
-                if o <= stop: ex = o
-                elif l <= stop: ex = stop
-            elif c <= stop:
-                ex = c
-            if ex is not None:
-                sell(tk, d, ex)
-            elif h > ps["peak"]:
+            # a) giải ngân đợt kế khi giá vượt mốc kích hoạt (đà tăng)
+            while ps["plan"] and h >= ps["entry0"] * (1 + ps["plan"][0][0] / 100.0) and cash >= MIN_BUY:
+                trig, t_alloc = ps["plan"][0]
+                fill = ps["entry0"] * (1 + trig / 100.0)
+                add = min(t_alloc, cash)
+                if add < MIN_BUY:
+                    break
+                ps["plan"].pop(0)
+                ash = add / fill
+                ps["entry"] = (ps["entry"] * ps["shares"] + fill * ash) / (ps["shares"] + ash)
+                ps["shares"] += ash; ps["alloc"] += add; n_fill += 1
+                cash -= add * (1 + fee / 2)
+            # b) cắt lỗ
+            trail_lvl = ps["peak"] * (1 - trail)
+            closed = False
+            if clp == "scale_out":
+                if trail_lvl >= ps["entry"] * (1 - min_cl):   # đã có lãi → trailing đóng hẳn
+                    px = _hit(o, l, c, trail_lvl)
+                    if px is not None:
+                        sell_frac(tk, d, px, 1.0); closed = True
+                else:                                          # vùng lỗ → cắt từng phần
+                    px2 = _hit(o, l, c, ps["entry"] * (1 - max_cl))
+                    if px2 is not None:
+                        sell_frac(tk, d, px2, 1.0); closed = True
+                    elif not ps["half_sold"]:
+                        px1 = _hit(o, l, c, ps["entry"] * (1 - min_cl))
+                        if px1 is not None:
+                            sell_frac(tk, d, px1, 0.5); ps["half_sold"] = True
+            else:                                              # single: init + trailing, đóng hẳn
+                px = _hit(o, l, c, max(ps["entry"] * (1 - init), trail_lvl))
+                if px is not None:
+                    sell_frac(tk, d, px, 1.0); closed = True
+            if not closed and h > ps["peak"]:
                 ps["peak"] = h
         # 2) vào lệnh theo tín hiệu breakout hôm nay
         eq_start = cash + sum(ps["shares"] * ps["last_close"] for ps in positions.values())
@@ -593,7 +646,7 @@ def run_portfolio(sig, get_df, p) -> Dict[str, Any]:
                     if add >= MIN_BUY:
                         ash = add / entry
                         ps["entry"] = (ps["entry"] * ps["shares"] + entry * ash) / (ps["shares"] + ash)
-                        ps["shares"] += ash; ps["alloc"] += add; ps["adds"] += 1
+                        ps["shares"] += ash; ps["alloc"] += add; ps["adds"] += 1; n_pyr += 1
                         cash -= add * (1 + fee / 2)
                 continue
 
@@ -604,15 +657,17 @@ def run_portfolio(sig, get_df, p) -> Dict[str, Any]:
                 if victim is None:
                     continue
                 vrow = pget(victim).get(d)
-                sell(victim, d, vrow[3] if vrow else positions[victim]["last_close"])
+                sell_frac(victim, d, vrow[3] if vrow else positions[victim]["last_close"], 1.0)
                 n_rot += 1
-            alloc = min(target, cash)
-            if alloc < MIN_BUY:
+            # GIẢI NGÂN THEO ĐỢT: chỉ vào lô ĐẦU bây giờ; các lô sau vào khi giá đạt mốc
+            first_alloc = min(target * ep[0][1], cash)
+            if first_alloc < MIN_BUY:
                 continue
-            positions[tk] = {"entry_date": d, "entry": entry, "alloc": alloc, "base": alloc,
-                             "shares": alloc / entry, "peak": entry, "last_close": entry,
-                             "days": 0, "adds": 0}
-            cash -= alloc * (1 + fee / 2)
+            plan = [(trig, target * frac) for trig, frac in ep[1:]]
+            positions[tk] = {"entry_date": d, "entry": entry, "entry0": entry, "alloc": first_alloc,
+                             "base": target, "shares": first_alloc / entry, "peak": entry,
+                             "last_close": entry, "days": 0, "adds": 0, "half_sold": False, "plan": plan}
+            cash -= first_alloc * (1 + fee / 2)
         # 3) chốt equity ngày
         deployed = sum(ps["shares"] * ps["last_close"] for ps in positions.values())
         peak_pos = max(peak_pos, len(positions))
@@ -620,12 +675,12 @@ def run_portfolio(sig, get_df, p) -> Dict[str, Any]:
         equity.append({"date": d, "equity": round(cash + deployed)})
 
     for tk in list(positions.keys()):                        # đóng phần còn mở cuối kỳ
-        sell(tk, cal[-1], positions[tk]["last_close"], is_open=True)
+        sell_frac(tk, cal[-1], positions[tk]["last_close"], 1.0, is_open=True)
 
-    return _aggregate_portfolio(trades, equity, p, peak_pos, peak_deployed, n_rot, cal)
+    return _aggregate_portfolio(trades, equity, p, peak_pos, peak_deployed, n_rot, n_fill, n_pyr, cal)
 
 
-def _aggregate_portfolio(trades, equity, p, peak_pos, peak_deployed, n_rot, cal):
+def _aggregate_portfolio(trades, equity, p, peak_pos, peak_deployed, n_rot, n_fill, n_pyr, cal):
     init_cap = float(p["initial_capital"])
     if not trades:
         return {"params": p, "summary": {"n_trades": 0}, "pnl": {}, "yearly": [],
@@ -643,9 +698,8 @@ def _aggregate_portfolio(trades, equity, p, peak_pos, peak_deployed, n_rot, cal)
     cagr = ((final_eq / init_cap) ** (1 / yrs) - 1) * 100 if init_cap > 0 and yrs > 0 else 0.0
     pnls = np.array([t["net_pnl"] for t in trades]); wins = pnls > 0
 
-    n_pyr = int(sum(t.get("adds", 0) for t in trades))
     summary = {**_trade_summary(trades), "skipped_overlap": 0,
-               "n_rotations": n_rot, "n_pyramids": n_pyr}
+               "n_rotations": n_rot, "n_pyramids": n_pyr, "n_fills": n_fill}
     pnl = {
         "initial_capital": round(init_cap), "final_equity": round(final_eq),
         "total_net_pnl": round(total_pnl),
