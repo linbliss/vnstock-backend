@@ -686,7 +686,8 @@ def run_portfolio(sig, get_df, p) -> Dict[str, Any]:
         deployed = sum(ps["shares"] * ps["last_close"] for ps in positions.values())
         peak_pos = max(peak_pos, len(positions))
         peak_deployed = max(peak_deployed, deployed)
-        equity.append({"date": d, "equity": round(cash + deployed)})
+        equity.append({"date": d, "equity": round(cash + deployed),
+                       "cash": round(cash), "invested": round(deployed)})
 
     for tk in list(positions.keys()):                        # đóng phần còn mở cuối kỳ
         sell_frac(tk, cal[-1], positions[tk]["last_close"], 1.0, is_open=True)
@@ -731,12 +732,16 @@ def _aggregate_portfolio(trades, equity, p, peak_pos, peak_deployed, n_rot, n_fi
         "roi_on_peak_pct": round(total_pnl / peak_deployed * 100, 2) if peak_deployed else 0,
     }
     top, bottom = _top_bottom_of(trades)
-    eq_curve = [{"date": e["date"], "cum_pnl": round(e["equity"] - init_cap)} for e in equity]
+    eq_curve = [{"date": e["date"], "equity": e["equity"], "cash": e["cash"],
+                 "invested": e["invested"], "cum_pnl": round(e["equity"] - init_cap)} for e in equity]
 
     # ROI THEO NĂM trên EQUITY (lãi kép): equity cuối năm / cuối năm trước − 1
     last_eq: Dict[str, float] = {}
+    last_cash: Dict[str, float] = {}
+    last_inv: Dict[str, float] = {}
     for e in equity:
-        last_eq[e["date"][:4]] = e["equity"]
+        y = e["date"][:4]
+        last_eq[y] = e["equity"]; last_cash[y] = e["cash"]; last_inv[y] = e["invested"]
     yret: Dict[str, float] = {}
     prev = init_cap
     for y in sorted(last_eq):
@@ -757,6 +762,8 @@ def _aggregate_portfolio(trades, equity, p, peak_pos, peak_deployed, n_rot, n_fi
             "net_pnl": round(pv), "expectancy_pct": round(float(r.mean()) * 100, 2) if ts else 0,
             "roi_pct": round(yret.get(y, 0.0) * 100, 2),      # ROI danh mục năm đó (equity)
             "end_equity": round(last_eq.get(y, init_cap)),    # tổng tài sản cuối năm
+            "end_cash": round(last_cash.get(y, init_cap)),    # tiền mặt cuối năm
+            "end_invested": round(last_inv.get(y, 0.0)),      # giá trị cổ phiếu cuối năm
         })
     return {"params": p, "summary": summary, "pnl": pnl, "yearly": yearly,
             "top": top, "bottom": bottom, "equity": eq_curve}
