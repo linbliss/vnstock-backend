@@ -687,6 +687,7 @@ def _aggregate_portfolio(trades, equity, p, peak_pos, peak_deployed, n_rot, cal)
             "win_rate": round(float((r > 0).mean()) * 100, 1) if ts else 0,
             "net_pnl": round(pv), "expectancy_pct": round(float(r.mean()) * 100, 2) if ts else 0,
             "roi_pct": round(yret.get(y, 0.0) * 100, 2),      # ROI danh mục năm đó (equity)
+            "end_equity": round(last_eq.get(y, init_cap)),    # tổng tài sản cuối năm
         })
     return {"params": p, "summary": summary, "pnl": pnl, "yearly": yearly,
             "top": top, "bottom": bottom, "equity": eq_curve}
