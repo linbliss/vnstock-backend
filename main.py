@@ -14,6 +14,7 @@ from app.services.backfill import daily_update_scheduler
 from app.routers import quotes, alerts, screener, admin, chart
 from app.routers import auth, portfolio, watchlist_router, user_settings_router
 from app.routers import shark
+from app.routers import backtest
 
 alert_task = None
 daily_task = None
@@ -169,6 +170,7 @@ app.include_router(portfolio.router,            prefix="/api/portfolio",   tags=
 app.include_router(watchlist_router.router,     prefix="/api/watchlists",  tags=["watchlists"])
 app.include_router(user_settings_router.router, prefix="/api/user",        tags=["user"])
 app.include_router(shark.router)   # đã tự set prefix "/api/shark"
+app.include_router(backtest.router,             prefix="/api/backtest",    tags=["backtest"])
 
 @app.get("/health")
 async def health():
