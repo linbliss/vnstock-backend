@@ -394,14 +394,16 @@ def _aggregate(trades, size, p, skipped_overlap):
     tk: Dict[str, list] = {}
     for t in trades:
         tk.setdefault(t["ticker"], []).append(t)
-    top = []
+    per_ticker = []
     for k, ts in tk.items():
         pv = np.array([x["net_pnl"] for x in ts]); r = np.array([x["net_ret"] for x in ts])
-        top.append({"ticker": k, "n": len(ts), "net_pnl": round(float(pv.sum())),
-                    "win_rate": round(float((r > 0).mean()) * 100, 1),
-                    "avg_ret_pct": round(float(r.mean()) * 100, 2),
-                    "best_ret_pct": round(float(r.max()) * 100, 2)})
-    top.sort(key=lambda x: x["net_pnl"], reverse=True)
+        per_ticker.append({"ticker": k, "n": len(ts), "net_pnl": round(float(pv.sum())),
+                           "win_rate": round(float((r > 0).mean()) * 100, 1),
+                           "avg_ret_pct": round(float(r.mean()) * 100, 2),
+                           "best_ret_pct": round(float(r.max()) * 100, 2),
+                           "worst_ret_pct": round(float(r.min()) * 100, 2)})
+    top = sorted(per_ticker, key=lambda x: x["net_pnl"], reverse=True)[:20]
+    bottom = sorted(per_ticker, key=lambda x: x["net_pnl"])[:20]  # lỗ nhiều nhất
 
     return {"params": p, "summary": summary, "pnl": pnl, "yearly": yearly,
-            "top": top[:20], "equity": eq}
+            "top": top, "bottom": bottom, "equity": eq}
