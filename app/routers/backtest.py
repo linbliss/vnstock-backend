@@ -28,6 +28,14 @@ class BacktestParams(BaseModel):
     exchanges: Optional[List[str]] = None            # ["HOSE","HNX","UPCOM"] | None=tất cả
     date_from: Optional[str] = None
     date_to: Optional[str] = None
+    # ── danh mục có giới hạn ──
+    portfolio_mode: bool = False
+    initial_capital: float = Field(100_000_000, gt=0)
+    max_positions: int = Field(10, ge=0, le=200)
+    sizing_mode: str = "equal"                       # fixed | equal | percent
+    position_pct: float = Field(0.10, gt=0, le=1)
+    compound: bool = True
+    rotation: str = "weakest"                        # off | weakest | take_profit
 
 
 def _exch_map():

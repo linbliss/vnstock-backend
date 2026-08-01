@@ -243,6 +243,14 @@ DEFAULTS = {
     "exchanges": None,          # None = tất cả; hoặc ["HOSE","HNX"]
     "date_from": None,
     "date_to": None,
+    # ── Chế độ DANH MỤC có giới hạn (mô phỏng thực tế) ──
+    "portfolio_mode": False,    # True = danh mục có trần vốn/vị thế, chạy theo ngày
+    "initial_capital": 100_000_000,   # vốn ban đầu
+    "max_positions": 10,        # trần số vị thế đồng thời (0 = không giới hạn)
+    "sizing_mode": "equal",     # fixed | equal (vốn/maxpos) | percent (%/vị thế)
+    "position_pct": 0.10,       # dùng khi sizing_mode=percent
+    "compound": True,           # lãi kép: tái đầu tư lợi nhuận đã thực hiện
+    "rotation": "weakest",      # off | weakest (cắt mã yếu) | take_profit (chốt mã lãi cao)
 }
 
 
@@ -286,7 +294,7 @@ def _simulate_one(df: pd.DataFrame, i0: int, p: Dict[str, Any]) -> Dict[str, Any
     hold = int(exit_idx - i0)
     return {"entry_date": str(dates[i0])[:10], "exit_date": str(dates[exit_idx])[:10],
             "entry": entry, "exit": exit_price, "gross_ret": gross, "net_ret": net_ret,
-            "net_pnl": net_pnl, "hold_days": hold, "open": is_open}
+            "net_pnl": net_pnl, "alloc": size, "hold_days": hold, "open": is_open}
 
 
 def run_backtest(signals: List[Dict[str, Any]],
@@ -298,7 +306,7 @@ def run_backtest(signals: List[Dict[str, Any]],
     exch_map = exch_map or {}
     size = p["position_vnd"]
 
-    # lọc + sắp theo ngày để enforce 1-vị-thế/mã
+    # lọc chung: thanh khoản + thời gian + sàn
     sig = [s for s in signals if s.get("avg_vol50", 0) >= p["min_avg_vol"]]
     if p.get("date_from"):
         sig = [s for s in sig if s["date"] >= p["date_from"]]
@@ -307,6 +315,9 @@ def run_backtest(signals: List[Dict[str, Any]],
     if exch_set:
         sig = [s for s in sig if exch_map.get(s["ticker"]) in exch_set]
     sig.sort(key=lambda x: x["date"])
+
+    if p.get("portfolio_mode"):
+        return run_portfolio(sig, get_df, p)
 
     df_cache: Dict[str, pd.DataFrame] = {}
     open_until: Dict[str, str] = {}
@@ -335,27 +346,65 @@ def run_backtest(signals: List[Dict[str, Any]],
     return _aggregate(trades, size, p, skipped_overlap)
 
 
-def _aggregate(trades, size, p, skipped_overlap):
-    n = len(trades)
-    if n == 0:
-        return {"params": p, "summary": {"n_trades": 0}, "pnl": {}, "yearly": [],
-                "top": [], "equity": [], "message": "Không có lệnh nào khớp bộ lọc"}
+# ── Helper dùng chung cho cả 2 chế độ ──────────────────────────────────────
+def _trade_summary(trades) -> Dict[str, Any]:
     rets = np.array([t["net_ret"] for t in trades])
-    pnls = np.array([t["net_pnl"] for t in trades])
     holds = np.array([t["hold_days"] for t in trades])
     wins = rets > 0
     aw = rets[wins].mean() if wins.any() else 0.0
     al = rets[~wins].mean() if (~wins).any() else 0.0
     payoff = (aw / -al) if al < 0 else float("nan")
-    total_inv = n * size
+    return {
+        "n_trades": len(trades), "n_open": int(sum(t["open"] for t in trades)),
+        "win_rate": round(float(wins.mean()) * 100, 1),
+        "payoff": round(payoff, 2) if payoff == payoff else None,
+        "expectancy_pct": round(float(rets.mean()) * 100, 2),
+        "avg_win_pct": round(float(aw) * 100, 2), "avg_loss_pct": round(float(al) * 100, 2),
+        "avg_hold_days": round(float(holds.mean()), 1), "median_hold_days": int(np.median(holds)),
+    }
+
+
+def _yearly_of(trades) -> List[Dict[str, Any]]:
+    yy: Dict[str, list] = {}
+    for t in trades:
+        yy.setdefault(t["year"], []).append(t)
+    out = []
+    for y in sorted(yy):
+        ts = yy[y]
+        r = np.array([x["net_ret"] for x in ts]); pv = np.array([x["net_pnl"] for x in ts])
+        inv = float(sum(x["alloc"] for x in ts))
+        out.append({"year": y, "n": len(ts), "win_rate": round(float((r > 0).mean()) * 100, 1),
+                    "net_pnl": round(float(pv.sum())), "expectancy_pct": round(float(r.mean()) * 100, 2),
+                    "roi_pct": round(float(pv.sum()) / inv * 100, 2) if inv else 0})
+    return out
+
+
+def _top_bottom_of(trades):
+    tk: Dict[str, list] = {}
+    for t in trades:
+        tk.setdefault(t["ticker"], []).append(t)
+    per = []
+    for k, ts in tk.items():
+        pv = np.array([x["net_pnl"] for x in ts]); r = np.array([x["net_ret"] for x in ts])
+        per.append({"ticker": k, "n": len(ts), "net_pnl": round(float(pv.sum())),
+                    "win_rate": round(float((r > 0).mean()) * 100, 1),
+                    "avg_ret_pct": round(float(r.mean()) * 100, 2),
+                    "best_ret_pct": round(float(r.max()) * 100, 2),
+                    "worst_ret_pct": round(float(r.min()) * 100, 2)})
+    return (sorted(per, key=lambda x: x["net_pnl"], reverse=True)[:20],
+            sorted(per, key=lambda x: x["net_pnl"])[:20])
+
+
+def _aggregate(trades, size, p, skipped_overlap):
+    if not trades:
+        return {"params": p, "summary": {"n_trades": 0}, "pnl": {}, "yearly": [],
+                "top": [], "bottom": [], "equity": [], "message": "Không có lệnh nào khớp bộ lọc"}
+    pnls = np.array([t["net_pnl"] for t in trades])
+    total_inv = len(trades) * size
     total_pnl = float(pnls.sum())
 
-    # VỐN TỐI ĐA cùng lúc: số lệnh mở ĐỒNG THỜI cao nhất × vốn/lệnh (interval overlap).
-    # Cùng ngày: mở (+1) trước đóng (-1) → đếm bao trùm (an toàn, ước lượng vốn cần tối đa).
-    ev = []
-    for t in trades:
-        ev.append((t["entry_date"], 1))
-        ev.append((t["exit_date"], -1))
+    # VỐN TỐI ĐA cùng lúc (interval overlap): mở (+1) trước đóng (-1) cùng ngày.
+    ev = [(t["entry_date"], 1) for t in trades] + [(t["exit_date"], -1) for t in trades]
     ev.sort(key=lambda x: (x[0], -x[1]))
     cur = peak_pos = 0
     for _d, delta in ev:
@@ -363,24 +412,14 @@ def _aggregate(trades, size, p, skipped_overlap):
         peak_pos = max(peak_pos, cur)
     peak_capital = peak_pos * size
 
-    # equity curve theo NGÀY THOÁT (P&L thực hiện luỹ kế) + max drawdown
-    ex = sorted(trades, key=lambda t: t["exit_date"])
+    # equity theo NGÀY THOÁT (P&L thực hiện luỹ kế) + max drawdown
     cum, eq, peak_eq, maxdd = 0.0, [], 0.0, 0.0
-    for t in ex:
-        cum += t["net_pnl"]
-        peak_eq = max(peak_eq, cum)
-        maxdd = min(maxdd, cum - peak_eq)
+    for t in sorted(trades, key=lambda t: t["exit_date"]):
+        cum += t["net_pnl"]; peak_eq = max(peak_eq, cum); maxdd = min(maxdd, cum - peak_eq)
         eq.append({"date": t["exit_date"], "cum_pnl": round(cum)})
 
-    summary = {
-        "n_trades": n, "n_open": int(sum(t["open"] for t in trades)),
-        "win_rate": round(float(wins.mean()) * 100, 1),
-        "payoff": round(payoff, 2) if payoff == payoff else None,
-        "expectancy_pct": round(float(rets.mean()) * 100, 2),
-        "avg_win_pct": round(float(aw) * 100, 2), "avg_loss_pct": round(float(al) * 100, 2),
-        "avg_hold_days": round(float(holds.mean()), 1),
-        "median_hold_days": int(np.median(holds)), "skipped_overlap": skipped_overlap,
-    }
+    summary = {**_trade_summary(trades), "skipped_overlap": skipped_overlap}
+    wins = pnls > 0
     pnl = {
         "total_invested": round(total_inv), "total_net_pnl": round(total_pnl),
         "roi_pct": round(total_pnl / total_inv * 100, 2) if total_inv else 0,
@@ -392,33 +431,178 @@ def _aggregate(trades, size, p, skipped_overlap):
         "peak_positions": peak_pos, "peak_capital": round(peak_capital),
         "roi_on_peak_pct": round(total_pnl / peak_capital * 100, 2) if peak_capital else 0,
     }
-    # theo năm (theo năm VÀO lệnh)
-    yy: Dict[str, list] = {}
-    for t in trades:
-        yy.setdefault(t["year"], []).append(t)
-    yearly = []
-    for y in sorted(yy):
-        ts = yy[y]
-        r = np.array([x["net_ret"] for x in ts]); pv = np.array([x["net_pnl"] for x in ts])
-        yearly.append({
-            "year": y, "n": len(ts), "win_rate": round(float((r > 0).mean()) * 100, 1),
-            "net_pnl": round(float(pv.sum())), "expectancy_pct": round(float(r.mean()) * 100, 2),
-            "roi_pct": round(float(pv.sum()) / (len(ts) * size) * 100, 2),
-        })
-    # top mã theo tổng lãi ròng
-    tk: Dict[str, list] = {}
-    for t in trades:
-        tk.setdefault(t["ticker"], []).append(t)
-    per_ticker = []
-    for k, ts in tk.items():
-        pv = np.array([x["net_pnl"] for x in ts]); r = np.array([x["net_ret"] for x in ts])
-        per_ticker.append({"ticker": k, "n": len(ts), "net_pnl": round(float(pv.sum())),
-                           "win_rate": round(float((r > 0).mean()) * 100, 1),
-                           "avg_ret_pct": round(float(r.mean()) * 100, 2),
-                           "best_ret_pct": round(float(r.max()) * 100, 2),
-                           "worst_ret_pct": round(float(r.min()) * 100, 2)})
-    top = sorted(per_ticker, key=lambda x: x["net_pnl"], reverse=True)[:20]
-    bottom = sorted(per_ticker, key=lambda x: x["net_pnl"])[:20]  # lỗ nhiều nhất
-
-    return {"params": p, "summary": summary, "pnl": pnl, "yearly": yearly,
+    top, bottom = _top_bottom_of(trades)
+    return {"params": p, "summary": summary, "pnl": pnl, "yearly": _yearly_of(trades),
             "top": top, "bottom": bottom, "equity": eq}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# CHẾ ĐỘ DANH MỤC — mô phỏng theo NGÀY, có trần vốn/vị thế, xoay vòng, lãi kép
+# ══════════════════════════════════════════════════════════════════════════
+def _pick_victim(positions, d, pget, mode, min_hold=10):
+    """Chọn mã để bán lấy chỗ khi danh mục đầy. Trả None nếu không nên xoay.
+    Chỉ xét vị thế đã giữ ≥ min_hold phiên (tránh cắt lệnh non đang chờ chạy)."""
+    cand = []
+    for tk, ps in positions.items():
+        row = pget(tk).get(d)
+        c = row[3] if row else ps["last_close"]
+        cand.append((tk, c / ps["entry"] - 1.0, ps["days"]))
+    if mode == "take_profit":                       # chốt mã LÃI ≥+20% (giữ đủ lâu) lấy vốn
+        elig = [x for x in cand if x[1] >= 0.20 and x[2] >= min_hold]
+        return max(elig, key=lambda x: x[1])[0] if elig else None
+    # 'weakest': cắt mã THUA (ret<0) đã giữ ≥min_hold — laggard thực sự, không cắt winner
+    elig = [x for x in cand if x[1] < 0 and x[2] >= min_hold]
+    return min(elig, key=lambda x: x[1])[0] if elig else None
+
+
+def run_portfolio(sig, get_df, p) -> Dict[str, Any]:
+    from collections import defaultdict
+    fee, trail, init, intraday = p["fee_roundtrip"], p["trail_pct"], p["init_stop_pct"], p["intraday"]
+    maxpos = int(p["max_positions"]) or 10 ** 9
+    MIN_BUY = 1_000_000
+
+    by_date: Dict[str, list] = defaultdict(list)
+    for s in sig:
+        by_date[s["date"]].append(s)
+    for d in by_date:                                # trong ngày ưu tiên mã thanh khoản cao
+        by_date[d].sort(key=lambda x: -x.get("avg_vol50", 0))
+
+    idx = get_df("VNINDEX")
+    if idx is not None and not idx.empty:
+        cal = [str(x)[:10] for x in idx["date"].tolist()]
+    else:
+        cal = sorted(by_date.keys())
+    lo = p.get("date_from") or (min(by_date) if by_date else (cal[0] if cal else None))
+    hi = p.get("date_to") or (cal[-1] if cal else None)
+    cal = [d for d in cal if (lo is None or d >= lo) and (hi is None or d <= hi)]
+    if not cal:
+        return {"params": p, "summary": {"n_trades": 0}, "pnl": {}, "yearly": [],
+                "top": [], "bottom": [], "equity": [], "message": "Không có phiên nào trong khoảng chọn"}
+
+    price: Dict[str, dict] = {}
+
+    def pget(tk):
+        if tk not in price:
+            df = get_df(tk)
+            price[tk] = ({} if df is None else
+                         {str(r[0])[:10]: (float(r[1]), float(r[2]), float(r[3]), float(r[4]))
+                          for r in df[["date", "open", "high", "low", "close"]].itertuples(index=False, name=None)})
+        return price[tk]
+
+    cash = float(p["initial_capital"])
+    positions: Dict[str, dict] = {}
+    trades: List[Dict[str, Any]] = []
+    equity: List[Dict[str, Any]] = []
+    peak_pos = n_rot = 0
+    peak_deployed = 0.0
+
+    def sell(tk, d, px, is_open=False):
+        nonlocal cash
+        ps = positions.pop(tk)
+        proceeds = ps["shares"] * px * (1 - fee / 2)
+        cost = ps["alloc"] * (1 + fee / 2)
+        net = proceeds - cost
+        cash += proceeds
+        trades.append({"ticker": tk, "entry_date": ps["entry_date"], "exit_date": d,
+                       "entry": ps["entry"], "exit": px, "net_ret": net / ps["alloc"],
+                       "net_pnl": net, "alloc": ps["alloc"], "hold_days": ps["days"],
+                       "year": ps["entry_date"][:4], "open": is_open})
+
+    for d in cal:
+        # 1) cập nhật & thoát lệnh
+        for tk in list(positions.keys()):
+            ps = positions[tk]; row = pget(tk).get(d)
+            if not row:
+                continue
+            o, h, l, c = row; ps["last_close"] = c; ps["days"] += 1
+            stop = max(ps["entry"] * (1 - init), ps["peak"] * (1 - trail))
+            ex = None
+            if intraday:
+                if o <= stop: ex = o
+                elif l <= stop: ex = stop
+            elif c <= stop:
+                ex = c
+            if ex is not None:
+                sell(tk, d, ex)
+            elif h > ps["peak"]:
+                ps["peak"] = h
+        # 2) vào lệnh theo tín hiệu breakout hôm nay
+        for s in by_date.get(d, []):
+            tk = s["ticker"]
+            if tk in positions:
+                continue
+            eq_val = (cash + sum(ps["shares"] * ps["last_close"] for ps in positions.values())
+                      if p["compound"] else p["initial_capital"])
+            mode = p["sizing_mode"]
+            if mode == "fixed":
+                target = p["position_vnd"]
+            elif mode == "percent":
+                target = eq_val * p["position_pct"]
+            else:  # equal
+                target = eq_val / maxpos if maxpos < 10 ** 9 else p["position_vnd"]
+            if len(positions) >= maxpos:                     # đầy → xoay vòng
+                if p["rotation"] == "off":
+                    continue
+                victim = _pick_victim(positions, d, pget, p["rotation"])
+                if victim is None:
+                    continue
+                vrow = pget(victim).get(d)
+                sell(victim, d, vrow[3] if vrow else positions[victim]["last_close"])
+                n_rot += 1
+            alloc = min(target, cash)
+            if alloc < MIN_BUY:
+                continue
+            entry = s["entry_close"]
+            positions[tk] = {"entry_date": d, "entry": entry, "alloc": alloc,
+                             "shares": alloc / entry, "peak": entry, "last_close": entry, "days": 0}
+            cash -= alloc * (1 + fee / 2)
+        # 3) chốt equity ngày
+        deployed = sum(ps["shares"] * ps["last_close"] for ps in positions.values())
+        peak_pos = max(peak_pos, len(positions))
+        peak_deployed = max(peak_deployed, deployed)
+        equity.append({"date": d, "equity": round(cash + deployed)})
+
+    for tk in list(positions.keys()):                        # đóng phần còn mở cuối kỳ
+        sell(tk, cal[-1], positions[tk]["last_close"], is_open=True)
+
+    return _aggregate_portfolio(trades, equity, p, peak_pos, peak_deployed, n_rot, cal)
+
+
+def _aggregate_portfolio(trades, equity, p, peak_pos, peak_deployed, n_rot, cal):
+    init_cap = float(p["initial_capital"])
+    if not trades:
+        return {"params": p, "summary": {"n_trades": 0}, "pnl": {}, "yearly": [],
+                "top": [], "bottom": [], "equity": [], "message": "Không có lệnh nào khớp bộ lọc"}
+    final_eq = init_cap + sum(t["net_pnl"] for t in trades)
+    total_pnl = final_eq - init_cap
+    # drawdown trên đường EQUITY thật
+    peak_e, maxdd, maxdd_pct = init_cap, 0.0, 0.0
+    for e in equity:
+        peak_e = max(peak_e, e["equity"])
+        dd = e["equity"] - peak_e
+        if dd < maxdd:
+            maxdd, maxdd_pct = dd, dd / peak_e * 100
+    yrs = (len(cal) / 252.0) if cal else 1.0
+    cagr = ((final_eq / init_cap) ** (1 / yrs) - 1) * 100 if init_cap > 0 and yrs > 0 else 0.0
+    pnls = np.array([t["net_pnl"] for t in trades]); wins = pnls > 0
+
+    summary = {**_trade_summary(trades), "skipped_overlap": 0, "n_rotations": n_rot}
+    pnl = {
+        "initial_capital": round(init_cap), "final_equity": round(final_eq),
+        "total_net_pnl": round(total_pnl),
+        "total_return_pct": round(total_pnl / init_cap * 100, 2) if init_cap else 0,
+        "cagr_pct": round(cagr, 2),
+        "total_invested": round(float(sum(t["alloc"] for t in trades))),
+        "roi_pct": round(total_pnl / float(sum(t["alloc"] for t in trades)) * 100, 2) if trades else 0,
+        "n_win": int(wins.sum()), "n_loss": int((~wins).sum()),
+        "gross_profit": round(float(pnls[pnls > 0].sum())),
+        "gross_loss": round(float(pnls[pnls <= 0].sum())),
+        "best_trade": round(float(pnls.max())), "worst_trade": round(float(pnls.min())),
+        "max_drawdown": round(float(maxdd)), "max_drawdown_pct": round(float(maxdd_pct), 2),
+        "peak_positions": peak_pos, "peak_capital": round(peak_deployed),
+        "roi_on_peak_pct": round(total_pnl / peak_deployed * 100, 2) if peak_deployed else 0,
+    }
+    top, bottom = _top_bottom_of(trades)
+    eq_curve = [{"date": e["date"], "cum_pnl": round(e["equity"] - init_cap)} for e in equity]
+    return {"params": p, "summary": summary, "pnl": pnl, "yearly": _yearly_of(trades),
+            "top": top, "bottom": bottom, "equity": eq_curve}
