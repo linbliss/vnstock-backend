@@ -245,12 +245,15 @@ DEFAULTS = {
     "date_to": None,
     # ── Chế độ DANH MỤC có giới hạn (mô phỏng thực tế) ──
     "portfolio_mode": False,    # True = danh mục có trần vốn/vị thế, chạy theo ngày
-    "initial_capital": 100_000_000,   # vốn ban đầu
-    "max_positions": 10,        # trần số vị thế đồng thời (0 = không giới hạn)
-    "sizing_mode": "equal",     # fixed | equal (vốn/maxpos) | percent (%/vị thế)
+    "initial_capital": 100_000_000,   # vốn ban đầu X
+    "max_positions": 10,        # Y: số mã tối đa BAN ĐẦU (0 = không giới hạn)
+    "max_positions_grown": 0,   # Z: số mã tối đa KHI CÓ LÃI (0/≤Y = không tăng)
+    "sizing_mode": "equal",     # fixed | equal (equity/số vị thế) | percent | unit (X/Y lô cố định)
     "position_pct": 0.10,       # dùng khi sizing_mode=percent
     "compound": True,           # lãi kép: tái đầu tư lợi nhuận đã thực hiện
     "rotation": "weakest",      # off | weakest (cắt mã yếu) | take_profit (chốt mã lãi cao)
+    "pyramid": False,           # gia tăng vị thế mã đang nắm khi có breakout mới & còn tiền
+    "pyramid_max": 3,           # trần số 'lô' mỗi mã khi gia tăng (vd 3 = tối đa 3×X/Y)
 }
 
 
@@ -458,7 +461,13 @@ def _pick_victim(positions, d, pget, mode, min_hold=10):
 def run_portfolio(sig, get_df, p) -> Dict[str, Any]:
     from collections import defaultdict
     fee, trail, init, intraday = p["fee_roundtrip"], p["trail_pct"], p["init_stop_pct"], p["intraday"]
-    maxpos = int(p["max_positions"]) or 10 ** 9
+    X = float(p["initial_capital"])
+    Y = int(p["max_positions"]) or 10 ** 9                 # số mã tối đa BAN ĐẦU
+    Z = int(p.get("max_positions_grown") or 0)             # số mã tối đa KHI CÓ LÃI
+    Z = Z if (Y < 10 ** 9 and Z > Y) else Y                # Z<=Y hoặc Y vô hạn → không tăng
+    mode, compound, pct = p["sizing_mode"], p["compound"], p["position_pct"]
+    unit = (X / Y) if (mode == "unit" and Y and Y < 10 ** 9) else None   # lô cố định X/Y
+    pyramid, pyr_max = bool(p.get("pyramid")), float(p.get("pyramid_max", 3))
     MIN_BUY = 1_000_000
 
     by_date: Dict[str, list] = defaultdict(list)
@@ -506,7 +515,7 @@ def run_portfolio(sig, get_df, p) -> Dict[str, Any]:
         trades.append({"ticker": tk, "entry_date": ps["entry_date"], "exit_date": d,
                        "entry": ps["entry"], "exit": px, "net_ret": net / ps["alloc"],
                        "net_pnl": net, "alloc": ps["alloc"], "hold_days": ps["days"],
-                       "year": ps["entry_date"][:4], "open": is_open})
+                       "adds": ps.get("adds", 0), "year": ps["entry_date"][:4], "open": is_open})
 
     for d in cal:
         # 1) cập nhật & thoát lệnh
@@ -527,20 +536,38 @@ def run_portfolio(sig, get_df, p) -> Dict[str, Any]:
             elif h > ps["peak"]:
                 ps["peak"] = h
         # 2) vào lệnh theo tín hiệu breakout hôm nay
+        eq_start = cash + sum(ps["shares"] * ps["last_close"] for ps in positions.values())
+        # trần vị thế ĐỘNG: bắt đầu Y, tăng theo vốn tới Z (chỉ khi sizing 'unit')
+        if unit:
+            cap_now = min(Z, max(Y, int(eq_start // unit)))
+        else:
+            cap_now = Y
         for s in by_date.get(d, []):
-            tk = s["ticker"]
-            if tk in positions:
-                continue
-            eq_val = (cash + sum(ps["shares"] * ps["last_close"] for ps in positions.values())
-                      if p["compound"] else p["initial_capital"])
-            mode = p["sizing_mode"]
-            if mode == "fixed":
-                target = p["position_vnd"]
+            tk = s["ticker"]; entry = s["entry_close"]
+            # kích thước lô mục tiêu
+            if unit is not None:
+                target = unit
             elif mode == "percent":
-                target = eq_val * p["position_pct"]
-            else:  # equal
-                target = eq_val / maxpos if maxpos < 10 ** 9 else p["position_vnd"]
-            if len(positions) >= maxpos:                     # đầy → xoay vòng
+                target = (eq_start if compound else X) * pct
+            elif mode == "equal":
+                base_n = cap_now if cap_now < 10 ** 9 else Y
+                target = (eq_start if compound else X) / base_n
+            else:  # fixed
+                target = p["position_vnd"]
+
+            if tk in positions:                              # ĐÃ NẮM → cân nhắc gia tăng vị thế
+                if pyramid and cash >= MIN_BUY:
+                    ps = positions[tk]
+                    room = pyr_max * ps["base"] - ps["alloc"]     # trần pyr_max lô/mã
+                    add = min(target, cash, room)
+                    if add >= MIN_BUY:
+                        ash = add / entry
+                        ps["entry"] = (ps["entry"] * ps["shares"] + entry * ash) / (ps["shares"] + ash)
+                        ps["shares"] += ash; ps["alloc"] += add; ps["adds"] += 1
+                        cash -= add * (1 + fee / 2)
+                continue
+
+            if len(positions) >= cap_now:                    # đầy → xoay vòng (mã mới)
                 if p["rotation"] == "off":
                     continue
                 victim = _pick_victim(positions, d, pget, p["rotation"])
@@ -552,9 +579,9 @@ def run_portfolio(sig, get_df, p) -> Dict[str, Any]:
             alloc = min(target, cash)
             if alloc < MIN_BUY:
                 continue
-            entry = s["entry_close"]
-            positions[tk] = {"entry_date": d, "entry": entry, "alloc": alloc,
-                             "shares": alloc / entry, "peak": entry, "last_close": entry, "days": 0}
+            positions[tk] = {"entry_date": d, "entry": entry, "alloc": alloc, "base": alloc,
+                             "shares": alloc / entry, "peak": entry, "last_close": entry,
+                             "days": 0, "adds": 0}
             cash -= alloc * (1 + fee / 2)
         # 3) chốt equity ngày
         deployed = sum(ps["shares"] * ps["last_close"] for ps in positions.values())
@@ -586,7 +613,9 @@ def _aggregate_portfolio(trades, equity, p, peak_pos, peak_deployed, n_rot, cal)
     cagr = ((final_eq / init_cap) ** (1 / yrs) - 1) * 100 if init_cap > 0 and yrs > 0 else 0.0
     pnls = np.array([t["net_pnl"] for t in trades]); wins = pnls > 0
 
-    summary = {**_trade_summary(trades), "skipped_overlap": 0, "n_rotations": n_rot}
+    n_pyr = int(sum(t.get("adds", 0) for t in trades))
+    summary = {**_trade_summary(trades), "skipped_overlap": 0,
+               "n_rotations": n_rot, "n_pyramids": n_pyr}
     pnl = {
         "initial_capital": round(init_cap), "final_equity": round(final_eq),
         "total_net_pnl": round(total_pnl),
@@ -604,5 +633,30 @@ def _aggregate_portfolio(trades, equity, p, peak_pos, peak_deployed, n_rot, cal)
     }
     top, bottom = _top_bottom_of(trades)
     eq_curve = [{"date": e["date"], "cum_pnl": round(e["equity"] - init_cap)} for e in equity]
-    return {"params": p, "summary": summary, "pnl": pnl, "yearly": _yearly_of(trades),
+
+    # ROI THEO NĂM trên EQUITY (lãi kép): equity cuối năm / cuối năm trước − 1
+    last_eq: Dict[str, float] = {}
+    for e in equity:
+        last_eq[e["date"][:4]] = e["equity"]
+    yret: Dict[str, float] = {}
+    prev = init_cap
+    for y in sorted(last_eq):
+        yret[y] = last_eq[y] / prev - 1 if prev else 0.0
+        prev = last_eq[y]
+    # gộp với thống kê lệnh VÀO trong năm (n, win, kỳ vọng)
+    by_year: Dict[str, list] = {}
+    for t in trades:
+        by_year.setdefault(t["year"], []).append(t)
+    yearly = []
+    for y in sorted(set(list(last_eq) + list(by_year))):
+        ts = by_year.get(y, [])
+        r = np.array([x["net_ret"] for x in ts]) if ts else np.array([0.0])
+        pv = float(sum(x["net_pnl"] for x in ts))
+        yearly.append({
+            "year": y, "n": len(ts),
+            "win_rate": round(float((r > 0).mean()) * 100, 1) if ts else 0,
+            "net_pnl": round(pv), "expectancy_pct": round(float(r.mean()) * 100, 2) if ts else 0,
+            "roi_pct": round(yret.get(y, 0.0) * 100, 2),      # ROI danh mục năm đó (equity)
+        })
+    return {"params": p, "summary": summary, "pnl": pnl, "yearly": yearly,
             "top": top, "bottom": bottom, "equity": eq_curve}

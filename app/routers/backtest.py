@@ -31,11 +31,14 @@ class BacktestParams(BaseModel):
     # ── danh mục có giới hạn ──
     portfolio_mode: bool = False
     initial_capital: float = Field(100_000_000, gt=0)
-    max_positions: int = Field(10, ge=0, le=200)
-    sizing_mode: str = "equal"                       # fixed | equal | percent
+    max_positions: int = Field(10, ge=0, le=200)              # Y
+    max_positions_grown: int = Field(0, ge=0, le=500)         # Z
+    sizing_mode: str = "equal"                       # fixed | equal | percent | unit
     position_pct: float = Field(0.10, gt=0, le=1)
     compound: bool = True
     rotation: str = "weakest"                        # off | weakest | take_profit
+    pyramid: bool = False
+    pyramid_max: float = Field(3, ge=1, le=10)
 
 
 def _exch_map():
