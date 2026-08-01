@@ -46,6 +46,7 @@ class BacktestParams(BaseModel):
     cutloss_plan: str = "single"                     # single | scale_out
     min_cutloss_pct: float = Field(0.05, gt=0, le=0.5)
     max_cutloss_pct: float = Field(0.08, gt=0, le=0.5)
+    recover: bool = False
 
 
 def _exch_map():

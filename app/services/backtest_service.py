@@ -273,8 +273,9 @@ DEFAULTS = {
     "entry_plan": "full",       # full | oneil | p337 | half
     # ── CẮT LỖ TỪNG PHẦN ──
     "cutloss_plan": "single",   # single | scale_out
-    "min_cutloss_pct": 0.05,    # scale_out: chạm mức lỗ min → bán 50% vị thế
-    "max_cutloss_pct": 0.08,    # scale_out: chạm mức lỗ max → bán hết phần còn lại
+    "min_cutloss_pct": 0.05,    # scale_out: GIẢM min% TỪ ĐỈNH → bán 50% (bảo toàn lãi)
+    "max_cutloss_pct": 0.08,    # scale_out: GIẢM max% TỪ ĐỈNH → bán hết phần còn lại
+    "recover": False,           # mua lại phần đã bán khi giá hồi vượt đỉnh trước lúc trim
 }
 
 # Giải ngân theo đợt: [(mốc lãi % kích hoạt, tỷ trọng lô)] — tổng tỷ trọng = 1.0
@@ -508,6 +509,7 @@ def run_portfolio(sig, get_df, p) -> Dict[str, Any]:
     ep = ENTRY_PLANS.get(p.get("entry_plan", "full"), ENTRY_PLANS["full"])  # giải ngân theo đợt
     clp = p.get("cutloss_plan", "single")                 # single | scale_out
     min_cl, max_cl = float(p.get("min_cutloss_pct", 0.05)), float(p.get("max_cutloss_pct", 0.08))
+    recover, RECOVER_MAX = bool(p.get("recover")), 4      # mua lại phần đã bán khi hồi
     MIN_BUY = 1_000_000
 
     by_date: Dict[str, list] = defaultdict(list)
@@ -542,7 +544,7 @@ def run_portfolio(sig, get_df, p) -> Dict[str, Any]:
     positions: Dict[str, dict] = {}
     trades: List[Dict[str, Any]] = []
     equity: List[Dict[str, Any]] = []
-    peak_pos = n_rot = n_fill = n_pyr = 0
+    peak_pos = n_rot = n_fill = n_pyr = n_recover = 0
     peak_deployed = 0.0
 
     def sell_frac(tk, d, px, frac, is_open=False):
@@ -589,24 +591,33 @@ def run_portfolio(sig, get_df, p) -> Dict[str, Any]:
                 ps["entry"] = (ps["entry"] * ps["shares"] + fill * ash) / (ps["shares"] + ash)
                 ps["shares"] += ash; ps["alloc"] += add; n_fill += 1
                 cash -= add * (1 + fee / 2)
-            # b) cắt lỗ
-            trail_lvl = ps["peak"] * (1 - trail)
+            # b) MUA LẠI phần đã bán khi giá HỒI vượt đỉnh trước lúc trim (chỉ scale_out)
+            if (recover and clp == "scale_out" and ps["half_sold"] and cash >= MIN_BUY
+                    and ps["recovers"] < RECOVER_MAX and h >= ps["peak_at_sale"]):
+                rb = min(ps["resell_alloc"], cash)
+                if rb >= MIN_BUY:
+                    fill = ps["peak_at_sale"]
+                    ash = rb / fill
+                    ps["entry"] = (ps["entry"] * ps["shares"] + fill * ash) / (ps["shares"] + ash)
+                    ps["shares"] += ash; ps["alloc"] += rb
+                    ps["half_sold"] = False; ps["recovers"] += 1; n_recover += 1
+                    cash -= rb * (1 + fee / 2)
+            # c) cắt lỗ / CHỐT LỜI TỪNG PHẦN
             closed = False
             if clp == "scale_out":
-                if trail_lvl >= ps["entry"] * (1 - min_cl):   # đã có lãi → trailing đóng hẳn
-                    px = _hit(o, l, c, trail_lvl)
-                    if px is not None:
-                        sell_frac(tk, d, px, 1.0); closed = True
-                else:                                          # vùng lỗ → cắt từng phần
-                    px2 = _hit(o, l, c, ps["entry"] * (1 - max_cl))
-                    if px2 is not None:
-                        sell_frac(tk, d, px2, 1.0); closed = True
-                    elif not ps["half_sold"]:
-                        px1 = _hit(o, l, c, ps["entry"] * (1 - min_cl))
-                        if px1 is not None:
-                            sell_frac(tk, d, px1, 0.5); ps["half_sold"] = True
+                # Hai mức trailing theo ĐỈNH (áp cả khi ĐANG LÃI → bảo toàn lãi):
+                #   giảm min% từ đỉnh → bán 50%; giảm max% từ đỉnh → bán hết.
+                px2 = _hit(o, l, c, ps["peak"] * (1 - max_cl))
+                if px2 is not None:
+                    sell_frac(tk, d, px2, 1.0); closed = True
+                elif not ps["half_sold"]:
+                    px1 = _hit(o, l, c, ps["peak"] * (1 - min_cl))
+                    if px1 is not None:
+                        ps["resell_alloc"] = ps["alloc"] * 0.5      # số vốn bán ra (để mua lại)
+                        ps["peak_at_sale"] = ps["peak"]
+                        sell_frac(tk, d, px1, 0.5); ps["half_sold"] = True
             else:                                              # single: init + trailing, đóng hẳn
-                px = _hit(o, l, c, max(ps["entry"] * (1 - init), trail_lvl))
+                px = _hit(o, l, c, max(ps["entry"] * (1 - init), ps["peak"] * (1 - trail)))
                 if px is not None:
                     sell_frac(tk, d, px, 1.0); closed = True
             if not closed and h > ps["peak"]:
@@ -666,7 +677,8 @@ def run_portfolio(sig, get_df, p) -> Dict[str, Any]:
             plan = [(trig, target * frac) for trig, frac in ep[1:]]
             positions[tk] = {"entry_date": d, "entry": entry, "entry0": entry, "alloc": first_alloc,
                              "base": target, "shares": first_alloc / entry, "peak": entry,
-                             "last_close": entry, "days": 0, "adds": 0, "half_sold": False, "plan": plan}
+                             "last_close": entry, "days": 0, "adds": 0, "half_sold": False,
+                             "peak_at_sale": 0.0, "resell_alloc": 0.0, "recovers": 0, "plan": plan}
             cash -= first_alloc * (1 + fee / 2)
         # 3) chốt equity ngày
         deployed = sum(ps["shares"] * ps["last_close"] for ps in positions.values())
@@ -677,10 +689,11 @@ def run_portfolio(sig, get_df, p) -> Dict[str, Any]:
     for tk in list(positions.keys()):                        # đóng phần còn mở cuối kỳ
         sell_frac(tk, cal[-1], positions[tk]["last_close"], 1.0, is_open=True)
 
-    return _aggregate_portfolio(trades, equity, p, peak_pos, peak_deployed, n_rot, n_fill, n_pyr, cal)
+    return _aggregate_portfolio(trades, equity, p, peak_pos, peak_deployed,
+                                n_rot, n_fill, n_pyr, n_recover, cal)
 
 
-def _aggregate_portfolio(trades, equity, p, peak_pos, peak_deployed, n_rot, n_fill, n_pyr, cal):
+def _aggregate_portfolio(trades, equity, p, peak_pos, peak_deployed, n_rot, n_fill, n_pyr, n_recover, cal):
     init_cap = float(p["initial_capital"])
     if not trades:
         return {"params": p, "summary": {"n_trades": 0}, "pnl": {}, "yearly": [],
@@ -698,8 +711,8 @@ def _aggregate_portfolio(trades, equity, p, peak_pos, peak_deployed, n_rot, n_fi
     cagr = ((final_eq / init_cap) ** (1 / yrs) - 1) * 100 if init_cap > 0 and yrs > 0 else 0.0
     pnls = np.array([t["net_pnl"] for t in trades]); wins = pnls > 0
 
-    summary = {**_trade_summary(trades), "skipped_overlap": 0,
-               "n_rotations": n_rot, "n_pyramids": n_pyr, "n_fills": n_fill}
+    summary = {**_trade_summary(trades), "skipped_overlap": 0, "n_rotations": n_rot,
+               "n_pyramids": n_pyr, "n_fills": n_fill, "n_recovers": n_recover}
     pnl = {
         "initial_capital": round(init_cap), "final_equity": round(final_eq),
         "total_net_pnl": round(total_pnl),
