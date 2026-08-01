@@ -39,6 +39,9 @@ class BacktestParams(BaseModel):
     rotation: str = "weakest"                        # off | weakest | take_profit
     pyramid: bool = False
     pyramid_max: float = Field(3, ge=1, le=10)
+    regime_filter: str = "off"                       # off | reduce | block
+    regime_weak_exposure: float = Field(0.3, ge=0, le=1)
+    regime_ma: int = Field(50, ge=10, le=200)
 
 
 def _exch_map():

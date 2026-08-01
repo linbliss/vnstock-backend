@@ -38,6 +38,17 @@ _build_state: Dict[str, Any] = {"status": "idle", "done": 0, "total": 0,
                                 "signals": 0, "message": "", "at": None}
 
 
+def _regime_up(get_df: Callable[[str], Optional[pd.DataFrame]], ma: int = 50) -> Dict[str, bool]:
+    """Dict {ngày -> VNINDEX > MA50} — thị trường uptrend (yếu tố 'M' của Minervini)."""
+    idx = get_df("VNINDEX")
+    if idx is None or idx.empty:
+        return {}
+    df = idx.sort_values("date").reset_index(drop=True)
+    m = df["close"].astype(float).rolling(ma).mean()
+    return {str(df["date"].iloc[i])[:10]: bool(df["close"].iloc[i] > m.iloc[i])
+            for i in range(len(df)) if not np.isnan(m.iloc[i])}
+
+
 def _get_df_from_store(ticker: str) -> Optional[pd.DataFrame]:
     df = ohlcv_store.get_ohlcv(ticker)            # DataFrame date/o/h/l/c/v, sort ASC | None
     if df is None or df.empty or "close" not in df:
@@ -254,6 +265,10 @@ DEFAULTS = {
     "rotation": "weakest",      # off | weakest (cắt mã yếu) | take_profit (chốt mã lãi cao)
     "pyramid": False,           # gia tăng vị thế mã đang nắm khi có breakout mới & còn tiền
     "pyramid_max": 3,           # trần số 'lô' mỗi mã khi gia tăng (vd 3 = tối đa 3×X/Y)
+    # ── LỌC THỊ TRƯỜNG (VNINDEX vs MA50 — yếu tố 'M' Minervini) ──
+    "regime_filter": "off",     # off | reduce (giảm giải ngân khi yếu) | block (chặn mở mới khi yếu)
+    "regime_weak_exposure": 0.3,  # reduce: tỷ lệ vị thế cho phép khi thị trường yếu (0.3 = 30%)
+    "regime_ma": 50,            # MA của VNINDEX để xác định uptrend
 }
 
 
@@ -321,6 +336,11 @@ def run_backtest(signals: List[Dict[str, Any]],
 
     if p.get("portfolio_mode"):
         return run_portfolio(sig, get_df, p)
+
+    # lọc thị trường yếu (per-signal: bỏ tín hiệu vào lúc VNINDEX < MA50)
+    if p.get("regime_filter", "off") != "off":
+        regime = _regime_up(get_df, int(p.get("regime_ma", 50)))
+        sig = [s for s in sig if regime.get(s["date"], True)]
 
     df_cache: Dict[str, pd.DataFrame] = {}
     open_until: Dict[str, str] = {}
@@ -468,6 +488,9 @@ def run_portfolio(sig, get_df, p) -> Dict[str, Any]:
     mode, compound, pct = p["sizing_mode"], p["compound"], p["position_pct"]
     unit = (X / Y) if (mode == "unit" and Y and Y < 10 ** 9) else None   # lô cố định X/Y
     pyramid, pyr_max = bool(p.get("pyramid")), float(p.get("pyramid_max", 3))
+    rf = p.get("regime_filter", "off")                    # off | reduce | block
+    wexp = float(p.get("regime_weak_exposure", 0.3))
+    regime = _regime_up(get_df, int(p.get("regime_ma", 50))) if rf != "off" else {}
     MIN_BUY = 1_000_000
 
     by_date: Dict[str, list] = defaultdict(list)
@@ -542,6 +565,13 @@ def run_portfolio(sig, get_df, p) -> Dict[str, Any]:
             cap_now = min(Z, max(Y, int(eq_start // unit)))
         else:
             cap_now = Y
+        # LỌC THỊ TRƯỜNG: yếu → giảm trần (reduce) hoặc chặn mở mới (block) + tắt pyramiding
+        weak = (rf != "off") and (not regime.get(d, True))
+        if weak:
+            eff_cap = len(positions) if rf == "block" else max(0, int(round(cap_now * wexp)))
+        else:
+            eff_cap = cap_now
+        allow_pyr = pyramid and not weak
         for s in by_date.get(d, []):
             tk = s["ticker"]; entry = s["entry_close"]
             # kích thước lô mục tiêu
@@ -556,7 +586,7 @@ def run_portfolio(sig, get_df, p) -> Dict[str, Any]:
                 target = p["position_vnd"]
 
             if tk in positions:                              # ĐÃ NẮM → cân nhắc gia tăng vị thế
-                if pyramid and cash >= MIN_BUY:
+                if allow_pyr and cash >= MIN_BUY:
                     ps = positions[tk]
                     room = pyr_max * ps["base"] - ps["alloc"]     # trần pyr_max lô/mã
                     add = min(target, cash, room)
@@ -567,8 +597,8 @@ def run_portfolio(sig, get_df, p) -> Dict[str, Any]:
                         cash -= add * (1 + fee / 2)
                 continue
 
-            if len(positions) >= cap_now:                    # đầy → xoay vòng (mã mới)
-                if p["rotation"] == "off":
+            if len(positions) >= eff_cap:                    # đầy (hoặc bị lọc regime) → xoay vòng
+                if p["rotation"] == "off" or weak:           # thị trường yếu: không xoay để mở mã mới
                     continue
                 victim = _pick_victim(positions, d, pget, p["rotation"])
                 if victim is None:
