@@ -350,6 +350,19 @@ def _aggregate(trades, size, p, skipped_overlap):
     total_inv = n * size
     total_pnl = float(pnls.sum())
 
+    # VỐN TỐI ĐA cùng lúc: số lệnh mở ĐỒNG THỜI cao nhất × vốn/lệnh (interval overlap).
+    # Cùng ngày: mở (+1) trước đóng (-1) → đếm bao trùm (an toàn, ước lượng vốn cần tối đa).
+    ev = []
+    for t in trades:
+        ev.append((t["entry_date"], 1))
+        ev.append((t["exit_date"], -1))
+    ev.sort(key=lambda x: (x[0], -x[1]))
+    cur = peak_pos = 0
+    for _d, delta in ev:
+        cur += delta
+        peak_pos = max(peak_pos, cur)
+    peak_capital = peak_pos * size
+
     # equity curve theo NGÀY THOÁT (P&L thực hiện luỹ kế) + max drawdown
     ex = sorted(trades, key=lambda t: t["exit_date"])
     cum, eq, peak_eq, maxdd = 0.0, [], 0.0, 0.0
@@ -376,6 +389,8 @@ def _aggregate(trades, size, p, skipped_overlap):
         "gross_loss": round(float(pnls[pnls <= 0].sum())),
         "best_trade": round(float(pnls.max())), "worst_trade": round(float(pnls.min())),
         "max_drawdown": round(float(maxdd)),
+        "peak_positions": peak_pos, "peak_capital": round(peak_capital),
+        "roi_on_peak_pct": round(total_pnl / peak_capital * 100, 2) if peak_capital else 0,
     }
     # theo năm (theo năm VÀO lệnh)
     yy: Dict[str, list] = {}
