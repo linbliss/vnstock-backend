@@ -20,7 +20,9 @@ def shark_signals(
 @router.get("/tape/{ticker}")
 def shark_tape(
     ticker: str,
-    limit: int = Query(2000, ge=1, le=5000),
+    # Trần 5000 CŨ làm mất đầu phiên ở mã thanh khoản rất cao (vd SSI ~5.4k khớp/phiên
+    # → thiếu 09:15–09:52). Store giữ tới MAX_TICKS=100k nên nâng trần để lấy TRỌN phiên.
+    limit: int = Query(2000, ge=1, le=50000),
     big_value: float = Query(shark_monitor.BIG_VALUE_VND, ge=0),
     window_min: int = Query(shark_monitor.WINDOW_MIN, ge=1, le=120),
 ):
